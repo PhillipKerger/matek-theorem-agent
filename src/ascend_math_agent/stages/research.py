@@ -17,6 +17,7 @@ from pydantic import (
 
 from ..config import ModelSettings
 from ..openai_client import ModelClient, ModelRequest, ModelResult
+from ..progress import Ascension, ProgressReporter, no_progress
 from ..source_identifiers import tool_metadata_source_identifiers
 from ..source_provenance import IdentifierVerifier, SourceEvidenceClaim
 from .common import (
@@ -422,6 +423,7 @@ async def run_adaptive_research(
     final_judge_prompt_path: Path | None = None,
     audit_prompt_paths: dict[str, Path] | None = None,
     source_verifier: IdentifierVerifier | None = None,
+    progress: ProgressReporter = no_progress,
 ) -> ResearchResult:
     """Run coordinator-managed, bounded adaptive research and its acceptance gate.
 
@@ -512,6 +514,8 @@ async def run_adaptive_research(
                 obligations=repair_obligations or ["Model-call budget exhausted before planning."],
             )
 
+        progress(Ascension.PLAN_RESEARCH, f"Planning research round {round_number}.")
+
         if round_number == 1:
             coordinator_input = json.dumps(
                 {
@@ -594,6 +598,10 @@ async def run_adaptive_research(
             return await finish(outcome, obligations=repair_obligations or [reason])
 
         semaphore = asyncio.Semaphore(settings.maximum_concurrent_agents)
+        progress(
+            Ascension.RUN_RESEARCH,
+            f"Launching {len(plan.assignments)} research agents for round {round_number}.",
+        )
 
         async def run_worker(
             assignment: ResearchAssignment,
@@ -693,6 +701,10 @@ async def run_adaptive_research(
                 ResearchOutcome.BUDGET_EXHAUSTED,
                 obligations=["Budget exhausted before candidate proof packaging."],
             )
+        progress(
+            Ascension.AUDIT_RESEARCH,
+            "Packaging the candidate solution for independent audits.",
+        )
         package_input = json.dumps(
             {
                 "claim_contract": compiled.claim_contract.as_dict(),

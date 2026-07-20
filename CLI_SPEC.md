@@ -95,6 +95,24 @@ Without a backend flag, a new installation uses Codex. Important options:
 `--backend api` is explicit consent to use separately billed Platform API access. `--dry-run`
 validates and prints the resolved backend and stage plan without a model call.
 
+During `run` and active `resume` operations, ASCEND prints sparse progress lines with stable
+high-level milestone numbers. It does not stream model reasoning, per-call diagnostics, or every
+worker completion. A full run may show:
+
+```text
+ASCENSION 0: Fetching problem.
+ASCENSION 1: Formulating technical research prompt.
+ASCENSION 2: Planning research round 1.
+ASCENSION 3: Launching 4 research agents for round 1.
+ASCENSION 4: Packaging the candidate solution for independent audits.
+ASCENSION 5: Writing manuscript and verifying bibliography.
+ASCENSION 6: Assessing and verifying the Lean formalization.
+ASCENSION 7: Preparing final report.
+```
+
+Ascensions 2 and 3 repeat for each adaptive research round. Skipped or already checkpointed stages
+do not print misleading progress lines.
+
 ## `ascend status [RUN_ID]`
 
 Shows the selected backend, nonsecret authentication class, Codex/backend version, requested

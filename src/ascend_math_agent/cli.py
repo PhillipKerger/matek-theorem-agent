@@ -48,6 +48,7 @@ from .openai_client import (
     OpenAIResponsesClient,
     TokenPricing,
 )
+from .progress import Ascension
 from .redaction import redact_text
 from .resources import resource_path
 from .stages.compile_prompt import EXPECTED_FRAMEWORK_SHA256
@@ -101,6 +102,10 @@ def _project_root() -> Path:
     return discover_project_root(Path.cwd())
 
 
+def _print_progress(ascension: Ascension, message: str) -> None:
+    console.print(f"[bold cyan]ASCENSION {int(ascension)}:[/bold cyan] {message}")
+
+
 def _execution_backend(config: AppConfig) -> ExecutionBackend:
     if config.lean.execution_backend == SandboxChoice.DOCKER.value:
         return DockerBackend(image=config.lean.docker_image)
@@ -145,6 +150,7 @@ def _live_runner(config: AppConfig) -> WorkflowRunner:
                 model=config.codex.model or None,
                 reasoning_effort=config.codex.formalization_effort,
             ),
+            progress=_print_progress,
         ),
     )
 
@@ -156,6 +162,7 @@ def _offline_runner(config: AppConfig) -> WorkflowRunner:
             model_client=cast(ModelClient, _OfflineModelClient()),
             execution_backend=NativeBackend(),
             codex_client=cast(CodexClient, _OfflineCodexClient()),
+            progress=_print_progress,
         ),
     )
 

@@ -1,5 +1,9 @@
 # Workflow Specification
 
+The CLI reports sparse `ASCENSION n` progress at the stage boundaries below. Adaptive research
+also reports round planning, agent-batch launch, and candidate-audit packaging. These updates are
+operational milestones only; model reasoning and per-call details are not streamed to the user.
+
 ## Stage 0 — Intake
 
 Inputs: problem file, optional framework override, config, CLI flags.

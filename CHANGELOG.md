@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Command-line progress
+
+- `ascend run` and active resumes now print sparse numbered `ASCENSION` milestones for intake,
+  prompt formulation, adaptive research rounds, candidate audits, manuscript generation, Lean,
+  and final reporting without streaming model reasoning or per-call noise.
+
 ### Strict structured outputs
 
 - Codex output schemas are now generated from closed Pydantic models, require every object

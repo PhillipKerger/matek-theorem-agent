@@ -22,6 +22,7 @@ from .intake import ingest_problem
 from .logging import RunLogger, load_usage_journal_strict
 from .models import RunState, ScientificStatus, StageName, StageStatus
 from .openai_client import ModelClient, ModelRequest
+from .progress import Ascension, ProgressReporter, no_progress
 from .redaction import redact_data, redact_text
 from .reporting import (
     ReportArtifacts,
@@ -107,6 +108,7 @@ class WorkflowDependencies:
     execution_backend: ExecutionBackend
     codex_client: CodexClient
     source_verifier: IdentifierVerifier | None = None
+    progress: ProgressReporter = no_progress
 
 
 class WorkflowResult(BaseModel):
@@ -328,6 +330,7 @@ class WorkflowRunner:
         environment_snapshot: Mapping[str, Any] | None = None,
     ) -> WorkflowResult:
         selected = options or WorkflowOptions()
+        self.dependencies.progress(Ascension.FETCH_PROBLEM, "Fetching problem.")
         intake = ingest_problem(
             problem_file=problem_file,
             project_root=project_root,
@@ -858,6 +861,10 @@ class WorkflowRunner:
         result_path = state.run_root / "prompts" / "compiled_problem.json"
         if not self._begin(state, store, logger, StageName.PROMPT_COMPILATION):
             return CompiledProblem.model_validate_json(result_path.read_text(encoding="utf-8"))
+        self.dependencies.progress(
+            Ascension.FORMULATE_PROMPT,
+            "Formulating technical research prompt.",
+        )
 
         custom = options.framework_path
         framework_context = (
@@ -1007,6 +1014,7 @@ class WorkflowRunner:
                         "complexity": paths[names[8]],
                     },
                     source_verifier=self._source_verifier(state.run_root),
+                    progress=self.dependencies.progress,
                 )
         except Exception as exc:
             self._failure(state, store, logger, StageName.RESEARCH, exc)
@@ -1071,6 +1079,10 @@ class WorkflowRunner:
         result_path = state.run_root / "manuscript" / "result.json"
         if not self._begin(state, store, logger, StageName.MANUSCRIPT):
             return ManuscriptResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+        self.dependencies.progress(
+            Ascension.WRITE_MANUSCRIPT,
+            "Writing manuscript and verifying bibliography.",
+        )
         resume_bibliography = bool(state.metadata.get("resume_bibliography_correction", False))
         try:
             with resource_paths(
@@ -1170,6 +1182,10 @@ class WorkflowRunner:
             result = LeanPipelineResult.model_validate_json(result_path.read_text(encoding="utf-8"))
             self._apply_lean_result(state, store, logger, result, budget)
             return
+        self.dependencies.progress(
+            Ascension.FORMALIZE_LEAN,
+            "Assessing and verifying the Lean formalization.",
+        )
         names = (
             "prompts/lean_feasibility.md",
             "prompts/lean_statement_generator.md",
@@ -1319,6 +1335,7 @@ class WorkflowRunner:
         existing = state.stages[StageName.REPORT]
         if existing.status is StageStatus.SUCCEEDED:
             return load_final_report(state.run_root)
+        self.dependencies.progress(Ascension.PREPARE_REPORT, "Preparing final report.")
         self._begin(state, store, logger, StageName.REPORT)
         logger.event("report.generating", stage=StageName.REPORT)
         self._sync_backend_metadata(state)

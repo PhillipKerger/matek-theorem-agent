@@ -28,6 +28,7 @@ from ascend_math_agent.execution.base import CommandRequest, CommandResult
 from ascend_math_agent.intake import ingest_problem
 from ascend_math_agent.models import ScientificStatus, StageName, StageStatus
 from ascend_math_agent.openai_client import ModelRequest, ModelResult
+from ascend_math_agent.progress import Ascension
 from ascend_math_agent.stages.common import sha256_json, sha256_text
 from ascend_math_agent.stages.compile_prompt import (
     CompiledProblem,
@@ -748,6 +749,7 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
     model = RoutedFullWorkflowModel(provider)
     backend = FullWorkflowBackend()
     codex = EditingCodex()
+    updates: list[tuple[Ascension, str]] = []
     runner = WorkflowRunner(
         AppConfig(
             project_root=project,
@@ -763,6 +765,7 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            progress=lambda ascension, message: updates.append((ascension, message)),
         ),
     )
 
@@ -795,6 +798,18 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
     assert (result.state.run_root / "lean" / "challenge.lean").is_file()
     assert len(codex.requests) == 1
     assert len(backend.requests) == 3
+    assert [ascension for ascension, _ in updates] == [
+        Ascension.FETCH_PROBLEM,
+        Ascension.FORMULATE_PROMPT,
+        Ascension.PLAN_RESEARCH,
+        Ascension.RUN_RESEARCH,
+        Ascension.PLAN_RESEARCH,
+        Ascension.RUN_RESEARCH,
+        Ascension.AUDIT_RESEARCH,
+        Ascension.WRITE_MANUSCRIPT,
+        Ascension.FORMALIZE_LEAN,
+        Ascension.PREPARE_REPORT,
+    ]
     usage_records = [
         json.loads(line)
         for line in (result.state.run_root / "logs" / "usage.jsonl")
@@ -1107,6 +1122,52 @@ async def test_report_regeneration_is_offline_and_recreates_missing_report(
 
 
 @pytest.mark.asyncio
+async def test_workflow_emits_sparse_progress_from_intake_to_prompt(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    updates: list[tuple[Ascension, str]] = []
+    runner = WorkflowRunner(
+        AppConfig(
+            project_root=project,
+            research=ResearchSettings(
+                minimum_initial_agents=4,
+                maximum_concurrent_agents=2,
+                maximum_rounds=1,
+            ),
+        ),
+        WorkflowDependencies(
+            model_client=InterruptAtCandidateModel(),
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+            progress=lambda ascension, message: updates.append((ascension, message)),
+        ),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_new(
+            make_problem(project),
+            project,
+            options=WorkflowOptions(research_only=True),
+            environment_snapshot={"fixture": "offline"},
+        )
+
+    assert updates[:2] == [
+        (Ascension.FETCH_PROBLEM, "Fetching problem."),
+        (Ascension.FORMULATE_PROMPT, "Formulating technical research prompt."),
+    ]
+    assert (Ascension.PLAN_RESEARCH, "Planning research round 1.") in updates
+    assert (
+        Ascension.RUN_RESEARCH,
+        "Launching 4 research agents for round 1.",
+    ) in updates
+    assert (
+        Ascension.AUDIT_RESEARCH,
+        "Packaging the candidate solution for independent audits.",
+    ) in updates
+    assert updates[-1] == (Ascension.PREPARE_REPORT, "Preparing final report.")
+
+
+@pytest.mark.asyncio
 async def test_resume_failed_bibliography_corrects_persisted_draft_without_restarting_writer(
     tmp_path: Path,
 ) -> None:
@@ -1181,6 +1242,13 @@ def test_cli_dry_run_creates_no_workspace_and_never_constructs_live_runner(
     assert result.exit_code == 0, result.output
     assert "Dry run complete" in result.output
     assert not (tmp_path / ".ascend").exists()
+
+
+def test_cli_progress_uses_ascension_terminal_format() -> None:
+    with cli_module.console.capture() as capture:
+        cli_module._print_progress(Ascension.RUN_RESEARCH, "Launching 4 research agents.")
+
+    assert capture.get().strip() == "ASCENSION 3: Launching 4 research agents."
 
 
 def test_cli_init_status_and_usage_exit_codes(
