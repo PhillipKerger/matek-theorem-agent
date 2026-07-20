@@ -7,11 +7,20 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import ModelSettings
 from ..execution.base import CommandRequest, CommandResult, ExecutionBackend
 from ..openai_client import ModelClient, ModelRequest
+from ..source_identifiers import source_identifiers, tool_metadata_source_identifiers
+from ..source_provenance import (
+    IdentifierVerifier,
+    SourceEvidenceClaim,
+    SourceVerificationRecord,
+    SourceVerificationReport,
+    SourceVerificationStatus,
+    provider_verification_records,
+)
 from ..verification import (
     classify_latex_result,
     parse_bibtex,
@@ -30,8 +39,6 @@ from .common import (
     project_resource,
     sha256_json,
     sha256_text,
-    source_identifiers,
-    tool_metadata_source_identifiers,
 )
 from .research import (
     ResearchAcceptanceGate,
@@ -171,8 +178,23 @@ class BibliographyEntryAudit(BaseModel):
     stable_identifier_checked: bool
     characterization_supported: bool
     theorem_hypotheses_supported: bool
-    authoritative_evidence: list[str] = Field(default_factory=list)
+    authoritative_evidence: list[SourceEvidenceClaim] = Field(default_factory=list)
     corrections: list[BibliographyCorrection] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_evidence(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        key = str(value.get("citation_key") or "").strip()
+        evidence = value.get("authoritative_evidence")
+        if isinstance(evidence, list):
+            value = dict(value)
+            value["authoritative_evidence"] = [
+                {"claim": item, "source_ids": [key]} if isinstance(item, str) else item
+                for item in evidence
+            ]
+        return value
 
     @field_validator("corrections", mode="before")
     @classmethod
@@ -197,7 +219,10 @@ class BibliographyEntryAudit(BaseModel):
             and self.characterization_supported
             and self.theorem_hypotheses_supported
             and bool(self.authoritative_evidence)
-            and all(source_identifiers(item) for item in self.authoritative_evidence)
+            and all(
+                isinstance(item, SourceEvidenceClaim) and self.citation_key in item.source_ids
+                for item in self.authoritative_evidence
+            )
         )
 
 
@@ -207,7 +232,24 @@ class RelatedWorkClaimAudit(BaseModel):
     claim: str
     citation_keys: list[str] = Field(default_factory=list)
     supported: bool
-    evidence: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidenceClaim] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_evidence(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        citation_keys = [
+            str(item).strip() for item in value.get("citation_keys", []) if str(item).strip()
+        ]
+        evidence = value.get("evidence")
+        if isinstance(evidence, list):
+            value = dict(value)
+            value["evidence"] = [
+                {"claim": item, "source_ids": citation_keys} if isinstance(item, str) else item
+                for item in evidence
+            ]
+        return value
 
 
 class BibliographyAudit(BaseModel):
@@ -567,7 +609,7 @@ def _audit_gate_issues(
     validation: RelatedWorkValidation,
     paper_tex: str,
     references_bib: str,
-    provider_identifiers: Collection[str] = (),
+    verified_identifiers: Collection[str] = (),
 ) -> list[str]:
     issues = list(audit.blocking_issues)
     parsed_entries, _ = parse_bibtex(references_bib)
@@ -593,19 +635,10 @@ def _audit_gate_issues(
                 issues.append(
                     f"Bibliography entry {key!r} has no quality stable identifier or HTTPS URL."
                 )
-            evidence_identifiers = set().union(
-                *(source_identifiers(value) for value in entry.authoritative_evidence)
-            )
-            if stable_identifiers and not stable_identifiers.intersection(evidence_identifiers):
-                issues.append(
-                    f"Bibliography evidence for {key!r} does not match its recorded identifier."
-                )
-            if stable_identifiers and not stable_identifiers.intersection(provider_identifiers):
-                issues.append(
-                    f"Bibliography entry {key!r} was not returned by the provider search tool."
-                )
-            if evidence_identifiers and not evidence_identifiers.intersection(provider_identifiers):
-                issues.append(f"Bibliography evidence for {key!r} is not provider-backed.")
+            if stable_identifiers and not stable_identifiers.intersection(verified_identifiers):
+                issues.append(f"Bibliography entry {key!r} was not independently resolved.")
+            if any(key not in evidence.source_ids for evidence in entry.authoritative_evidence):
+                issues.append(f"Bibliography evidence for {key!r} is not linked to its source ID.")
     for check in audit.claim_checks:
         if not check.supported:
             issues.append(f"Related-work characterization is unsupported: {check.claim}")
@@ -621,20 +654,20 @@ def _audit_gate_issues(
             issues.append(
                 "Related-work characterization cites unaudited keys: " + ", ".join(sorted(unknown))
             )
-        if not check.evidence or any(not source_identifiers(value) for value in check.evidence):
+        if not check.evidence:
             issues.append(
                 f"Related-work characterization lacks authoritative evidence: {check.claim}"
             )
             continue
-        claim_evidence = set().union(*(source_identifiers(value) for value in check.evidence))
-        cited_identifiers = set().union(
-            *(bibliography_identifiers.get(key, set()) for key in claim_keys)
-        )
-        if cited_identifiers and not cited_identifiers.intersection(claim_evidence):
-            issues.append(f"Related-work evidence does not match its cited source: {check.claim}")
-        if not claim_evidence.intersection(provider_identifiers):
+        valid_evidence = [
+            evidence for evidence in check.evidence if isinstance(evidence, SourceEvidenceClaim)
+        ]
+        if len(valid_evidence) != len(check.evidence):
+            issues.append(f"Related-work characterization has malformed evidence: {check.claim}")
+        linked_ids = set().union(*(set(evidence.source_ids) for evidence in valid_evidence))
+        if not claim_keys.issubset(linked_ids):
             issues.append(
-                f"Related-work evidence was not returned by the provider search tool: {check.claim}"
+                f"Related-work evidence is not linked to every cited source: {check.claim}"
             )
     if not audit.claim_checks:
         issues.append("No substantive related-work characterization was independently checked.")
@@ -647,6 +680,44 @@ def _audit_gate_issues(
     )
     issues.extend(issue.message for issue in deterministic.issues)
     return list(dict.fromkeys(issues))
+
+
+async def _verify_bibliography_identifiers(
+    references_bib: str,
+    *,
+    provider_identifiers: Collection[str],
+    verifier: IdentifierVerifier | None,
+) -> SourceVerificationReport:
+    records: list[SourceVerificationRecord] = []
+    warnings: list[str] = []
+    parsed_entries, _ = parse_bibtex(references_bib)
+    for entry in parsed_entries:
+        identifiers = set().union(
+            *(
+                source_identifiers(entry.fields.get(field, ""))
+                for field in ("doi", "eprint", "isbn", "url", "mrnumber")
+            )
+        )
+        provider_records = provider_verification_records(identifiers, provider_identifiers)
+        records.extend(provider_records)
+        unresolved = identifiers - {record.identifier for record in provider_records}
+        if unresolved and verifier is not None:
+            deterministic = await verifier.verify(
+                unresolved,
+                expected_title=entry.fields.get("title"),
+            )
+            records.extend(deterministic.records)
+            warnings.extend(deterministic.warnings)
+        elif unresolved:
+            records.extend(
+                SourceVerificationRecord(
+                    identifier=identifier,
+                    status=SourceVerificationStatus.UNAVAILABLE,
+                    detail="deterministic source verifier is not configured",
+                )
+                for identifier in sorted(unresolved)
+            )
+    return SourceVerificationReport(records=records, warnings=list(dict.fromkeys(warnings)))
 
 
 def _bibliography_markdown(audit: BibliographyAudit, issues: list[str]) -> str:
@@ -686,6 +757,7 @@ async def generate_manuscript(
     manuscript_prompt_path: Path | None = None,
     bibliography_prompt_path: Path | None = None,
     resume_from: ManuscriptResult | None = None,
+    source_verifier: IdentifierVerifier | None = None,
 ) -> ManuscriptResult:
     """Write and independently verify a manuscript after the accepted research gate.
 
@@ -917,18 +989,24 @@ async def generate_manuscript(
 
         audit, provider_metadata = await verify_draft(draft)
         provider_identifiers = tool_metadata_source_identifiers(provider_metadata)
+        source_verification = await _verify_bibliography_identifiers(
+            draft.references_bib,
+            provider_identifiers=provider_identifiers,
+            verifier=source_verifier,
+        )
         gate_issues = _audit_gate_issues(
             audit,
             related,
             draft.paper_tex,
             draft.references_bib,
-            provider_identifiers,
+            source_verification.verified_identifiers,
         )
         atomic_write_json(cycle_dir / "bibliography_audit.json", audit)
         atomic_write_json(
             cycle_dir / "bibliography_provider_metadata.json",
             [dict(item) for item in provider_metadata],
         )
+        atomic_write_json(cycle_dir / "source_verification.json", source_verification)
         artifact_paths["bibliography_audit"] = atomic_write_json(
             destination / "bibliography_audit.json", audit
         )
@@ -939,6 +1017,9 @@ async def generate_manuscript(
         artifact_paths["bibliography_provider_metadata"] = atomic_write_json(
             destination / "bibliography_provider_metadata.json",
             [dict(item) for item in provider_metadata],
+        )
+        artifact_paths["bibliography_source_verification"] = atomic_write_json(
+            destination / "bibliography_source_verification.json", source_verification
         )
         if not gate_issues:
             break
@@ -1048,6 +1129,7 @@ async def resume_manuscript_bibliography(
     latex_timeout_seconds: int = 600,
     manuscript_prompt_path: Path | None = None,
     bibliography_prompt_path: Path | None = None,
+    source_verifier: IdentifierVerifier | None = None,
 ) -> ManuscriptResult:
     """Resume only a rejected bibliography/correction gate.
 
@@ -1075,4 +1157,5 @@ async def resume_manuscript_bibliography(
         manuscript_prompt_path=manuscript_prompt_path,
         bibliography_prompt_path=bibliography_prompt_path,
         resume_from=previous_result,
+        source_verifier=source_verifier,
     )

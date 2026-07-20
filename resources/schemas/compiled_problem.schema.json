@@ -58,44 +58,60 @@
       "title": "PromptCompilationStatus",
       "type": "string"
     },
+    "SourceEvidenceClaim": {
+      "additionalProperties": false,
+      "description": "A prose claim linked explicitly to stable source IDs.",
+      "properties": {
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "claim",
+        "source_ids"
+      ],
+      "title": "SourceEvidenceClaim",
+      "type": "object"
+    },
     "SourceLedgerEntry": {
       "additionalProperties": false,
       "description": "A traceable source record returned by the compiler.",
       "properties": {
-        "evidence": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Evidence"
+        "evidence_claims": {
+          "items": {
+            "$ref": "#/$defs/SourceEvidenceClaim"
+          },
+          "title": "Evidence Claims",
+          "type": "array"
         },
-        "stable_identifier": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Stable Identifier"
+        "identifiers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Identifiers",
+          "type": "array"
+        },
+        "required_for_claim": {
+          "title": "Required For Claim",
+          "type": "boolean"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
         },
         "title": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Title"
+          "title": "Title",
+          "type": "string"
         },
-        "url": {
+        "verification_detail": {
           "anyOf": [
             {
               "type": "string"
@@ -104,26 +120,21 @@
               "type": "null"
             }
           ],
-          "title": "Url"
+          "title": "Verification Detail"
         },
         "verified": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Verified"
+          "title": "Verified",
+          "type": "boolean"
         }
       },
       "required": [
+        "source_id",
         "title",
-        "stable_identifier",
-        "url",
+        "identifiers",
+        "evidence_claims",
+        "required_for_claim",
         "verified",
-        "evidence"
+        "verification_detail"
       ],
       "title": "SourceLedgerEntry",
       "type": "object"

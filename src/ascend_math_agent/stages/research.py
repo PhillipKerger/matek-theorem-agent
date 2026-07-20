@@ -17,6 +17,8 @@ from pydantic import (
 
 from ..config import ModelSettings
 from ..openai_client import ModelClient, ModelRequest, ModelResult
+from ..source_identifiers import tool_metadata_source_identifiers
+from ..source_provenance import IdentifierVerifier, SourceEvidenceClaim
 from .common import (
     ArtifactManifest,
     CallManifest,
@@ -29,7 +31,12 @@ from .common import (
     sha256_json,
     sha256_text,
 )
-from .compile_prompt import CompiledProblem, PromptCompilationResult
+from .compile_prompt import (
+    CompiledProblem,
+    PromptCompilationResult,
+    SourceLedgerEntry,
+    verify_source_ledger,
+)
 
 
 class WorkerStatus(StrEnum):
@@ -93,14 +100,6 @@ class ResearchRoundPlan(BaseModel):
     stop_reason: str | None = None
 
 
-class ResearchSource(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str
-    stable_identifier: str | None = None
-    relevance: str
-
-
 class ResearchWorkerReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -109,7 +108,7 @@ class ResearchWorkerReport(BaseModel):
     formal_results: list[str]
     proof_content: str
     exact_gap: str | None
-    sources: list[ResearchSource]
+    sources: list[SourceLedgerEntry]
     assumptions: list[str] = Field(default_factory=list)
     counterexamples: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
@@ -185,7 +184,44 @@ class ImportedTheorem(BaseModel):
     name: str
     statement: str
     hypotheses: list[str]
-    stable_identifier: str | None = None
+    source_id: str
+    identifiers: list[str]
+    evidence_claims: list[SourceEvidenceClaim]
+    verified: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_source(cls, value: object) -> object:
+        if not isinstance(value, dict) or "identifiers" in value:
+            return value
+        raw = dict(value)
+        source = SourceLedgerEntry.model_validate(
+            {
+                "title": raw.get("name", "Imported theorem"),
+                "stable_identifier": raw.pop("stable_identifier", None),
+                "evidence": raw.get("statement", "Imported theorem statement"),
+                "required_for_claim": True,
+            }
+        )
+        raw.update(
+            {
+                "source_id": source.source_id,
+                "identifiers": source.identifiers,
+                "evidence_claims": source.evidence_claims,
+                "verified": False,
+            }
+        )
+        return raw
+
+    def as_source_entry(self) -> SourceLedgerEntry:
+        return SourceLedgerEntry(
+            source_id=self.source_id,
+            title=self.name,
+            identifiers=self.identifiers,
+            evidence_claims=self.evidence_claims,
+            required_for_claim=True,
+            verified=self.verified,
+        )
 
 
 class CandidateProofPackage(BaseModel):
@@ -385,6 +421,7 @@ async def run_adaptive_research(
     candidate_prompt_path: Path | None = None,
     final_judge_prompt_path: Path | None = None,
     audit_prompt_paths: dict[str, Path] | None = None,
+    source_verifier: IdentifierVerifier | None = None,
 ) -> ResearchResult:
     """Run coordinator-managed, bounded adaptive research and its acceptance gate.
 
@@ -590,8 +627,34 @@ async def run_adaptive_research(
                 parsed = result.parsed
                 if not isinstance(parsed, ResearchWorkerReport):
                     raise StageValidationError("Model client returned the wrong worker type.")
+                source_verification = await verify_source_ledger(
+                    parsed.sources,
+                    provider_identifiers=tool_metadata_source_identifiers(result.tool_metadata),
+                    verifier=source_verifier,
+                )
+                for source in parsed.sources:
+                    matched = set(source.identifiers).intersection(
+                        source_verification.verified_identifiers
+                    )
+                    source.verified = bool(matched)
+                    source.verification_detail = (
+                        "Independently verified: " + ", ".join(sorted(matched))
+                        if matched
+                        else "No identifier could be independently verified."
+                    )
+                    if not source.verified:
+                        parsed.assumptions.append(
+                            f"Source {source.source_id} could not be independently verified."
+                        )
+                parsed.assumptions = list(dict.fromkeys(parsed.assumptions))
                 path = atomic_write_json(worker_output_dir / f"{assignment.id}.json", parsed)
                 artifact_paths[f"round_{worker_round}_worker_{assignment.id}"] = path
+                artifact_paths[f"round_{worker_round}_worker_{assignment.id}_sources"] = (
+                    atomic_write_json(
+                        worker_output_dir / "source_verification" / f"{assignment.id}.json",
+                        source_verification,
+                    )
+                )
                 return parsed
 
         try:
@@ -648,12 +711,31 @@ async def run_adaptive_research(
             output_type=CandidateProofPackage,
         )
         current_candidate = package_result.parsed
+        imported_source_verification = await verify_source_ledger(
+            [theorem.as_source_entry() for theorem in current_candidate.imported_theorems],
+            provider_identifiers=tool_metadata_source_identifiers(package_result.tool_metadata),
+            verifier=source_verifier,
+        )
+        for theorem in current_candidate.imported_theorems:
+            theorem.verified = bool(
+                set(theorem.identifiers).intersection(
+                    imported_source_verification.verified_identifiers
+                )
+            )
+            if not theorem.verified:
+                current_candidate.unresolved_items.append(
+                    f"Imported theorem {theorem.name!r} is not independently verified."
+                )
+        current_candidate.unresolved_items = list(dict.fromkeys(current_candidate.unresolved_items))
         attempt_dir = ensure_stage_directory(candidate_dir / "attempts" / str(round_number))
         artifact_paths[f"candidate_attempt_{round_number}"] = atomic_write_json(
             attempt_dir / "package.json", current_candidate
         )
         artifact_paths[f"candidate_attempt_{round_number}_proof"] = atomic_write_text(
             attempt_dir / "proof.md", current_candidate.full_proof
+        )
+        artifact_paths[f"candidate_attempt_{round_number}_source_verification"] = atomic_write_json(
+            attempt_dir / "source_verification.json", imported_source_verification
         )
         # The canonical candidate paths always contain the latest package, even when it is
         # later rejected or returned for repair. Attempt directories preserve prior versions.

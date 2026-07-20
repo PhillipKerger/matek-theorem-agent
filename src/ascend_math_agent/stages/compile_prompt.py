@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Collection, Sequence
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ..config import ModelSettings
 from ..openai_client import ModelClient, ModelRequest
+from ..source_identifiers import source_identifiers, tool_metadata_source_identifiers
+from ..source_provenance import (
+    IdentifierVerifier,
+    SourceEvidenceClaim,
+    SourceVerificationRecord,
+    SourceVerificationReport,
+    SourceVerificationStatus,
+    canonical_identifiers,
+    provider_verification_records,
+)
 from .common import (
     ArtifactManifest,
     CallManifest,
@@ -22,9 +33,6 @@ from .common import (
     ensure_stage_directory,
     project_resource,
     sha256_bytes,
-    source_identifiers,
-    tool_metadata_source_identifiers,
-    valid_source_identifier,
 )
 
 EXPECTED_FRAMEWORK_SHA256 = "bd724294a261f4bc2e5da2191813e40c1340bc6ee039c753cb5c60276e7a512c"
@@ -73,11 +81,62 @@ class SourceLedgerEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    title: str | None = None
-    stable_identifier: str | None = None
-    url: str | None = None
-    verified: bool | None = None
-    evidence: str | None = None
+    source_id: str
+    title: str
+    identifiers: list[str]
+    evidence_claims: list[SourceEvidenceClaim]
+    required_for_claim: bool = False
+    verified: bool = False
+    verification_detail: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_entry(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "identifiers" in value:
+            return value
+        title = str(value.get("title") or "").strip()
+        raw_identifiers = [value.get("stable_identifier"), value.get("url")]
+        identifiers = sorted(canonical_identifiers(raw_identifiers))
+        identity_material = "|".join([title, *identifiers])
+        source_id = str(value.get("source_id") or "").strip() or (
+            "source-" + sha256(identity_material.encode("utf-8")).hexdigest()[:12]
+        )
+        evidence = str(value.get("evidence") or "").strip()
+        return {
+            "source_id": source_id,
+            "title": title,
+            "identifiers": identifiers,
+            "evidence_claims": (
+                [{"claim": evidence, "source_ids": [source_id]}] if evidence else []
+            ),
+            "required_for_claim": bool(value.get("required_for_claim", False)),
+            "verified": False,
+            "verification_detail": None,
+        }
+
+    @field_validator("source_id", "title")
+    @classmethod
+    def source_text_nonempty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("source IDs and titles must not be blank")
+        return normalized
+
+    @field_validator("identifiers")
+    @classmethod
+    def normalize_identifiers(cls, values: list[str]) -> list[str]:
+        normalized = sorted(canonical_identifiers(values))
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("source identifiers must be unique")
+        return normalized
+
+
+class SourceLedgerRepair(BaseModel):
+    """A bounded correction containing only source-provenance records."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_ledger: list[SourceLedgerEntry]
 
 
 class ClaimContractEntry(BaseModel):
@@ -233,6 +292,7 @@ class PromptCompilationResult(BaseModel):
 
     compiled_problem: CompiledProblem
     framework_sha256: str
+    source_verification: SourceVerificationReport = Field(default_factory=SourceVerificationReport)
     artifacts: ArtifactManifest = Field(default_factory=ArtifactManifest)
     calls: CallManifest
 
@@ -345,7 +405,7 @@ def validate_framework_coverage(compiled_prompt: str) -> list[str]:
 def validate_source_ledger(
     source_ledger: Sequence[SourceLedgerEntry | dict[str, Any]],
     *,
-    provider_identifiers: Collection[str] = (),
+    verified_identifiers: Collection[str] = (),
 ) -> list[str]:
     """Require independently checkable evidence for each claimed source.
 
@@ -356,48 +416,124 @@ def validate_source_ledger(
 
     issues: list[str] = []
     seen: set[str] = set()
+    source_ids: list[str] = []
+    parsed_entries: list[SourceLedgerEntry] = []
     for index, raw_entry in enumerate(source_ledger):
         try:
             entry = SourceLedgerEntry.model_validate(raw_entry)
         except Exception as exc:
             issues.append(f"Source ledger entry {index} is malformed: {exc}")
             continue
-        label = entry.title.strip() if entry.title else f"entry {index}"
-        if not entry.title or not entry.title.strip():
-            issues.append(f"Source ledger entry {index} has no title.")
-        if entry.verified is not True:
-            issues.append(f"Source ledger {label!r} is not explicitly verified.")
-        identifier_values = [entry.stable_identifier, entry.url]
-        identifiers = set().union(
-            *(source_identifiers(value) for value in identifier_values if value)
-        )
-        if not any(valid_source_identifier(value) for value in identifier_values):
+        parsed_entries.append(entry)
+        source_ids.append(entry.source_id)
+        label = entry.title
+        identifiers = set(entry.identifiers)
+        if not identifiers:
             issues.append(
                 f"Source ledger {label!r} has no quality DOI, arXiv/ISBN/MR identifier, "
                 "or authoritative HTTPS URL."
             )
-        evidence_identifiers = source_identifiers(entry.evidence or "")
-        if not evidence_identifiers:
-            issues.append(
-                f"Source ledger {label!r} has no independently checkable evidence identifier."
-            )
-        elif identifiers and not identifiers.intersection(evidence_identifiers):
-            issues.append(
-                f"Source ledger {label!r} evidence does not match its stable identifier or URL."
-            )
-        if identifiers and not identifiers.intersection(provider_identifiers):
-            issues.append(
-                f"Source ledger {label!r} is not backed by this response's web-search sources."
-            )
-        if evidence_identifiers and not evidence_identifiers.intersection(provider_identifiers):
-            issues.append(
-                f"Source ledger {label!r} evidence was not returned by the provider search tool."
-            )
+        if not entry.evidence_claims:
+            issues.append(f"Source ledger {label!r} has no explicitly linked evidence claims.")
+        if entry.verified and not identifiers.intersection(verified_identifiers):
+            issues.append(f"Source ledger {label!r} is marked verified without independent proof.")
         duplicates = identifiers.intersection(seen)
         if duplicates:
             issues.append(f"Source ledger {label!r} duplicates an earlier stable identifier.")
         seen.update(identifiers)
+    duplicate_source_ids = {
+        source_id for source_id in source_ids if source_ids.count(source_id) > 1
+    }
+    if duplicate_source_ids:
+        issues.append(
+            "Source ledger contains duplicate source IDs: "
+            + ", ".join(sorted(duplicate_source_ids))
+        )
+    known_source_ids = set(source_ids)
+    for entry in parsed_entries:
+        for claim in entry.evidence_claims:
+            unknown = set(claim.source_ids) - known_source_ids
+            if unknown:
+                issues.append(
+                    f"Evidence for {entry.source_id!r} references unknown source IDs: "
+                    + ", ".join(sorted(unknown))
+                )
     return issues
+
+
+def _normalize_evidence_links(entries: Sequence[SourceLedgerEntry]) -> list[SourceLedgerEntry]:
+    known_source_ids = {entry.source_id for entry in entries}
+    normalized: list[SourceLedgerEntry] = []
+    for entry in entries:
+        repaired_claims = []
+        for claim in entry.evidence_claims:
+            linked = [source_id for source_id in claim.source_ids if source_id in known_source_ids]
+            repaired_claims.append(
+                claim.model_copy(update={"source_ids": linked or [entry.source_id]})
+            )
+        normalized.append(entry.model_copy(update={"evidence_claims": repaired_claims}, deep=True))
+    return normalized
+
+
+def _invalid_source_ids(entries: Sequence[SourceLedgerEntry]) -> set[str]:
+    identifier_counts: dict[str, int] = {}
+    source_id_counts: dict[str, int] = {}
+    known_source_ids = {entry.source_id for entry in entries}
+    for entry in entries:
+        source_id_counts[entry.source_id] = source_id_counts.get(entry.source_id, 0) + 1
+        for identifier in entry.identifiers:
+            identifier_counts[identifier] = identifier_counts.get(identifier, 0) + 1
+    return {
+        entry.source_id
+        for entry in entries
+        if not entry.identifiers
+        or not entry.evidence_claims
+        or source_id_counts[entry.source_id] > 1
+        or any(identifier_counts[identifier] > 1 for identifier in entry.identifiers)
+        or any(
+            not claim.source_ids or not set(claim.source_ids).issubset(known_source_ids)
+            for claim in entry.evidence_claims
+        )
+    }
+
+
+async def verify_source_ledger(
+    source_ledger: Sequence[SourceLedgerEntry],
+    *,
+    provider_identifiers: Collection[str] = (),
+    verifier: IdentifierVerifier | None = None,
+) -> SourceVerificationReport:
+    """Verify canonical identifiers without relying on provider-specific metadata."""
+
+    records: list[SourceVerificationRecord] = []
+    warnings: list[str] = []
+    all_source_ids = {entry.source_id for entry in source_ledger}
+    for entry in source_ledger:
+        for claim in entry.evidence_claims:
+            unknown = set(claim.source_ids) - all_source_ids
+            if unknown:
+                warnings.append(
+                    f"Evidence claim for {entry.source_id} references unknown source IDs: "
+                    + ", ".join(sorted(unknown))
+                )
+        provider_records = provider_verification_records(entry.identifiers, provider_identifiers)
+        records.extend(provider_records)
+        provider_verified = {record.identifier for record in provider_records}
+        unresolved = set(entry.identifiers) - provider_verified
+        if unresolved and verifier is not None:
+            deterministic = await verifier.verify(unresolved, expected_title=entry.title)
+            records.extend(deterministic.records)
+            warnings.extend(deterministic.warnings)
+        elif unresolved:
+            records.extend(
+                SourceVerificationRecord(
+                    identifier=identifier,
+                    status=SourceVerificationStatus.UNAVAILABLE,
+                    detail="deterministic source verifier is not configured",
+                )
+                for identifier in sorted(unresolved)
+            )
+    return SourceVerificationReport(records=records, warnings=list(dict.fromkeys(warnings)))
 
 
 def _ledger_identifiers(
@@ -406,9 +542,7 @@ def _ledger_identifiers(
     identifiers: set[str] = set()
     for raw_entry in source_ledger:
         entry = SourceLedgerEntry.model_validate(raw_entry)
-        for value in (entry.stable_identifier, entry.url):
-            if value:
-                identifiers.update(source_identifiers(value))
+        identifiers.update(entry.identifiers)
     return frozenset(identifiers)
 
 
@@ -461,6 +595,7 @@ async def compile_prompt(
     settings: ModelSettings | None = None,
     expected_framework_sha256: str | None = EXPECTED_FRAMEWORK_SHA256,
     placeholder_allowlist: Collection[str] = (),
+    source_verifier: IdentifierVerifier | None = None,
 ) -> PromptCompilationResult:
     """Compile and validate a problem, optionally writing contracted prompt artifacts.
 
@@ -514,16 +649,131 @@ async def compile_prompt(
         CompiledProblem,
     )
     compiled = model_result.parsed
-    provider_identifiers = tool_metadata_source_identifiers(model_result.tool_metadata)
-    ledger_issues = validate_source_ledger(
+    compiled.source_ledger = _normalize_evidence_links(
+        [SourceLedgerEntry.model_validate(entry) for entry in compiled.source_ledger]
+    )
+    response_ids = [model_result.response_id]
+    model_calls = 1
+    provider_metadata = list(model_result.tool_metadata)
+    repair_warning: str | None = None
+    initial_issues = validate_source_ledger(compiled.source_ledger)
+    if initial_issues and compiled.source_ledger:
+        repair_settings = resolved_settings.model_copy(
+            update={
+                "reasoning_effort": "medium",
+                "maximum_web_search_calls": min(resolved_settings.maximum_web_search_calls, 4),
+                "max_output_tokens": min(resolved_settings.max_output_tokens, 8_000),
+            }
+        )
+        try:
+            repair_result = await client.generate_structured(
+                ModelRequest(
+                    instructions=(
+                        "Correct only the supplied source ledger. Preserve source IDs where "
+                        "possible, provide canonical DOI/arXiv/ISBN/MR/authoritative HTTPS "
+                        "identifiers, and link every evidence claim through source_ids. Do not "
+                        "change the mathematical problem or claim external verification."
+                    ),
+                    input_text=json.dumps(
+                        {
+                            "source_ledger": [
+                                entry.model_dump(mode="json") for entry in compiled.source_ledger
+                            ],
+                            "validation_issues": initial_issues,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    settings=repair_settings,
+                ),
+                SourceLedgerRepair,
+            )
+        except Exception as exc:
+            repair_warning = f"Bounded source-ledger repair was unavailable: {type(exc).__name__}."
+        else:
+            compiled.source_ledger = _normalize_evidence_links(repair_result.parsed.source_ledger)
+            provider_metadata.extend(repair_result.tool_metadata)
+            response_ids.append(repair_result.response_id)
+            model_calls += 1
+
+    invalid_source_ids = _invalid_source_ids(compiled.source_ledger)
+    invalid_required = [
+        entry.source_id
+        for entry in compiled.source_ledger
+        if entry.required_for_claim and entry.source_id in invalid_source_ids
+    ]
+    if invalid_required:
+        raise StageValidationError(
+            "Source ledger repair failed for logically required source(s): "
+            + ", ".join(invalid_required)
+        )
+    removed_optional = [
+        entry.source_id for entry in compiled.source_ledger if entry.source_id in invalid_source_ids
+    ]
+    if removed_optional:
+        compiled.source_ledger = [
+            entry for entry in compiled.source_ledger if entry.source_id not in invalid_source_ids
+        ]
+        compiled.source_ledger = _normalize_evidence_links(compiled.source_ledger)
+
+    provider_identifiers = tool_metadata_source_identifiers(provider_metadata)
+    verification = await verify_source_ledger(
         compiled.source_ledger,
         provider_identifiers=provider_identifiers,
+        verifier=source_verifier,
     )
-    if ledger_issues:
-        raise StageValidationError("Source ledger verification failed: " + " ".join(ledger_issues))
-    compiled.source_ledger = [
-        SourceLedgerEntry.model_validate(entry) for entry in compiled.source_ledger
+    verified_identifiers = verification.verified_identifiers
+    unverified_required: list[str] = []
+    unverified_optional: list[str] = []
+    for entry in compiled.source_ledger:
+        matched = sorted(set(entry.identifiers).intersection(verified_identifiers))
+        entry.verified = bool(matched)
+        entry.verification_detail = (
+            "Independently verified: " + ", ".join(matched)
+            if matched
+            else "No identifier could be independently verified."
+        )
+        if not entry.verified:
+            target = unverified_required if entry.required_for_claim else unverified_optional
+            target.append(entry.source_id)
+    ledger_issues = validate_source_ledger(
+        compiled.source_ledger,
+        verified_identifiers=verified_identifiers,
+    )
+    structural_issues = [
+        issue for issue in ledger_issues if "marked verified without independent proof" not in issue
     ]
+    if structural_issues:
+        raise StageValidationError("Source ledger verification failed: " + " ".join(ledger_issues))
+    if unverified_required:
+        raise StageValidationError(
+            "Source verification failed for logically required source(s): "
+            + ", ".join(unverified_required)
+        )
+    if unverified_optional:
+        warning = (
+            "Independent source verification was unavailable for optional source(s): "
+            + ", ".join(unverified_optional)
+            + ". Literature claims were downgraded to unknown."
+        )
+        verification.warnings.append(warning)
+        compiled.literature_status = LiteratureStatus.UNKNOWN
+        compiled.literature_resolution_summary = None
+        if compiled.status is PromptCompilationStatus.COMPILED:
+            compiled.compiled_prompt = (
+                compiled.compiled_prompt.rstrip() + "\n\nSource provenance notice\n" + warning
+            )
+    if removed_optional:
+        warning = (
+            "Optional malformed source(s) were removed after one bounded repair attempt: "
+            + ", ".join(removed_optional)
+            + ". Literature claims were downgraded to unknown."
+        )
+        verification.warnings.append(warning)
+        compiled.literature_status = LiteratureStatus.UNKNOWN
+        compiled.literature_resolution_summary = None
+    if repair_warning:
+        verification.warnings.append(repair_warning)
 
     if compiled.status is PromptCompilationStatus.COMPILED:
         unresolved = find_unresolved_placeholders(
@@ -560,6 +810,9 @@ async def compile_prompt(
                 destination / "source_ledger.json",
                 [entry.model_dump(mode="json") for entry in compiled.source_ledger],
             ),
+            "source_verification": atomic_write_json(
+                destination / "source_verification.json", verification
+            ),
         }
         if compiled.status is PromptCompilationStatus.COMPILED:
             paths["compiled_prompt"] = atomic_write_text(
@@ -570,16 +823,17 @@ async def compile_prompt(
                 destination / "clarification_request.md",
                 _render_clarification_request(compiled),
             )
-        if model_result.tool_metadata:
+        if provider_metadata:
             paths["source_provider_metadata"] = atomic_write_json(
                 destination / "source_provider_metadata.json",
-                [dict(item) for item in model_result.tool_metadata],
+                [dict(item) for item in provider_metadata],
             )
         artifacts = build_artifact_manifest(paths)
 
     return PromptCompilationResult(
         compiled_problem=compiled,
         framework_sha256=framework_digest,
+        source_verification=verification,
         artifacts=artifacts,
-        calls=CallManifest(model_calls=1, response_ids=[model_result.response_id]),
+        calls=CallManifest(model_calls=model_calls, response_ids=response_ids),
     )

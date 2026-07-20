@@ -1,13 +1,59 @@
 {
   "$defs": {
-    "ResearchSource": {
+    "SourceEvidenceClaim": {
       "additionalProperties": false,
+      "description": "A prose claim linked explicitly to stable source IDs.",
       "properties": {
-        "relevance": {
-          "title": "Relevance",
+        "claim": {
+          "title": "Claim",
           "type": "string"
         },
-        "stable_identifier": {
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "claim",
+        "source_ids"
+      ],
+      "title": "SourceEvidenceClaim",
+      "type": "object"
+    },
+    "SourceLedgerEntry": {
+      "additionalProperties": false,
+      "description": "A traceable source record returned by the compiler.",
+      "properties": {
+        "evidence_claims": {
+          "items": {
+            "$ref": "#/$defs/SourceEvidenceClaim"
+          },
+          "title": "Evidence Claims",
+          "type": "array"
+        },
+        "identifiers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Identifiers",
+          "type": "array"
+        },
+        "required_for_claim": {
+          "title": "Required For Claim",
+          "type": "boolean"
+        },
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "verification_detail": {
           "anyOf": [
             {
               "type": "string"
@@ -16,19 +62,23 @@
               "type": "null"
             }
           ],
-          "title": "Stable Identifier"
+          "title": "Verification Detail"
         },
-        "title": {
-          "title": "Title",
-          "type": "string"
+        "verified": {
+          "title": "Verified",
+          "type": "boolean"
         }
       },
       "required": [
+        "source_id",
         "title",
-        "stable_identifier",
-        "relevance"
+        "identifiers",
+        "evidence_claims",
+        "required_for_claim",
+        "verified",
+        "verification_detail"
       ],
-      "title": "ResearchSource",
+      "title": "SourceLedgerEntry",
       "type": "object"
     },
     "WorkerStatus": {
@@ -104,7 +154,7 @@
     },
     "sources": {
       "items": {
-        "$ref": "#/$defs/ResearchSource"
+        "$ref": "#/$defs/SourceLedgerEntry"
       },
       "title": "Sources",
       "type": "array"

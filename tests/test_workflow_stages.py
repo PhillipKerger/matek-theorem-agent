@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,11 @@ from ascend_math_agent.codex_client import CodexRequest, CodexResult
 from ascend_math_agent.config import ModelSettings
 from ascend_math_agent.execution.base import CommandRequest, CommandResult
 from ascend_math_agent.openai_client import ModelRequest, ModelResult
+from ascend_math_agent.source_provenance import (
+    SourceVerificationRecord,
+    SourceVerificationReport,
+    SourceVerificationStatus,
+)
 from ascend_math_agent.stages.common import (
     StageGateError,
     StageValidationError,
@@ -24,6 +30,8 @@ from ascend_math_agent.stages.compile_prompt import (
     CompiledProblem,
     LiteratureStatus,
     PromptCompilationStatus,
+    SourceLedgerEntry,
+    SourceLedgerRepair,
     compile_prompt,
 )
 from ascend_math_agent.stages.lean import (
@@ -62,6 +70,7 @@ from ascend_math_agent.stages.research import (
     CandidateProofPackage,
     FinalJudgeDecision,
     FinalJudgeVerdict,
+    ImportedTheorem,
     ResearchAcceptanceGate,
     ResearchAssignment,
     ResearchOutcome,
@@ -212,6 +221,7 @@ async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
         "compiled_prompt",
         "compiled_problem",
         "source_ledger",
+        "source_verification",
     }
     assert client.requests[0].settings.reasoning_effort == "xhigh"
     assert client.requests[0].settings.web_search is True
@@ -315,7 +325,7 @@ async def test_prompt_compiler_rejects_modified_default_framework(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_prompt_compiler_rejects_missing_framework_sections_and_unverified_sources(
+async def test_prompt_compiler_rejects_missing_framework_sections_and_downgrades_bad_sources(
     tmp_path: Path,
 ) -> None:
     incomplete = StaticClient([compiled_problem("Current task statement\nProve the theorem.")])
@@ -336,13 +346,61 @@ async def test_prompt_compiler_rejects_missing_framework_sections_and_unverified
             "evidence": "a model said the publisher confirms it",
         }
     ]
-    with pytest.raises(StageValidationError, match="Source ledger verification failed"):
-        await compile_prompt(
-            client=StaticClient([bad_source]),
-            problem_text="Prove P.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path / "bad-source",
-        )
+    client = StaticClient([bad_source])
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path / "bad-source",
+    )
+    assert result.compiled_problem.literature_status is LiteratureStatus.UNKNOWN
+    assert result.source_ledger == []
+    assert "removed after one bounded repair" in result.source_verification.warnings[0]
+    assert len(client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_uses_one_small_source_ledger_repair(tmp_path: Path) -> None:
+    malformed = compiled_problem()
+    malformed_entry = SourceLedgerEntry.model_validate(
+        {
+            "title": "Repairable fixture source",
+            "stable_identifier": "not canonical",
+            "evidence": "The fixture theorem is stated in this source.",
+        }
+    )
+    malformed.source_ledger = [malformed_entry]
+    source_id = malformed_entry.source_id
+    repair = SourceLedgerRepair(
+        source_ledger=[
+            SourceLedgerEntry(
+                source_id=source_id,
+                title="Repairable fixture source",
+                identifiers=["doi:10.5555/12345678"],
+                evidence_claims=[
+                    {
+                        "claim": "The fixture theorem is stated in this source.",
+                        "source_ids": [source_id],
+                    }
+                ],
+            )
+        ]
+    )
+    client = StaticClient([malformed, repair], tool_metadata=web_source_metadata())
+
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
+
+    assert result.source_ledger[0]["verified"] is True
+    assert result.calls.model_calls == 2
+    assert len(client.requests) == 2
+    assert client.requests[1].settings.reasoning_effort == "medium"
+    assert client.requests[1].settings.maximum_web_search_calls == 4
+    assert client.requests[1].settings.max_output_tokens == 8_000
 
 
 @pytest.mark.asyncio
@@ -365,13 +423,15 @@ async def test_prompt_compiler_allows_a_verified_empty_source_ledger(tmp_path: P
             "evidence": "https://doi.org/10.5555/12345678",
         }
     ]
-    with pytest.raises(StageValidationError, match="not backed by this response"):
-        await compile_prompt(
-            client=StaticClient([sourced]),
-            problem_text="Prove a source-dependent fixture statement.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path / "missing-provider-source",
-        )
+    downgraded = await compile_prompt(
+        client=StaticClient([sourced]),
+        problem_text="Prove a source-dependent fixture statement.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path / "missing-provider-source",
+    )
+    assert downgraded.compiled_problem.literature_status is LiteratureStatus.UNKNOWN
+    assert downgraded.source_ledger[0]["verified"] is False
+    assert downgraded.source_verification.warnings
     sourced_result = await compile_prompt(
         client=StaticClient([sourced], tool_metadata=web_source_metadata()),
         problem_text="Prove a source-dependent fixture statement.",
@@ -391,10 +451,17 @@ async def test_prompt_compiler_allows_a_verified_empty_source_ledger(tmp_path: P
 
 
 class SuccessfulResearchClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        worker_sources: list[SourceLedgerEntry] | None = None,
+        imported_theorems: list[ImportedTheorem] | None = None,
+    ) -> None:
         self.calls = 0
         self.active = 0
         self.maximum_active = 0
+        self.worker_sources = worker_sources or []
+        self.imported_theorems = imported_theorems or []
 
     async def generate_structured(
         self, request: ModelRequest, output_type: type[Any]
@@ -430,11 +497,13 @@ class SuccessfulResearchClient:
                 formal_results=[f"Lemma from {assignment['approach_family']}"],
                 proof_content="Detailed proof.",
                 exact_gap=None,
-                sources=[],
+                sources=self.worker_sources,
                 mechanism=assignment["task"],
             )
         elif output_type is CandidateProofPackage:
-            parsed = candidate_package()
+            parsed = candidate_package().model_copy(
+                update={"imported_theorems": self.imported_theorems}, deep=True
+            )
         elif output_type is AuditVerdict:
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
@@ -450,6 +519,31 @@ class SuccessfulResearchClient:
         else:  # pragma: no cover - a stage adding an unexpected call should fail loudly
             raise AssertionError(output_type)
         return ModelResult(parsed=parsed, response_id=response_id)
+
+
+class OfflineIdentifierVerifier:
+    def __init__(self, verified: Collection[str] = ()) -> None:
+        self.verified = set(verified)
+
+    async def verify(
+        self,
+        identifiers: Collection[str],
+        *,
+        expected_title: str | None = None,
+    ) -> SourceVerificationReport:
+        records = [
+            SourceVerificationRecord(
+                identifier=identifier,
+                status=(
+                    SourceVerificationStatus.VERIFIED
+                    if identifier in self.verified
+                    else SourceVerificationStatus.UNAVAILABLE
+                ),
+                detail="offline fixture",
+            )
+            for identifier in identifiers
+        ]
+        return SourceVerificationReport(records=records)
 
 
 def candidate_package() -> CandidateProofPackage:
@@ -494,6 +588,60 @@ async def test_adaptive_research_bounds_concurrency_and_requires_all_audits(
     assert result.calls.model_calls == 11
     assert (tmp_path / "candidate" / "package.json").is_file()
     assert (tmp_path / "verdict.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_research_records_unavailable_optional_sources_as_assumptions(
+    tmp_path: Path,
+) -> None:
+    source = SourceLedgerEntry(
+        source_id="worker-source",
+        title="Optional background source",
+        identifiers=["doi:10.5555/12345678"],
+        evidence_claims=[{"claim": "Background context only", "source_ids": ["worker-source"]}],
+    )
+
+    result = await run_adaptive_research(
+        client=SuccessfulResearchClient(worker_sources=[source]),
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        source_verifier=OfflineIdentifierVerifier(),
+    )
+
+    assert result.accepted_for_manuscript
+    assert all(report.sources[0].verified is False for report in result.worker_reports)
+    assert all(
+        "could not be independently verified" in report.assumptions[0]
+        for report in result.worker_reports
+    )
+
+
+@pytest.mark.asyncio
+async def test_unverified_imported_theorem_blocks_research_acceptance(tmp_path: Path) -> None:
+    theorem = ImportedTheorem(
+        name="External theorem",
+        statement="Every fixture object has property P.",
+        hypotheses=["The fixture object is admissible."],
+        source_id="external-theorem",
+        identifiers=["arxiv:2401.01234"],
+        evidence_claims=[{"claim": "The theorem statement", "source_ids": ["external-theorem"]}],
+    )
+
+    result = await run_adaptive_research(
+        client=SuccessfulResearchClient(imported_theorems=[theorem]),
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(maximum_rounds=1),
+        source_verifier=OfflineIdentifierVerifier(),
+    )
+
+    assert result.outcome is ResearchOutcome.PARTIAL
+    assert not result.accepted_for_manuscript
+    assert "not independently verified" in result.unresolved_obligations[0]
+    assert result.candidate is not None
+    assert result.candidate.imported_theorems[0].verified is False
+    assert not result.audits
+    assert (tmp_path / "candidate" / "attempts" / "1" / "source_verification.json").is_file()
 
 
 @pytest.mark.asyncio
@@ -1026,7 +1174,7 @@ async def test_bibliography_evidence_must_match_provider_tool_sources(tmp_path: 
     )
     assert result.outcome == ManuscriptOutcome.BIBLIOGRAPHY_REJECTED
     audit_text = (tmp_path / "bibliography_audit.md").read_text(encoding="utf-8")
-    assert "provider" in audit_text
+    assert "independently resolved" in audit_text
 
 
 @pytest.mark.asyncio

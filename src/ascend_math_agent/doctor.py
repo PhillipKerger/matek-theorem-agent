@@ -184,7 +184,8 @@ def _default_codex_deep_probe(executable: str, project_root: Path) -> str:
                 env=sanitized_environment(),
                 input=(
                     "ASCEND doctor probe. Do not run shell commands or modify files. "
-                    "Return exactly the requested JSON object with ok set to true."
+                    "Use web search to find the official Lean theorem prover website, then "
+                    "return exactly the requested JSON object with ok set to true."
                 ),
                 check=False,
                 capture_output=True,
@@ -201,7 +202,37 @@ def _default_codex_deep_probe(executable: str, project_root: Path) -> str:
             raise RuntimeError("Codex did not produce valid structured output") from exc
         if parsed != {"ok": True}:
             raise RuntimeError("Codex returned an unexpected structured probe result")
-    return "live structured-output probe succeeded (search enabled)"
+        source_metadata = _codex_jsonl_has_source_urls(completed.stdout)
+    if source_metadata:
+        return "live structured-output probe succeeded; search source URL metadata is available"
+    return (
+        "live structured-output probe succeeded; this Codex version did not emit search source "
+        "URLs, so ASCEND will use its deterministic source resolver"
+    )
+
+
+def _codex_jsonl_has_source_urls(text: str) -> bool:
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        if value.get("type") == "url_citation" and isinstance(value.get("url"), str):
+            return True
+        item = value.get("item")
+        if not isinstance(item, Mapping):
+            continue
+        action = item.get("action")
+        sources = action.get("sources") if isinstance(action, Mapping) else item.get("sources")
+        if not isinstance(sources, list):
+            continue
+        if any(
+            isinstance(source, Mapping) and isinstance(source.get("url"), str) for source in sources
+        ):
+            return True
+    return False
 
 
 def _configured_backend(config: AppConfig) -> str:

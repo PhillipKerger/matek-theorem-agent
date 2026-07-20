@@ -11,3 +11,7 @@ with a precise obligation list rather than presenting it as solved.
 When the package resolves the target by an existing theorem, identify that theorem and its exact
 hypotheses as imported material. Do not relabel a known result, its exposition, or its
 formalization as a new theorem.
+
+For every imported theorem, provide a stable source ID, canonical identifiers, exact hypotheses,
+and evidence claims linked through source IDs. Leave verification to ASCEND; an unverified
+imported theorem remains an unresolved proof obligation.

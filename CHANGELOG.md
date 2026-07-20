@@ -11,6 +11,19 @@
 - Provider `invalid_json_schema` failures are reported as non-retryable schema compatibility
   errors with the saved schema path instead of `CODEX_PROCESS_CRASH` retries.
 
+### Source provenance reliability
+
+- Prompt compilation, adaptive research, and bibliography validation now share typed source
+  records, explicit evidence-to-source links, and canonical DOI/arXiv/ISBN/MR/HTTPS identifiers.
+- A bounded deterministic resolver verifies identifiers with title checks, retries, redirect
+  handling, resolver fallback, and a run-local success cache; provider citation metadata is no
+  longer required for workflow completion.
+- Prompt compilation performs at most one small source-ledger correction. Optional unresolved
+  literature is removed or marked unknown with warnings, while unverified imported theorems
+  remain blocking proof obligations.
+- Opt-in `ascend doctor --deep` now reports whether the installed Codex JSONL stream exposes
+  search result URLs. Ordinary doctor remains model-call-free.
+
 ### Repository publication cleanup
 
 - Moved the package, tests, resources, documentation, and CI workflow to the repository root.

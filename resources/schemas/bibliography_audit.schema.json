@@ -24,7 +24,7 @@
       "properties": {
         "authoritative_evidence": {
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/SourceEvidenceClaim"
           },
           "title": "Authoritative Evidence",
           "type": "array"
@@ -128,7 +128,7 @@
         },
         "evidence": {
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/SourceEvidenceClaim"
           },
           "title": "Evidence",
           "type": "array"
@@ -145,6 +145,29 @@
         "evidence"
       ],
       "title": "RelatedWorkClaimAudit",
+      "type": "object"
+    },
+    "SourceEvidenceClaim": {
+      "additionalProperties": false,
+      "description": "A prose claim linked explicitly to stable source IDs.",
+      "properties": {
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "claim",
+        "source_ids"
+      ],
+      "title": "SourceEvidenceClaim",
       "type": "object"
     }
   },

@@ -32,6 +32,7 @@ from .reporting import (
     write_final_report,
 )
 from .resources import resource_path, resource_paths
+from .source_provenance import BoundedHttpSourceVerifier, IdentifierVerifier
 from .stages.compile_prompt import (
     EXPECTED_FRAMEWORK_SHA256,
     CompiledProblem,
@@ -105,6 +106,7 @@ class WorkflowDependencies:
     model_client: ModelClient
     execution_backend: ExecutionBackend
     codex_client: CodexClient
+    source_verifier: IdentifierVerifier | None = None
 
 
 class WorkflowResult(BaseModel):
@@ -174,6 +176,13 @@ class WorkflowRunner:
     def __init__(self, config: AppConfig, dependencies: WorkflowDependencies) -> None:
         self.config = config
         self.dependencies = dependencies
+
+    def _source_verifier(self, run_root: Path) -> IdentifierVerifier:
+        if self.dependencies.source_verifier is not None:
+            return self.dependencies.source_verifier
+        cache_path = run_root / "prompts" / "source_verification_cache.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        return BoundedHttpSourceVerifier(cache_path=cache_path)
 
     def _budget_tracker(
         self,
@@ -873,6 +882,7 @@ class WorkflowRunner:
                     expected_framework_sha256=(
                         None if custom is not None else EXPECTED_FRAMEWORK_SHA256
                     ),
+                    source_verifier=self._source_verifier(state.run_root),
                 )
         except Exception as exc:
             self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)
@@ -883,6 +893,7 @@ class WorkflowRunner:
                 "literature_resolution_summary": (
                     result.compiled_problem.literature_resolution_summary
                 ),
+                "source_provenance_warnings": result.source_verification.warnings,
             }
         )
         if result.needs_clarification:
@@ -995,6 +1006,7 @@ class WorkflowRunner:
                         "sources": paths[names[7]],
                         "complexity": paths[names[8]],
                     },
+                    source_verifier=self._source_verifier(state.run_root),
                 )
         except Exception as exc:
             self._failure(state, store, logger, StageName.RESEARCH, exc)
@@ -1086,6 +1098,7 @@ class WorkflowRunner:
                         latex_command=tuple(self.config.manuscript.latex_command),
                         manuscript_prompt_path=paths["prompts/manuscript_writer.md"],
                         bibliography_prompt_path=paths["prompts/bibliography_verifier.md"],
+                        source_verifier=self._source_verifier(state.run_root),
                     )
                 else:
                     result = await generate_manuscript(
@@ -1103,6 +1116,7 @@ class WorkflowRunner:
                         latex_command=tuple(self.config.manuscript.latex_command),
                         manuscript_prompt_path=paths["prompts/manuscript_writer.md"],
                         bibliography_prompt_path=paths["prompts/bibliography_verifier.md"],
+                        source_verifier=self._source_verifier(state.run_root),
                     )
         except Exception as exc:
             self._failure(state, store, logger, StageName.MANUSCRIPT, exc)

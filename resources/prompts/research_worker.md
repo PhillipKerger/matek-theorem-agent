@@ -12,3 +12,6 @@ without a complete finite-reduction theorem.
 If existing literature already proves the exact target, report the precise theorem and source,
 compare every hypothesis and conclusion with the claim contract, and distinguish reconstruction
 or verification from a novel result.
+
+For each external source, provide a stable `source_id`, canonical identifiers, and prose evidence
+claims explicitly linked through `source_ids`. Leave verification to ASCEND.

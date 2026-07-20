@@ -12,9 +12,27 @@ from ascend_math_agent.doctor import (
     CodexAuthentication,
     DoctorGroup,
     _classify_codex_auth,
+    _codex_jsonl_has_source_urls,
     _run_version,
     run_doctor_checks,
 )
+
+
+@pytest.mark.parametrize(
+    ("jsonl", "expected"),
+    [
+        (
+            '{"item":{"action":{"sources":[{"url":"https://lean-lang.org"}]}}}\n',
+            True,
+        ),
+        ('{"type":"url_citation","url":"https://lean-lang.org"}\n', True),
+        ('{"item":{"action":{"type":"search","query":"Lean"}}}\n', False),
+        ("non-json diagnostic\n", False),
+    ],
+)
+def test_codex_jsonl_source_url_capability_detection(jsonl: str, expected: bool) -> None:
+    assert _codex_jsonl_has_source_urls(jsonl) is expected
+
 
 _CODEX_ROOT_HELP = """Commands:
   exec   Run non-interactively
