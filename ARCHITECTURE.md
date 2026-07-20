@@ -23,6 +23,7 @@ problem.md + CLI/environment/project configuration
   -> LaTeX manuscript writer
   -> bibliography verifier
   -> LaTeX compiler
+  -> durable user confirmation (five-minute default-to-proceed timeout)
   -> Lean feasibility agent
   -> challenge.lean generator
   -> statement alignment auditor
@@ -117,6 +118,11 @@ A successful prompt-compilation call may terminate with `NEEDS_PROBLEM_CLARIFICA
 truthful completed outcome rather than a guessed claim contract: downstream stages are skipped,
 clarification questions are persisted, and the final report directs the user to revise the input
 and start a new run.
+
+Every stage handoff validates required upstream statuses and recorded artifact hashes before the
+next stage can start. The manuscript-to-Lean handoff additionally persists the user's approval,
+decline, timeout, or noninteractive default in `lean/consent.json`; resumption reuses that durable
+decision.
 
 ### Research engine
 

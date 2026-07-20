@@ -29,10 +29,13 @@ from ascend_math_agent.stages.compile_prompt import (
     EXPECTED_FRAMEWORK_SHA256,
     CompiledProblem,
     LiteratureStatus,
+    PlaceholderDisposition,
     PromptCompilationStatus,
+    PromptPlaceholderRepair,
     SourceLedgerEntry,
     SourceLedgerRepair,
     compile_prompt,
+    find_unresolved_placeholders,
 )
 from ascend_math_agent.stages.lean import (
     MANDATORY_ALIGNMENT_FIELDS,
@@ -198,6 +201,45 @@ def compiled_problem(
     )
 
 
+@pytest.mark.parametrize(
+    "protected_text",
+    [
+        "The interval [1,c] is finite.",
+        "For every [x,y], take its order complex.",
+        r"The lower interval [1,x^{-1}y] has the required rank.",
+        "Use the indexed interval [a_i,b_j].",
+        "The matrix entry M[i,j] and index set A_{[i,j]} are fixed.",
+        "This follows from [Smith 2020] and [@smith2020].",
+        "See [the primary source](https://example.test/source).",
+        r"\[ [x,y] = \{z : x \le z \le y\}. \]",
+        "Keep `[TODO]` as a literal code example.",
+        "```text\n[INSERT TARGET HERE]\n```",
+    ],
+)
+def test_placeholder_detector_accepts_math_citations_links_and_code(
+    protected_text: str,
+) -> None:
+    assert find_unresolved_placeholders(protected_text) == []
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "[TODO]",
+        "[TBD]",
+        "[FIXME: state the lemma]",
+        "[INSERT TARGET HERE]",
+        "[FILL IN THE CONSTANT]",
+        "[REPLACE THIS TEXT]",
+        "[PLACEHOLDER]",
+        "[citation needed]",
+        "[FULL NAME OF THE PROBLEM, CONJECTURE, OR TARGET THEOREM]",
+    ],
+)
+def test_placeholder_detector_rejects_strong_editorial_markers(marker: str) -> None:
+    assert find_unresolved_placeholders(f"Prose {marker} remains.") == [marker]
+
+
 @pytest.mark.asyncio
 async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
     tmp_path: Path,
@@ -220,6 +262,7 @@ async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
         "framework",
         "compiled_prompt",
         "compiled_problem",
+        "prompt_validation",
         "source_ledger",
         "source_verification",
     }
@@ -236,6 +279,89 @@ async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
             framework_path=FRAMEWORK,
             prompts_dir=tmp_path / "bad",
         )
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_uses_one_small_context_only_placeholder_repair(
+    tmp_path: Path,
+) -> None:
+    payload = compiled_problem(
+        covered_compiled_prompt("Prove [INSERT TARGET HERE] under the stated hypotheses.")
+    )
+    repair = PromptPlaceholderRepair(
+        replacement_sentence="Prove P for every n under the stated hypotheses."
+    )
+    client = StaticClient([payload, repair])
+
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
+
+    assert result.calls.model_calls == 2
+    assert result.prompt_validation.passed is True
+    assert result.prompt_validation.diagnostics[0].disposition is PlaceholderDisposition.REPAIRED
+    assert "[INSERT TARGET HERE]" not in result.compiled_prompt
+    repair_input = json.loads(client.requests[1].input_text)
+    assert set(repair_input) == {
+        "claim_contract",
+        "normalized_statement",
+        "section_name",
+        "suspect_sentence",
+    }
+    assert "compiled_prompt" not in repair_input
+    assert client.requests[1].settings.web_search is False
+    assert client.requests[1].settings.max_output_tokens == 1_200
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_downgrades_unrepairable_optional_sentence(
+    tmp_path: Path,
+) -> None:
+    prompt = covered_compiled_prompt().replace(
+        "Known starting point and exact bottleneck\n",
+        "Known starting point and exact bottleneck\nRemove [TODO] from this optional note.\n",
+    )
+    client = StaticClient([compiled_problem(prompt)])
+
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
+
+    assert result.prompt_validation.passed is True
+    assert result.prompt_validation.warnings
+    diagnostic = result.prompt_validation.diagnostics[0]
+    assert diagnostic.disposition is PlaceholderDisposition.REMOVED_OPTIONAL
+    assert diagnostic.target_critical is False
+    assert "[TODO]" not in result.compiled_prompt
+    persisted = json.loads((tmp_path / "prompt_validation.json").read_text(encoding="utf-8"))
+    assert persisted["warnings"] == result.prompt_validation.warnings
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_preserves_artifacts_on_target_critical_repair_failure(
+    tmp_path: Path,
+) -> None:
+    payload = compiled_problem(covered_compiled_prompt("Prove [INSERT TARGET HERE]."))
+
+    with pytest.raises(StageValidationError, match=r"\[INSERT TARGET HERE\]"):
+        await compile_prompt(
+            client=StaticClient([payload]),
+            problem_text="Prove P.",
+            framework_path=FRAMEWORK,
+            prompts_dir=tmp_path,
+        )
+
+    assert (tmp_path / "compiled_problem.json").is_file()
+    assert (tmp_path / "compiled_research_prompt.md").is_file()
+    validation = json.loads((tmp_path / "prompt_validation.json").read_text(encoding="utf-8"))
+    assert validation["passed"] is False
+    assert validation["diagnostics"][0]["disposition"] == "target_critical_failure"
 
 
 @pytest.mark.asyncio

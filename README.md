@@ -140,9 +140,12 @@ default, ASCEND writes only beneath `.ascend/`; editing project source requires 
    before accepting a candidate.
 4. **Manuscript:** writes the paper only after research acceptance, verifies the bibliography,
    adds the required AI-usage disclosure, and compiles the LaTeX.
-5. **Formalization:** audits theorem-statement alignment, attempts Lean formalization, and runs
+5. **Lean confirmation:** asks whether to proceed with formal verification. Answering `n` skips
+   Lean and prepares the report; no answer within five minutes proceeds automatically. A
+   noninteractive run also proceeds immediately rather than hanging.
+6. **Formalization:** audits theorem-statement alignment, attempts Lean formalization, and runs
    deterministic compiler and placeholder/axiom checks.
-6. **Reporting:** preserves the evidence, provenance, diagnostics, and authoritative outcome in
+7. **Reporting:** preserves the evidence, provenance, diagnostics, and authoritative outcome in
    human- and machine-readable reports.
 
 ### If the problem is already solved

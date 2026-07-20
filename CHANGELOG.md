@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Added hash-validated stage-boundary guards so downstream work cannot start from incomplete or
+  modified upstream checkpoints.
+- Added a durable post-manuscript Lean confirmation. Interactive users may decline; five minutes
+  without an answer defaults to proceeding, and noninteractive runs proceed without hanging.
+- Made compiled-prompt placeholder validation resilient to mathematical interval, index, matrix,
+  citation, Markdown, code, and LaTeX notation. Strong editorial markers now receive one bounded
+  sentence-only repair; optional unresolved text is downgraded with a persisted warning, while
+  target-critical ambiguity still fails closed.
+- Persisted `prompts/prompt_validation.json` and the compiled/source artifacts before the
+  placeholder gate. Forced prompt-stage recovery reuses successful compiler/source calls and
+  refreshes only the bounded repair generation.
+- Rendered CLI exception text with Rich markup disabled so bracketed diagnostics remain literal.
+
 ### Command-line progress
 
 - `ascend run` and active resumes now print sparse numbered `ASCENSION` milestones for intake,

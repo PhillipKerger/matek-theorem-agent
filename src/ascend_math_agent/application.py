@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -78,8 +79,10 @@ from .workspace import (
     RunLock,
     atomic_write_json,
     atomic_write_text,
+    ensure_path_confined,
     find_run_root,
     latest_run_root,
+    sha256_file,
 )
 
 
@@ -102,6 +105,40 @@ class WorkflowOptions(BaseModel):
     invocation: dict[str, Any] = Field(default_factory=dict)
 
 
+LEAN_CONSENT_TIMEOUT_SECONDS = 5 * 60
+
+
+class LeanConsentOutcome(StrEnum):
+    """Durable result of the manuscript-to-Lean user checkpoint."""
+
+    USER_APPROVED = "user_approved"
+    USER_DECLINED = "user_declined"
+    TIMED_OUT = "timed_out_auto_proceed"
+    NON_INTERACTIVE = "non_interactive_auto_proceed"
+    AUTOMATION_DEFAULT = "automation_default_auto_proceed"
+    PROMPT_ERROR = "prompt_error_auto_proceed"
+
+    @property
+    def proceed(self) -> bool:
+        return self is not LeanConsentOutcome.USER_DECLINED
+
+
+@dataclass(frozen=True)
+class LeanConsentRequest:
+    run_id: str
+    manuscript_path: Path
+    timeout_seconds: int = LEAN_CONSENT_TIMEOUT_SECONDS
+
+
+LeanConsentHandler = Callable[[LeanConsentRequest], Awaitable[LeanConsentOutcome]]
+
+
+async def automatic_lean_consent(_: LeanConsentRequest) -> LeanConsentOutcome:
+    """Noninteractive library default; the CLI injects the actual terminal prompt."""
+
+    return LeanConsentOutcome.AUTOMATION_DEFAULT
+
+
 @dataclass(frozen=True)
 class WorkflowDependencies:
     model_client: ModelClient
@@ -109,6 +146,7 @@ class WorkflowDependencies:
     codex_client: CodexClient
     source_verifier: IdentifierVerifier | None = None
     progress: ProgressReporter = no_progress
+    lean_consent: LeanConsentHandler = automatic_lean_consent
 
 
 class WorkflowResult(BaseModel):
@@ -149,6 +187,13 @@ def _model_cache_namespace(state: RunState) -> str:
     if provider not in {"codex", "api"}:
         raise StateCorruptionError("provider-scoped model cache has invalid backend metadata")
     return f"{provider}-generation-{generation}"
+
+
+def _prompt_validation_generation(state: RunState) -> int:
+    value = state.metadata.get("prompt_validation_generation", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise StateCorruptionError("prompt_validation_generation must be a nonnegative integer")
+    return value
 
 
 def _sync_paid_calls_from_usage(state: RunState, records: list[UsageRecord]) -> bool:
@@ -400,7 +445,23 @@ class WorkflowRunner:
                 StageName.LEAN_VERIFICATION: StageName.LEAN_FEASIBILITY,
             }.get(force_stage, force_stage)
             invalidate_from(state, composite_boundary, "explicit --force-stage request")
-            state.metadata["model_cache_generation"] = _model_cache_generation(state) + 1
+            if force_stage in {
+                StageName.MANUSCRIPT,
+                StageName.BIBLIOGRAPHY,
+                StageName.LEAN_FEASIBILITY,
+                StageName.LEAN_ALIGNMENT,
+                StageName.LEAN_FORMALIZATION,
+                StageName.LEAN_VERIFICATION,
+            }:
+                self._archive_lean_consent(state, reason="explicit --force-stage request")
+            if force_stage is StageName.PROMPT_COMPILATION:
+                # Preserve the expensive successful compiler/source calls. Only the bounded
+                # post-compilation repair gets a fresh identity for this explicit recovery.
+                state.metadata["prompt_validation_generation"] = (
+                    _prompt_validation_generation(state) + 1
+                )
+            else:
+                state.metadata["model_cache_generation"] = _model_cache_generation(state) + 1
             assert_recorded_artifacts(state)
         else:
             assert_recorded_artifacts(state)
@@ -590,6 +651,12 @@ class WorkflowRunner:
         )
         logger.event("workflow.resumed", data={"run_id": state.run_id})
         try:
+            self._validate_stage_boundary(
+                state,
+                logger,
+                completed=(StageName.INTAKE,),
+                next_step=StageName.PROMPT_COMPILATION.value,
+            )
             compiled = await self._prompt_stage(state, store, logger, budget, options)
             if compiled.needs_clarification:
                 self._skip_after_prompt(
@@ -601,6 +668,12 @@ class WorkflowRunner:
                     state=state,
                     report=self._report_stage(state, store, logger),
                 )
+            self._validate_stage_boundary(
+                state,
+                logger,
+                completed=(StageName.PROMPT_COMPILATION,),
+                next_step=StageName.RESEARCH.value,
+            )
             research = await self._research_stage(state, store, logger, budget, compiled)
             if not research.accepted_for_manuscript:
                 self._skip_manuscript_and_lean(state, "research acceptance gate did not pass")
@@ -612,6 +685,13 @@ class WorkflowRunner:
                 state.metadata["lean_status"] = ScientificStatus.LEAN_NOT_REQUESTED.value
                 store.save(state)
                 return WorkflowResult(state=state, report=self._report_stage(state, store, logger))
+
+            self._validate_stage_boundary(
+                state,
+                logger,
+                completed=(StageName.RESEARCH, StageName.RESEARCH_AUDIT),
+                next_step=StageName.MANUSCRIPT.value,
+            )
 
             manuscript = await self._manuscript_stage(
                 state, store, logger, budget, compiled, research
@@ -627,6 +707,25 @@ class WorkflowRunner:
                 store.save(state)
                 return WorkflowResult(state=state, report=self._report_stage(state, store, logger))
 
+            self._validate_stage_boundary(
+                state,
+                logger,
+                completed=(StageName.MANUSCRIPT, StageName.BIBLIOGRAPHY),
+                next_step="lean_consent",
+            )
+            if not await self._confirm_lean_after_manuscript(state, store, logger):
+                self._skip_lean(state, "user declined Lean verification after manuscript")
+                state.scientific_status = ScientificStatus.LEAN_NOT_REQUESTED
+                state.metadata["lean_status"] = ScientificStatus.LEAN_NOT_REQUESTED.value
+                store.save(state)
+                return WorkflowResult(state=state, report=self._report_stage(state, store, logger))
+
+            self._validate_stage_boundary(
+                state,
+                logger,
+                completed=(StageName.MANUSCRIPT, StageName.BIBLIOGRAPHY),
+                next_step=StageName.LEAN_FEASIBILITY.value,
+            )
             await self._lean_stage(state, store, logger, budget, compiled, manuscript, options)
             return WorkflowResult(state=state, report=self._report_stage(state, store, logger))
         except asyncio.CancelledError:
@@ -850,6 +949,167 @@ class WorkflowRunner:
         self._sync_backend_metadata(state)
         store.save(state)
 
+    @staticmethod
+    def _validate_stage_boundary(
+        state: RunState,
+        logger: RunLogger,
+        *,
+        completed: Sequence[StageName],
+        next_step: str,
+    ) -> None:
+        """Fail closed before crossing a stage boundary with incomplete or changed inputs."""
+
+        incomplete = [
+            stage.value
+            for stage in completed
+            if state.stages[stage].status is not StageStatus.SUCCEEDED
+        ]
+        if incomplete:
+            raise StateCorruptionError(
+                f"cannot enter {next_step}; required stage checkpoints are not successful: "
+                + ", ".join(incomplete)
+            )
+        assert_recorded_artifacts(state)
+        logger.event(
+            "stage.boundary.validated",
+            data={
+                "completed": [stage.value for stage in completed],
+                "next_step": next_step,
+            },
+        )
+
+    @staticmethod
+    def _existing_lean_consent(state: RunState) -> LeanConsentOutcome | None:
+        raw = state.metadata.get("lean_consent")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise StateCorruptionError("lean_consent metadata must be an object")
+        try:
+            outcome = LeanConsentOutcome(str(raw["outcome"]))
+            expected_hash = str(raw["artifact_sha256"])
+            artifact_path = ensure_path_confined(
+                state.run_root, state.run_root / str(raw["artifact"])
+            )
+        except (KeyError, ValueError) as exc:
+            raise StateCorruptionError("lean_consent metadata is incomplete or invalid") from exc
+        if not artifact_path.is_file() or artifact_path.is_symlink():
+            raise StateCorruptionError("the durable Lean consent artifact is missing or unsafe")
+        if sha256_file(artifact_path) != expected_hash:
+            raise StateCorruptionError("the durable Lean consent artifact has changed")
+        try:
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StateCorruptionError("the durable Lean consent artifact is invalid") from exc
+        if (
+            not isinstance(artifact, dict)
+            or artifact.get("run_id") != state.run_id
+            or artifact.get("outcome") != outcome.value
+            or artifact.get("proceed") is not outcome.proceed
+            or raw.get("proceed") is not outcome.proceed
+        ):
+            raise StateCorruptionError("Lean consent metadata does not match its durable artifact")
+        return outcome
+
+    @classmethod
+    def _archive_lean_consent(cls, state: RunState, *, reason: str) -> None:
+        """Preserve an invalidated decision as history before a forced downstream rerun."""
+
+        outcome = cls._existing_lean_consent(state)
+        if outcome is None:
+            return
+        consent_path = ensure_path_confined(
+            state.run_root, state.run_root / "lean" / "consent.json"
+        )
+        artifact = json.loads(consent_path.read_text(encoding="utf-8"))
+        history_path = (
+            state.run_root
+            / "lean"
+            / "consent-history"
+            / f"checkpoint-{state.checkpoint_generation}.json"
+        )
+        atomic_write_json(
+            history_path,
+            {
+                **artifact,
+                "invalidated_at": datetime.now(UTC).isoformat(),
+                "invalidation_reason": reason,
+                "previous_outcome": outcome.value,
+            },
+            confinement_root=state.run_root,
+        )
+        consent_path.unlink()
+        raw_history = state.metadata.get("lean_consent_history", [])
+        history = list(raw_history) if isinstance(raw_history, list) else []
+        history.append(
+            {
+                "outcome": outcome.value,
+                "artifact": history_path.relative_to(state.run_root).as_posix(),
+                "reason": reason,
+            }
+        )
+        state.metadata["lean_consent_history"] = history
+        state.metadata.pop("lean_consent", None)
+
+    async def _confirm_lean_after_manuscript(
+        self,
+        state: RunState,
+        store: StateStore,
+        logger: RunLogger,
+    ) -> bool:
+        """Ask once after the manuscript gate and durably preserve the answer."""
+
+        existing = self._existing_lean_consent(state)
+        if existing is not None:
+            logger.event(
+                "lean.consent.reused",
+                data={"outcome": existing.value, "proceed": existing.proceed},
+            )
+            return existing.proceed
+
+        request = LeanConsentRequest(
+            run_id=state.run_id,
+            manuscript_path=state.run_root / "manuscript" / "paper.pdf",
+        )
+        error_kind: str | None = None
+        try:
+            raw_outcome = await asyncio.wait_for(
+                self.dependencies.lean_consent(request),
+                timeout=request.timeout_seconds,
+            )
+            outcome = LeanConsentOutcome(raw_outcome)
+        except TimeoutError:
+            outcome = LeanConsentOutcome.TIMED_OUT
+        except Exception as exc:
+            # A broken terminal prompt must not discard a verified manuscript or strand the
+            # workflow. Treat it as no response, record the error class, and proceed.
+            outcome = LeanConsentOutcome.PROMPT_ERROR
+            error_kind = type(exc).__name__
+
+        consent_path = state.run_root / "lean" / "consent.json"
+        payload = {
+            "schema_version": 1,
+            "run_id": state.run_id,
+            "outcome": outcome.value,
+            "proceed": outcome.proceed,
+            "timeout_seconds": request.timeout_seconds,
+            "manuscript": request.manuscript_path.relative_to(state.run_root).as_posix(),
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "prompt_error_kind": error_kind,
+        }
+        atomic_write_json(consent_path, payload, confinement_root=state.run_root)
+        state.metadata["lean_consent"] = {
+            **payload,
+            "artifact": consent_path.relative_to(state.run_root).as_posix(),
+            "artifact_sha256": sha256_file(consent_path),
+        }
+        logger.event(
+            "lean.consent.recorded",
+            data={"outcome": outcome.value, "proceed": outcome.proceed},
+        )
+        store.save(state)
+        return outcome.proceed
+
     async def _prompt_stage(
         self,
         state: RunState,
@@ -890,10 +1150,32 @@ class WorkflowRunner:
                         None if custom is not None else EXPECTED_FRAMEWORK_SHA256
                     ),
                     source_verifier=self._source_verifier(state.run_root),
+                    placeholder_repair_generation=_prompt_validation_generation(state),
                 )
         except Exception as exc:
+            prompt_dir = state.run_root / "prompts"
+            preserved = (
+                sorted(
+                    path.relative_to(state.run_root).as_posix()
+                    for path in prompt_dir.iterdir()
+                    if path.is_file() and not path.is_symlink()
+                )
+                if prompt_dir.is_dir()
+                else []
+            )
+            state.metadata["prompt_compilation_recovery"] = {
+                "artifacts_preserved": preserved,
+                "placeholder_repair_generation": state.metadata.get(
+                    "prompt_validation_generation", 0
+                ),
+                "next_action": (
+                    "Resume to reuse cached compiler/source work, or use --force-stage "
+                    "prompt_compilation for a fresh bounded placeholder-repair generation."
+                ),
+            }
             self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)
             raise
+        state.metadata.pop("prompt_compilation_recovery", None)
         state.metadata.update(
             {
                 "literature_status": result.compiled_problem.literature_status.value,
@@ -901,6 +1183,8 @@ class WorkflowRunner:
                     result.compiled_problem.literature_resolution_summary
                 ),
                 "source_provenance_warnings": result.source_verification.warnings,
+                "prompt_validation_warnings": result.prompt_validation.warnings,
+                "prompt_validation_generation": result.prompt_validation.repair_generation,
             }
         )
         if result.needs_clarification:
@@ -1332,6 +1616,20 @@ class WorkflowRunner:
         store: StateStore,
         logger: RunLogger,
     ) -> ReportArtifacts:
+        assert_recorded_artifacts(state)
+        self._existing_lean_consent(state)
+        logger.event(
+            "stage.boundary.validated",
+            data={
+                "completed": [
+                    stage.value
+                    for stage, record in state.stages.items()
+                    if stage is not StageName.REPORT
+                    and record.status in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}
+                ],
+                "next_step": StageName.REPORT.value,
+            },
+        )
         existing = state.stages[StageName.REPORT]
         if existing.status is StageStatus.SUCCEEDED:
             return load_final_report(state.run_root)

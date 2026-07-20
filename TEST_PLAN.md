@@ -13,6 +13,7 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 - Run ID generation and project discovery.
 - Atomic state writes and recovery from truncated temp files.
 - Stage transition legality.
+- Stage-boundary status and artifact-integrity validation.
 - Artifact hash and framework integrity checks.
 - Placeholder detection in compiled prompts.
 - Ambiguous input produces a clarification request and no downstream model or command calls.
@@ -42,6 +43,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
     custom framework is explicitly selected.
 11. Ambiguous problem: clarification is reported and all research/manuscript/Lean stages skip.
 12. Existing theorem: exact source/hypothesis matching is recorded without a novelty claim.
+13. Post-manuscript Lean confirmation: approve, decline, five-minute timeout-to-proceed,
+    noninteractive auto-proceed, and crash-safe decision reuse.
 
 ## Optional live tests
 

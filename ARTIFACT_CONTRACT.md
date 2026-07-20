@@ -17,6 +17,7 @@ Every run must follow this layout:
 │   ├── framework.txt
 │   ├── compiled_research_prompt.md
 │   ├── compiled_problem.json
+│   ├── prompt_validation.json
 │   └── source_ledger.json
 ├── research/
 │   ├── registry.json
@@ -38,6 +39,7 @@ Every run must follow this layout:
 │   ├── paper.pdf
 │   └── build.log
 ├── lean/
+│   ├── consent.json
 │   ├── FORMALIZATION_INSTRUCTIONS.md
 │   ├── formalization.yaml
 │   ├── challenge.lean

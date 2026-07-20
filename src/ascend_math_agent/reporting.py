@@ -59,6 +59,8 @@ class FinalReport(BaseModel):
     problem_clarification: dict[str, Any] = Field(default_factory=dict)
     literature_status: str = "unknown"
     literature_resolution_summary: str | None = None
+    prompt_validation_warnings: list[str] = Field(default_factory=list)
+    lean_consent: dict[str, Any] = Field(default_factory=dict)
     reproducibility: list[str] = Field(default_factory=list)
     narrative: ReportNarrative | None = None
 
@@ -182,6 +184,14 @@ def build_final_report(
             if metadata.get("literature_resolution_summary")
             else None
         ),
+        prompt_validation_warnings=(
+            [str(item) for item in metadata.get("prompt_validation_warnings", [])]
+            if isinstance(metadata.get("prompt_validation_warnings", []), list)
+            else []
+        ),
+        lean_consent=(
+            dict(metadata["lean_consent"]) if isinstance(metadata.get("lean_consent"), dict) else {}
+        ),
         reproducibility=[
             f"ascend status {state.run_id}",
             f"ascend verify {state.run_id}",
@@ -246,6 +256,17 @@ def render_report_markdown(report: FinalReport) -> str:
             ]
         )
 
+    if report.lean_consent:
+        lines.extend(
+            [
+                "## Lean verification decision",
+                "",
+                f"- Outcome: `{report.lean_consent.get('outcome', 'unknown')}`",
+                f"- Proceeded: `{report.lean_consent.get('proceed', False)}`",
+                "",
+            ]
+        )
+
     lines.extend(
         [
             "## Prior literature assessment",
@@ -255,6 +276,9 @@ def render_report_markdown(report: FinalReport) -> str:
     )
     if report.literature_resolution_summary:
         lines.append(f"- Assessment: {report.literature_resolution_summary}")
+    if report.prompt_validation_warnings:
+        lines.extend(["", "## Prompt validation warnings", ""])
+        lines.extend(f"- {warning}" for warning in report.prompt_validation_warnings)
     lines.extend(
         [
             "",

@@ -113,6 +113,17 @@ ASCENSION 7: Preparing final report.
 Ascensions 2 and 3 repeat for each adaptive research round. Skipped or already checkpointed stages
 do not print misleading progress lines.
 
+After a manuscript compiles and its bibliography is verified, an interactive full run asks:
+
+```text
+The verified manuscript is ready. Proceed with formal Lean verification? [Y/n]
+```
+
+`n` skips Lean and prepares the final report. An empty/affirmative answer proceeds. If the user
+does not answer within five minutes, ASCEND proceeds automatically. Noninteractive invocations
+also proceed immediately rather than hanging. The decision is durable and is not asked again on
+ordinary resume.
+
 ## `ascend status [RUN_ID]`
 
 Shows the selected backend, nonsecret authentication class, Codex/backend version, requested

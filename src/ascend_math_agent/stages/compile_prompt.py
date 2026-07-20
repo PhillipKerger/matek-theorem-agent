@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
@@ -38,10 +38,60 @@ from .common import (
 EXPECTED_FRAMEWORK_SHA256 = "bd724294a261f4bc2e5da2191813e40c1340bc6ee039c753cb5c60276e7a512c"
 
 _BRACKETED_TEXT = re.compile(r"\[([^\[\]\r\n]{1,240})\]")
-_MATH_BRACKET_CONTENT = re.compile(
-    r"(?:[-+]?\d+(?:\.\d+)?(?:\s*[,;:]\s*[-+]?\d+(?:\.\d+)?)*)"
-    r"|(?:[A-Za-z](?:_[A-Za-z0-9]+)?)"
-    r"|(?:[^A-Za-z]{1,80})"
+_STRONG_EDITORIAL_MARKER = re.compile(
+    r"(?:\b(?:TODO|TBD|FIXME|PLACEHOLDER)\b|\bcitation\s+needed\b|"
+    r"\bINSERT\b|\bFILL(?:\s+THIS)?\s+IN\b|\bREPLACE\b)",
+    re.IGNORECASE,
+)
+_CITATION_CONTENT = re.compile(
+    r"(?:@[-:.\w]+|\d+(?:\s*[-,]\s*\d+)*|[^\]]+\b(?:18|19|20)\d{2}[a-z]?)",
+    re.IGNORECASE,
+)
+_PROTECTED_TEXT = re.compile(
+    r"```.*?```|~~~.*?~~~|`[^`\r\n]*`|\$\$.*?\$\$|"
+    r"(?<!\\)\$(?!\$).*?(?<!\\)\$|\\\(.*?\\\)|\\\[.*?\\\]",
+    re.DOTALL,
+)
+_KNOWN_FRAMEWORK_PLACEHOLDERS = frozenset(
+    {
+        "BEGIN REUSABLE RESEARCH PROMPT FRAMEWORK",
+        "FULL NAME OF THE PROBLEM, CONJECTURE, OR TARGET THEOREM",
+        "A complete proof of the stated theorem, with all nonstandard intermediate claims proved.",
+        "A fully specified construction, algorithm, reduction, strategy, or certificate.",
+        "A proof that the constructed object belongs to the required admissible class.",
+        "A proof that the construction satisfies the exact target property.",
+        "A complete quantitative analysis, including all constants and parameter choices.",
+        "Verification that every external theorem is being used under its exact hypotheses.",
+        "INSERT OTHER PROBLEM-SPECIFIC NEAR MISSES THAT MUST BE RULED OUT",
+        "replace the problematic estimate by a quantity controlled by the desired benchmark",
+        "prove that the problematic case can be reduced to a controlled family of cases",
+        "insert other formally described ways of bypassing the bottleneck",
+        "Optional but strongly recommended when the literature identifies a clear bottleneck.",
+        "NAME OR DESCRIPTION OF A SUFFICIENT INTERMEDIATE RESULT",
+        "NAME OR DESCRIPTION OF A DIFFERENT SUFFICIENT INTERMEDIATE RESULT",
+        "NAME OR DESCRIPTION OF A THIRD SUFFICIENT INTERMEDIATE RESULT",
+        "State the result and the exact deduction it would enable.",
+        "Add further routes only when they are mathematically distinct.",
+        "NAME OF THE AVAILABLE MULTIAGENT SYSTEM",
+        "MAXIMUM CONCURRENT AGENT COUNT",
+        "INSERT APPROACH FAMILIES PARTICULARLY NATURAL IN THE RELEVANT FIELD",
+        "FOR ALGORITHMIC OR QUANTITATIVE RESULTS",
+        "INSERT ANY ADDITIONAL AUDIT ROLE PARTICULARLY IMPORTANT FOR THE PROBLEM",
+        "A complete theorem for a significant but proper subclass",
+        "A quantitatively weaker algorithm or bound",
+        "A result under a clearly stated additional hypothesis",
+        "A structural theorem that isolates the remaining obstruction",
+        "A formal barrier theorem for a precisely defined family of methods",
+        "A counterexample to a natural intermediate conjecture",
+        "A new equivalence that genuinely changes the available toolkit",
+        "A verified computational pattern that motivates a precise conjecture",
+        "INSERT PROBLEM-SPECIFIC INTERMEDIATE OUTCOMES",
+        "STATE WHETHER SEARCHING FOR A DIRECT SOLUTION TO THE EXACT PROBLEM IS PERMITTED.",
+        "END OF PROMPT FRAMEWORK",
+    }
+)
+_KNOWN_FRAMEWORK_PLACEHOLDERS_CASEFOLDED = frozenset(
+    item.casefold() for item in _KNOWN_FRAMEWORK_PLACEHOLDERS
 )
 _FRAMEWORK_SECTIONS = (
     "Current task statement",
@@ -58,6 +108,7 @@ _FRAMEWORK_SECTIONS = (
     "Final-response format",
 )
 _MINIMUM_SECTION_WORDS = 8
+_TARGET_CRITICAL_SECTIONS = frozenset({"Current task statement", "Exact success criterion"})
 
 
 class PromptCompilationStatus(StrEnum):
@@ -137,6 +188,55 @@ class SourceLedgerRepair(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_ledger: list[SourceLedgerEntry]
+
+
+class PromptPlaceholderRepair(BaseModel):
+    """One bounded replacement for a sentence containing an editorial placeholder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    replacement_sentence: str
+
+    @field_validator("replacement_sentence")
+    @classmethod
+    def replacement_nonempty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("a placeholder repair must provide a replacement sentence")
+        return normalized
+
+
+class PlaceholderDisposition(StrEnum):
+    REPAIRED = "repaired"
+    REMOVED_OPTIONAL = "removed_optional"
+    TARGET_CRITICAL_FAILURE = "target_critical_failure"
+
+
+class PlaceholderDiagnostic(BaseModel):
+    """Visible, persisted explanation of one placeholder-recovery decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    section: str
+    sentence: str
+    target_critical: bool
+    disposition: PlaceholderDisposition
+    detail: str
+    replacement_sentence: str | None = None
+
+
+class PromptValidationReport(BaseModel):
+    """Deterministic validation and bounded-repair audit for a compiled prompt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    repair_generation: int = Field(default=0, ge=0)
+    initial_suspects: list[str] = Field(default_factory=list)
+    diagnostics: list[PlaceholderDiagnostic] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    passed: bool = False
 
 
 class ClaimContractEntry(BaseModel):
@@ -293,6 +393,7 @@ class PromptCompilationResult(BaseModel):
     compiled_problem: CompiledProblem
     framework_sha256: str
     source_verification: SourceVerificationReport = Field(default_factory=SourceVerificationReport)
+    prompt_validation: PromptValidationReport = Field(default_factory=PromptValidationReport)
     artifacts: ArtifactManifest = Field(default_factory=ArtifactManifest)
     calls: CallManifest
 
@@ -322,32 +423,255 @@ class PromptCompilationResult(BaseModel):
 
 
 def find_unresolved_placeholders(text: str, *, allowlist: Collection[str] = ()) -> list[str]:
-    """Return unresolved editorial square-bracket placeholders.
+    """Return only square-bracket tokens with strong evidence of editorial intent.
 
-    Numeric intervals, punctuation-only mathematical notation, a single mathematical
-    identifier, Markdown links, and explicit allowlist entries are not editorial
-    placeholders.  Natural-language bracket contents are rejected.  This deliberately errs
-    on the side of stopping the paid workflow rather than shipping an unfilled template.
+    Generic brackets are mathematical notation far more often than they are template holes.
+    The detector therefore recognizes explicit editing commands and exact placeholders from
+    ASCEND's bundled framework, while protecting code, LaTeX, citations, Markdown links, and
+    symbolic/index notation.  Ambiguous natural-language brackets are intentionally accepted.
     """
 
     allowed = {item.strip() for item in allowlist}
+    protected_ranges = [match.span() for match in _PROTECTED_TEXT.finditer(text)]
     unresolved: list[str] = []
     for match in _BRACKETED_TEXT.finditer(text):
         content = match.group(1).strip()
         if not content or content in allowed:
             continue
-        if match.start() > 0 and text[match.start() - 1] == "\\":
-            # LaTeX display delimiter: \[ ... \].
+        if any(start <= match.start() and match.end() <= end for start, end in protected_ranges):
             continue
         if match.end() < len(text) and text[match.end()] == "(":
             # Markdown link label: [primary source](https://...).
             continue
-        if _MATH_BRACKET_CONTENT.fullmatch(content):
+        if _CITATION_CONTENT.fullmatch(content):
+            continue
+        is_known_template_token = content.casefold() in _KNOWN_FRAMEWORK_PLACEHOLDERS_CASEFOLDED
+        has_editorial_marker = _STRONG_EDITORIAL_MARKER.search(content) is not None
+        if not is_known_template_token and not has_editorial_marker:
+            # The conservative default protects all generic bracket content, including
+            # operators, delimiters, digits, indices, superscripts, and symbolic tuples.
             continue
         token = match.group(0)
         if token not in unresolved:
             unresolved.append(token)
     return unresolved
+
+
+def _section_at(text: str, offset: int) -> str:
+    section = "Unsectioned prompt text"
+    latest_offset = -1
+    prefix = text[:offset]
+    for candidate in _FRAMEWORK_SECTIONS:
+        pattern = re.compile(rf"(?im)^[ \t]*(?:#+[ \t]+)?{re.escape(candidate)}[ \t]*:?[ \t]*$")
+        matches = list(pattern.finditer(prefix))
+        if matches and matches[-1].start() > latest_offset:
+            section = candidate
+            latest_offset = matches[-1].start()
+    return section
+
+
+def _sentence_span(text: str, offset: int) -> tuple[int, int]:
+    """Return a small sentence-or-line span containing *offset*."""
+
+    start = offset
+    while start > 0 and text[start - 1] not in ".!?\n":
+        start -= 1
+    while start < offset and text[start].isspace() and text[start] != "\n":
+        start += 1
+    end = offset
+    while end < len(text) and text[end] not in ".!?\n":
+        end += 1
+    if end < len(text) and text[end] in ".!?":
+        end += 1
+    return start, end
+
+
+def _remove_sentence(text: str, start: int, end: int) -> str:
+    before = text[:start].rstrip(" \t")
+    after = text[end:].lstrip(" \t")
+    return before + after
+
+
+def _write_prompt_snapshot(
+    destination: Path,
+    *,
+    framework_bytes: bytes,
+    compiled: CompiledProblem,
+    verification: SourceVerificationReport,
+    validation: PromptValidationReport,
+    provider_metadata: Sequence[dict[str, Any] | Any],
+) -> dict[str, Path]:
+    """Persist recoverable prompt work before any post-compilation gate can fail."""
+
+    paths = {
+        "framework": atomic_write_bytes(destination / "framework.txt", framework_bytes),
+        "compiled_problem": atomic_write_json(destination / "compiled_problem.json", compiled),
+        "source_ledger": atomic_write_json(
+            destination / "source_ledger.json",
+            [entry.model_dump(mode="json") for entry in compiled.source_ledger],
+        ),
+        "source_verification": atomic_write_json(
+            destination / "source_verification.json", verification
+        ),
+        "prompt_validation": atomic_write_json(destination / "prompt_validation.json", validation),
+    }
+    if compiled.status is PromptCompilationStatus.COMPILED:
+        paths["compiled_prompt"] = atomic_write_text(
+            destination / "compiled_research_prompt.md", compiled.compiled_prompt
+        )
+    else:
+        paths["clarification_request"] = atomic_write_text(
+            destination / "clarification_request.md",
+            _render_clarification_request(compiled),
+        )
+    if provider_metadata:
+        paths["source_provider_metadata"] = atomic_write_json(
+            destination / "source_provider_metadata.json",
+            [dict(item) for item in provider_metadata],
+        )
+    return paths
+
+
+async def _recover_prompt_placeholders(
+    *,
+    client: ModelClient,
+    compiled: CompiledProblem,
+    settings: ModelSettings,
+    allowlist: Collection[str],
+    repair_generation: int,
+    persist: Callable[[PromptValidationReport], None],
+) -> tuple[PromptValidationReport, list[str]]:
+    """Repair strong editorial markers without rerunning the full compiler."""
+
+    validation = PromptValidationReport(
+        repair_generation=repair_generation,
+        initial_suspects=find_unresolved_placeholders(
+            compiled.compiled_prompt, allowlist=allowlist
+        ),
+    )
+    persist(validation)
+    repair_response_ids: list[str] = []
+    repair_attempts = 0
+    maximum_repair_calls = len(validation.initial_suspects)
+    repair_settings = settings.model_copy(
+        update={
+            "reasoning_mode": "standard",
+            "reasoning_effort": "medium",
+            "web_search": False,
+            "maximum_web_search_calls": 1,
+            "max_output_tokens": min(settings.max_output_tokens, 1_200),
+        }
+    )
+
+    while True:
+        suspects = find_unresolved_placeholders(compiled.compiled_prompt, allowlist=allowlist)
+        if not suspects:
+            validation.passed = True
+            persist(validation)
+            return validation, repair_response_ids
+
+        token = suspects[0]
+        offset = compiled.compiled_prompt.find(token)
+        if offset < 0:  # pragma: no cover - detector and lookup use the same string
+            raise StageValidationError(f"Cannot locate detected prompt placeholder {token}.")
+        start, end = _sentence_span(compiled.compiled_prompt, offset)
+        sentence = compiled.compiled_prompt[start:end].strip()
+        section = _section_at(compiled.compiled_prompt, offset)
+        target_critical = section in _TARGET_CRITICAL_SECTIONS
+        replacement: str | None = None
+        repair_detail: str
+        if repair_attempts >= maximum_repair_calls:
+            repair_detail = "The bounded placeholder-repair call limit was reached."
+        else:
+            repair_attempts += 1
+            try:
+                repair_result = await client.generate_structured(
+                    ModelRequest(
+                        instructions=(
+                            "Replace the one editorial placeholder in the supplied sentence with "
+                            "claim-contract-faithful mathematical prose. Return exactly one "
+                            "complete replacement sentence. Do not add citations, change the "
+                            "normalized statement, broaden or narrow quantifiers, or discuss the "
+                            "repair. "
+                            f"This bounded repair has cache generation {repair_generation}."
+                        ),
+                        input_text=json.dumps(
+                            {
+                                "suspect_sentence": sentence,
+                                "normalized_statement": compiled.normalized_statement,
+                                "claim_contract": compiled.claim_contract.as_dict(),
+                                "section_name": section,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        settings=repair_settings,
+                    ),
+                    PromptPlaceholderRepair,
+                )
+            except Exception as exc:
+                repair_detail = f"Bounded placeholder repair was unavailable: {type(exc).__name__}."
+            else:
+                repair_response_ids.append(repair_result.response_id)
+                replacement = repair_result.parsed.replacement_sentence.strip()
+                if find_unresolved_placeholders(replacement, allowlist=allowlist):
+                    repair_detail = "Bounded replacement still contained an editorial placeholder."
+                    replacement = None
+                else:
+                    repaired_prompt = (
+                        compiled.compiled_prompt[:start]
+                        + replacement
+                        + (compiled.compiled_prompt[end:])
+                    )
+                    compiled.compiled_prompt = repaired_prompt
+                    validation.diagnostics.append(
+                        PlaceholderDiagnostic(
+                            token=token,
+                            section=section,
+                            sentence=sentence,
+                            target_critical=target_critical,
+                            disposition=PlaceholderDisposition.REPAIRED,
+                            detail=("One bounded structured repair replaced the editorial marker."),
+                            replacement_sentence=replacement,
+                        )
+                    )
+                    persist(validation)
+                    continue
+
+        if target_critical:
+            validation.diagnostics.append(
+                PlaceholderDiagnostic(
+                    token=token,
+                    section=section,
+                    sentence=sentence,
+                    target_critical=True,
+                    disposition=PlaceholderDisposition.TARGET_CRITICAL_FAILURE,
+                    detail=repair_detail,
+                )
+            )
+            persist(validation)
+            raise StageValidationError(
+                "Compiled prompt contains an unresolved editorial placeholder in the exact "
+                f"target or success criterion: {token}"
+            )
+
+        compiled.compiled_prompt = _remove_sentence(compiled.compiled_prompt, start, end)
+        warning = (
+            f"Removed an unresolved optional sentence from {section!r} after bounded repair: "
+            f"{token}."
+        )
+        validation.warnings.append(warning)
+        validation.diagnostics.append(
+            PlaceholderDiagnostic(
+                token=token,
+                section=section,
+                sentence=sentence,
+                target_critical=False,
+                disposition=PlaceholderDisposition.REMOVED_OPTIONAL,
+                detail=repair_detail,
+            )
+        )
+        persist(validation)
 
 
 def load_framework(
@@ -596,6 +920,7 @@ async def compile_prompt(
     expected_framework_sha256: str | None = EXPECTED_FRAMEWORK_SHA256,
     placeholder_allowlist: Collection[str] = (),
     source_verifier: IdentifierVerifier | None = None,
+    placeholder_repair_generation: int = 0,
 ) -> PromptCompilationResult:
     """Compile and validate a problem, optionally writing contracted prompt artifacts.
 
@@ -775,16 +1100,37 @@ async def compile_prompt(
     if repair_warning:
         verification.warnings.append(repair_warning)
 
-    if compiled.status is PromptCompilationStatus.COMPILED:
-        unresolved = find_unresolved_placeholders(
-            compiled.compiled_prompt, allowlist=placeholder_allowlist
+    destination = ensure_stage_directory(prompts_dir) if prompts_dir is not None else None
+    snapshot_paths: dict[str, Path] = {}
+
+    def persist_prompt_snapshot(validation: PromptValidationReport) -> None:
+        nonlocal snapshot_paths
+        if destination is None:
+            return
+        snapshot_paths = _write_prompt_snapshot(
+            destination,
+            framework_bytes=framework_bytes,
+            compiled=compiled,
+            verification=verification,
+            validation=validation,
+            provider_metadata=provider_metadata,
         )
-        if unresolved:
-            rendered = ", ".join(unresolved[:8])
-            suffix = " ..." if len(unresolved) > 8 else ""
-            raise StageValidationError(
-                f"Compiled prompt contains unresolved editorial placeholders: {rendered}{suffix}"
-            )
+
+    prompt_validation = PromptValidationReport(
+        repair_generation=placeholder_repair_generation,
+        passed=compiled.status is PromptCompilationStatus.NEEDS_CLARIFICATION,
+    )
+    if compiled.status is PromptCompilationStatus.COMPILED:
+        prompt_validation, repair_response_ids = await _recover_prompt_placeholders(
+            client=client,
+            compiled=compiled,
+            settings=resolved_settings,
+            allowlist=placeholder_allowlist,
+            repair_generation=placeholder_repair_generation,
+            persist=persist_prompt_snapshot,
+        )
+        response_ids.extend(repair_response_ids)
+        model_calls += len(repair_response_ids)
         coverage_issues = validate_framework_coverage(compiled.compiled_prompt)
         if coverage_issues:
             raise StageValidationError(
@@ -799,41 +1145,21 @@ async def compile_prompt(
                 "Compiled prompt cites identifiers absent from its verified source ledger: "
                 + ", ".join(unrepresented_prompt_sources)
             )
+    else:
+        persist_prompt_snapshot(prompt_validation)
 
     artifacts = ArtifactManifest()
-    if prompts_dir is not None:
-        destination = ensure_stage_directory(prompts_dir)
-        paths = {
-            "framework": atomic_write_bytes(destination / "framework.txt", framework_bytes),
-            "compiled_problem": atomic_write_json(destination / "compiled_problem.json", compiled),
-            "source_ledger": atomic_write_json(
-                destination / "source_ledger.json",
-                [entry.model_dump(mode="json") for entry in compiled.source_ledger],
-            ),
-            "source_verification": atomic_write_json(
-                destination / "source_verification.json", verification
-            ),
-        }
-        if compiled.status is PromptCompilationStatus.COMPILED:
-            paths["compiled_prompt"] = atomic_write_text(
-                destination / "compiled_research_prompt.md", compiled.compiled_prompt
-            )
-        else:
-            paths["clarification_request"] = atomic_write_text(
-                destination / "clarification_request.md",
-                _render_clarification_request(compiled),
-            )
-        if provider_metadata:
-            paths["source_provider_metadata"] = atomic_write_json(
-                destination / "source_provider_metadata.json",
-                [dict(item) for item in provider_metadata],
-            )
-        artifacts = build_artifact_manifest(paths)
+    if destination is not None:
+        # Re-write after all deterministic gates so the durable snapshot reflects the final
+        # repaired generation. The same helper already preserved pre-gate work on failures.
+        persist_prompt_snapshot(prompt_validation)
+        artifacts = build_artifact_manifest(snapshot_paths)
 
     return PromptCompilationResult(
         compiled_problem=compiled,
         framework_sha256=framework_digest,
         source_verification=verification,
+        prompt_validation=prompt_validation,
         artifacts=artifacts,
         calls=CallManifest(model_calls=model_calls, response_ids=response_ids),
     )

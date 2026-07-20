@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import Coroutine, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -16,6 +17,8 @@ from rich.console import Console
 from rich.table import Table
 
 from .application import (
+    LeanConsentOutcome,
+    LeanConsentRequest,
     RunNotFoundError,
     WorkflowDependencies,
     WorkflowError,
@@ -106,6 +109,52 @@ def _print_progress(ascension: Ascension, message: str) -> None:
     console.print(f"[bold cyan]ASCENSION {int(ascension)}:[/bold cyan] {message}")
 
 
+async def _terminal_lean_consent(request: LeanConsentRequest) -> LeanConsentOutcome:
+    """Ask on an interactive terminal without blocking the workflow event loop."""
+
+    console.print(
+        "[bold]The verified manuscript is ready.[/bold] Proceed with formal Lean "
+        "verification? [Y/n] "
+        f"(automatically proceeds after {request.timeout_seconds // 60} minutes): ",
+        end="",
+    )
+    if not sys.stdin.isatty():
+        console.print("input is noninteractive; proceeding with Lean verification.")
+        return LeanConsentOutcome.NON_INTERACTIVE
+
+    loop = asyncio.get_running_loop()
+    response: asyncio.Future[str] = loop.create_future()
+
+    def input_ready() -> None:
+        if response.done():
+            return
+        try:
+            response.set_result(sys.stdin.readline())
+        except Exception as exc:  # pragma: no cover - terminal I/O failure
+            response.set_exception(exc)
+
+    try:
+        descriptor = sys.stdin.fileno()
+        loop.add_reader(descriptor, input_ready)
+    except (AttributeError, NotImplementedError, OSError, ValueError):
+        console.print("timed input is unavailable; proceeding with Lean verification.")
+        return LeanConsentOutcome.NON_INTERACTIVE
+
+    try:
+        answer = (await response).strip().casefold()
+    finally:
+        loop.remove_reader(descriptor)
+
+    if answer in {"n", "no"}:
+        console.print("Lean verification was declined; preparing the final report.")
+        return LeanConsentOutcome.USER_DECLINED
+    if not answer:
+        console.print("proceeding with Lean verification.")
+    elif answer not in {"y", "yes"}:
+        console.print("unrecognized response; using the default and proceeding with Lean.")
+    return LeanConsentOutcome.USER_APPROVED
+
+
 def _execution_backend(config: AppConfig) -> ExecutionBackend:
     if config.lean.execution_backend == SandboxChoice.DOCKER.value:
         return DockerBackend(image=config.lean.docker_image)
@@ -151,6 +200,7 @@ def _live_runner(config: AppConfig) -> WorkflowRunner:
                 reasoning_effort=config.codex.formalization_effort,
             ),
             progress=_print_progress,
+            lean_consent=_terminal_lean_consent,
         ),
     )
 
@@ -201,7 +251,8 @@ def _error_code(exc: BaseException) -> int:
 def _abort(exc: BaseException, *, verbose: bool = False) -> NoReturn:
     code = _error_code(exc)
     message = redact_text(str(exc)).strip() or type(exc).__name__
-    console.print(f"[red]Error:[/red] {message}")
+    console.print("[red]Error:[/red] ", end="")
+    console.print(message, markup=False)
     if verbose:
         console.print(f"[dim]Exception type: {type(exc).__name__}; exit code: {code}[/dim]")
     raise typer.Exit(code=code)
@@ -552,6 +603,13 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
             f"live web search {search_setting}; "
             f"automatic fallback {backend.get('automatic_fallback', False)}"
         )
+        lean_consent = state.metadata.get("lean_consent")
+        if isinstance(lean_consent, dict):
+            console.print(
+                "Lean decision: "
+                f"{lean_consent.get('outcome', 'unknown')}; "
+                f"proceed {lean_consent.get('proceed', False)}"
+            )
         raw_history = state.metadata.get("backend_history", [])
         if isinstance(raw_history, list) and raw_history:
             console.print(

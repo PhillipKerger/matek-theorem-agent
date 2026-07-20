@@ -106,6 +106,10 @@ Lean progression unless the citation is removed and the manuscript is regenerate
 
 ### FR-7 Lean feasibility and statement alignment
 
+- After the compiled manuscript and verified bibliography are durable, ask the interactive user
+  whether to proceed with formal Lean verification. A negative answer skips every Lean stage and
+  produces the final report. If no answer is received within five minutes, proceed automatically.
+- Persist the decision so resume never repeats the prompt or completed manuscript work.
 - Assess whether full or main-result formalization is realistically attainable.
 - Generate `challenge.lean` as the human-auditable target theorem statement.
 - Generate a plain-language back-translation and a field-by-field claim alignment report.

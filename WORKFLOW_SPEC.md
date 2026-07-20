@@ -28,9 +28,12 @@ problem file and start a new run.
 
 Otherwise it returns a full adapted prompt plus a formal claim contract, a source ledger, and a
 literature classification: `unknown`, `no_exact_match_found`, `partially_resolved`, or
-`fully_resolved`. A validation step rejects unresolved bracket placeholders except an explicit
-allowlist of literal mathematical notation. Partial/full resolution claims require verified
-sources and an exact statement-and-hypothesis comparison.
+`fully_resolved`. Placeholder validation flags only strong editorial markers; ordinary
+mathematical bracket notation, citations, links, code, and LaTeX are protected. ASCEND persists
+the compiled result and validation diagnostics before attempting one bounded, sentence-only
+repair. An unresolved marker blocks the workflow only in the exact target or success criterion;
+an optional sentence is removed with a recorded warning. Partial/full resolution claims require
+verified sources and an exact statement-and-hypothesis comparison.
 
 ## Stage 2 — Adaptive research
 
@@ -101,6 +104,11 @@ Only a fully verified bibliography may proceed.
 
 Compile LaTeX deterministically. Undefined references, missing citations, compilation errors,
 or bibliography mismatches fail the stage.
+
+Before entering Lean, an interactive run asks whether to continue with formal verification. A
+`no` answer skips all Lean stages and proceeds to the final report. No answer within five minutes
+defaults to continuing. Noninteractive runs cannot answer and therefore continue immediately.
+The decision is persisted in `lean/consent.json`; resume verifies and reuses it.
 
 ## Stage 5 — Lean feasibility
 
