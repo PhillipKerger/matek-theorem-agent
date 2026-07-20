@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Strict structured outputs
+
+- Codex output schemas are now generated from closed Pydantic models, require every object
+  property, reject arbitrary-key maps locally, and omit unsupported defaults.
+- Structured-output schema digests now participate in call-cache identity, and packaged schemas
+  are generated and checked against the same model authority.
+- Provider `invalid_json_schema` failures are reported as non-retryable schema compatibility
+  errors with the saved schema path instead of `CODEX_PROCESS_CRASH` retries.
+
 ### Repository publication cleanup
 
 - Moved the package, tests, resources, documentation, and CI workflow to the repository root.

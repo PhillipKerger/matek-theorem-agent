@@ -12,6 +12,10 @@ from ascend_math_agent.codex_model_backend import (
 )
 from ascend_math_agent.config import ModelSettings
 from ascend_math_agent.openai_client import ModelRequest
+from ascend_math_agent.stages.compile_prompt import (
+    CompiledProblem,
+    PromptCompilationStatus,
+)
 
 
 class _LiveProbeOutput(BaseModel):
@@ -67,3 +71,39 @@ async def test_live_codex_saved_auth_structured_read_only_call(tmp_path: Path) -
 
     assert result.parsed == _LiveProbeOutput(ok=True)
     assert list((run_root / "traces" / "codex" / "live_probe").rglob("events.jsonl"))
+
+
+@pytest.mark.asyncio
+async def test_live_codex_prompt_compilation_nested_schema(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    client = CodexCliModelClient(
+        tmp_path,
+        max_attempts=1,
+        timeout_seconds=120,
+        skip_git_repo_check=True,
+    ).for_stage("prompt_compilation", run_root=run_root, role="compiler-smoke")
+
+    result = await client.generate_structured(
+        ModelRequest(
+            instructions=(
+                "Return a needs_clarification CompiledProblem. Populate every schema field. "
+                "Use an empty claim contract and source ledger, unknown literature status, "
+                "and null literature summary."
+            ),
+            input_text="The problem is intentionally unspecified; ask what theorem to prove.",
+            settings=ModelSettings(
+                model="gpt-5.6-sol",
+                reasoning_mode="standard",
+                reasoning_effort="low",
+                web_search=False,
+                max_output_tokens=1_024,
+            ),
+        ),
+        CompiledProblem,
+    )
+
+    assert result.parsed.status is PromptCompilationStatus.NEEDS_CLARIFICATION
+    assert not result.parsed.claim_contract.entries
+    schema_paths = list((run_root / "traces" / "codex" / "prompt_compilation").rglob("schema.json"))
+    assert len(schema_paths) == 1

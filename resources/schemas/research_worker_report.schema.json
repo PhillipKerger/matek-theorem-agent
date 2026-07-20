@@ -1,47 +1,130 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
+  "$defs": {
+    "ResearchSource": {
+      "additionalProperties": false,
+      "properties": {
+        "relevance": {
+          "title": "Relevance",
+          "type": "string"
+        },
+        "stable_identifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stable Identifier"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "stable_identifier",
+        "relevance"
+      ],
+      "title": "ResearchSource",
+      "type": "object"
+    },
+    "WorkerStatus": {
+      "enum": [
+        "progress",
+        "blocked",
+        "refuted",
+        "candidate_complete"
+      ],
+      "title": "WorkerStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "assignment_id": {
+      "title": "Assignment Id",
+      "type": "string"
+    },
+    "assumptions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Assumptions",
+      "type": "array"
+    },
+    "counterexamples": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Counterexamples",
+      "type": "array"
+    },
+    "dependencies": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Dependencies",
+      "type": "array"
+    },
+    "exact_gap": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Exact Gap"
+    },
+    "formal_results": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Formal Results",
+      "type": "array"
+    },
+    "mechanism": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Mechanism"
+    },
+    "proof_content": {
+      "title": "Proof Content",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/ResearchSource"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/WorkerStatus"
+    }
+  },
   "required": [
     "assignment_id",
     "status",
     "formal_results",
     "proof_content",
     "exact_gap",
-    "sources"
+    "sources",
+    "assumptions",
+    "counterexamples",
+    "dependencies",
+    "mechanism"
   ],
-  "properties": {
-    "assignment_id": {
-      "type": "string"
-    },
-    "status": {
-      "enum": [
-        "progress",
-        "blocked",
-        "refuted",
-        "candidate_complete"
-      ]
-    },
-    "formal_results": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "proof_content": {
-      "type": "string"
-    },
-    "exact_gap": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "sources": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    }
-  },
-  "additionalProperties": true
+  "title": "ResearchWorkerReport",
+  "type": "object"
 }

@@ -39,6 +39,7 @@ from .openai_client import (
     output_schema_name,
 )
 from .redaction import redact_data, redact_text
+from .structured_schema import StrictSchemaError, strict_json_schema
 from .workspace import atomic_write_json, atomic_write_text, ensure_path_confined
 
 T = TypeVar("T", bound=BaseModel)
@@ -81,6 +82,7 @@ class CodexErrorKind(StrEnum):
     NETWORK_OR_SEARCH_UNAVAILABLE = "CODEX_NETWORK_OR_SEARCH_UNAVAILABLE"
     PROCESS_TIMEOUT = "CODEX_PROCESS_TIMEOUT"
     PROCESS_CRASH = "CODEX_PROCESS_CRASH"
+    SCHEMA_INCOMPATIBLE = "CODEX_SCHEMA_INCOMPATIBLE"
     SCHEMA_VALIDATION_FAILED = "CODEX_SCHEMA_VALIDATION_FAILED"
     OUTPUT_MISSING = "CODEX_OUTPUT_MISSING"
     SESSION_RESUME_FAILED = "CODEX_SESSION_RESUME_FAILED"
@@ -171,6 +173,10 @@ class CodexProcessCrashError(CodexBackendError):
     pass
 
 
+class CodexSchemaCompatibilityError(CodexBackendError):
+    pass
+
+
 class CodexSchemaValidationError(CodexBackendError):
     pass
 
@@ -204,6 +210,7 @@ _ERROR_CLASSES: Mapping[CodexErrorKind, type[CodexBackendError]] = {
     CodexErrorKind.NETWORK_OR_SEARCH_UNAVAILABLE: CodexNetworkOrSearchUnavailableError,
     CodexErrorKind.PROCESS_TIMEOUT: CodexProcessTimeoutError,
     CodexErrorKind.PROCESS_CRASH: CodexProcessCrashError,
+    CodexErrorKind.SCHEMA_INCOMPATIBLE: CodexSchemaCompatibilityError,
     CodexErrorKind.SCHEMA_VALIDATION_FAILED: CodexSchemaValidationError,
     CodexErrorKind.OUTPUT_MISSING: CodexOutputMissingError,
     CodexErrorKind.SESSION_RESUME_FAILED: CodexSessionResumeError,
@@ -603,6 +610,20 @@ def classify_codex_failure(
             True,
             "Retry the saved ASCEND run after checking local Codex responsiveness.",
         )
+    if (
+        "invalid_json_schema" in normalized
+        or "invalid json schema" in normalized
+        or (
+            "additionalproperties" in normalized
+            and "required to be supplied and to be false" in normalized
+        )
+    ):
+        return CodexFailureClassification(
+            CodexErrorKind.SCHEMA_INCOMPATIBLE,
+            False,
+            "Fix ASCEND's structured-output model at the provider-reported schema path, then "
+            "resume the saved run; retrying the unchanged schema cannot succeed.",
+        )
     if any(marker in normalized for marker in ("token expired", "auth expired", "refresh token")):
         return CodexFailureClassification(
             CodexErrorKind.AUTH_EXPIRED,
@@ -881,6 +902,30 @@ class CodexCliModelClient:
         output_type: type[T],
     ) -> ModelResult[T]:
         run_root = self._active_run_root()
+        try:
+            output_schema = strict_json_schema(output_type)
+        except StrictSchemaError as exc:
+            raise CodexSchemaCompatibilityError(
+                kind=CodexErrorKind.SCHEMA_INCOMPATIBLE,
+                stage=self._stage,
+                role=self._role,
+                retryable=False,
+                detail=str(exc),
+                remedy=(
+                    f"Replace the open output field at schema path {exc.path} with a closed "
+                    "typed model or key/value record array, then resume the saved run."
+                ),
+                checkpoint_path=run_root,
+                attempts=1,
+            ) from exc
+        schema_sha256 = hashlib.sha256(
+            json.dumps(
+                output_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         repair_instruction: str | None = None
         last_failure: _AttemptFailure | None = None
         last_artifacts: CodexCallArtifacts | None = None
@@ -891,7 +936,7 @@ class CodexCliModelClient:
             policy: _ResolvedPolicy | None = None
             atomic_write_json(
                 artifacts.schema_path,
-                output_type.model_json_schema(mode="serialization"),
+                output_schema,
                 confinement_root=run_root,
             )
             try:
@@ -938,6 +983,7 @@ class CodexCliModelClient:
                         "stage": self._stage,
                         "role": self._role,
                         "schema": output_schema_name(output_type),
+                        "schema_sha256": schema_sha256,
                         "instructions_sha256": hashlib.sha256(
                             redact_text(request.instructions).encode("utf-8")
                         ).hexdigest(),
@@ -1008,6 +1054,7 @@ class CodexCliModelClient:
                     },
                     "web_search": policy.web_search,
                     "sandbox": policy.sandbox,
+                    "schema_sha256": schema_sha256,
                     "session_id": summary.session_id,
                     "item_counts": dict(summary.item_counts),
                     "artifacts": {
@@ -1271,13 +1318,21 @@ class CodexCliModelClient:
                 )
             )
         if result.exit_code != 0:
+            classification = classify_codex_failure(
+                diagnostic,
+                exit_code=result.exit_code,
+                resuming=self._resume_session_id is not None,
+            )
+            if classification.kind is CodexErrorKind.SCHEMA_INCOMPATIBLE:
+                classification = CodexFailureClassification(
+                    classification.kind,
+                    False,
+                    "Fix the model at the provider-reported schema path and inspect the exact "
+                    f"saved schema at {artifacts.schema_path}; resume without starting a new run.",
+                )
             raise _AttemptException(
                 _AttemptFailure(
-                    classify_codex_failure(
-                        diagnostic,
-                        exit_code=result.exit_code,
-                        resuming=self._resume_session_id is not None,
-                    ),
+                    classification,
                     f"Codex exited with status {result.exit_code}: {diagnostic}",
                 )
             )
@@ -1801,11 +1856,22 @@ def _event_error_text(text: str) -> str:
             continue
         if not isinstance(value, Mapping) or value.get("type") not in {"error", "turn.failed"}:
             continue
-        for key in ("message", "error", "detail"):
-            candidate = value.get(key)
-            if isinstance(candidate, str):
-                messages.append(candidate)
+        _collect_error_strings(value, messages)
     return _safe_diagnostic(" ".join(messages))
+
+
+def _collect_error_strings(value: object, messages: list[str]) -> None:
+    if not isinstance(value, Mapping):
+        return
+    for key in ("code", "message", "detail"):
+        candidate = value.get(key)
+        if isinstance(candidate, str):
+            messages.append(candidate)
+    nested_error = value.get("error")
+    if isinstance(nested_error, str):
+        messages.append(nested_error)
+    else:
+        _collect_error_strings(nested_error, messages)
 
 
 def _safe_trace_text(text: str) -> str:

@@ -1,35 +1,69 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
+  "$defs": {
+    "AlignmentCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "explanation": {
+          "title": "Explanation",
+          "type": "string"
+        },
+        "field": {
+          "title": "Field",
+          "type": "string"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "field",
+        "passed",
+        "explanation"
+      ],
+      "title": "AlignmentCheck",
+      "type": "object"
+    },
+    "AlignmentStatus": {
+      "enum": [
+        "aligned",
+        "revision_required",
+        "rejected"
+      ],
+      "title": "AlignmentStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/AlignmentCheck"
+      },
+      "title": "Checks",
+      "type": "array"
+    },
+    "mathematical_back_translation": {
+      "title": "Mathematical Back Translation",
+      "type": "string"
+    },
+    "required_edits": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Required Edits",
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/AlignmentStatus"
+    }
+  },
   "required": [
     "status",
     "mathematical_back_translation",
     "checks",
     "required_edits"
   ],
-  "properties": {
-    "status": {
-      "enum": [
-        "aligned",
-        "revision_required",
-        "rejected"
-      ]
-    },
-    "mathematical_back_translation": {
-      "type": "string"
-    },
-    "checks": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "required_edits": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    }
-  },
-  "additionalProperties": false
+  "title": "ClaimAlignment",
+  "type": "object"
 }

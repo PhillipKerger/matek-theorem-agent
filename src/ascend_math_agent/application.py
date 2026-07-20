@@ -1073,8 +1073,10 @@ class WorkflowRunner:
                         previous_result=previous_result,
                         backend=self.dependencies.execution_backend,
                         research_result=research,
-                        claim_contract=compiled.claim_contract,
-                        source_ledger=compiled.source_ledger,
+                        claim_contract=compiled.claim_contract.as_dict(),
+                        source_ledger=[
+                            entry.model_dump(mode="json") for entry in compiled.source_ledger
+                        ],
                         manuscript_dir=state.run_root / "manuscript",
                         maximum_additional_correction_cycles=max(
                             1, self.config.manuscript.maximum_revision_rounds
@@ -1090,8 +1092,10 @@ class WorkflowRunner:
                         client=self._stage_client(StageName.MANUSCRIPT, budget, logger),
                         backend=self.dependencies.execution_backend,
                         research_result=research,
-                        claim_contract=compiled.claim_contract,
-                        source_ledger=compiled.source_ledger,
+                        claim_contract=compiled.claim_contract.as_dict(),
+                        source_ledger=[
+                            entry.model_dump(mode="json") for entry in compiled.source_ledger
+                        ],
                         manuscript_dir=state.run_root / "manuscript",
                         maximum_correction_cycles=self.config.manuscript.maximum_revision_rounds,
                         writer_settings=self._model_settings("manuscript"),
@@ -1179,7 +1183,7 @@ class WorkflowRunner:
                         (state.run_root / "research" / "result.json").read_text(encoding="utf-8")
                     ),
                     manuscript_result=manuscript,
-                    claim_contract=compiled.claim_contract,
+                    claim_contract=compiled.claim_contract.as_dict(),
                     lean_dir=state.run_root / "lean",
                     lean_project_root=state.project_root,
                     workflow_settings=LeanWorkflowSettings(

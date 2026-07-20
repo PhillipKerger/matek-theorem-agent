@@ -77,13 +77,37 @@ class LeanFeasibilityAssessment(BaseModel):
     paper_proof_mismatches: list[str]
 
 
+class LeanClaimMapEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_contract_key: str
+    lean_expression: str
+
+
 class LeanStatementDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     challenge_lean: str
     statement_explanation: str
-    claim_map: dict[str, Any]
+    claim_map: list[LeanClaimMapEntry]
     theorem_name: str | None = None
+
+    @field_validator("claim_map", mode="before")
+    @classmethod
+    def accept_legacy_claim_map(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return [
+                {
+                    "claim_contract_key": str(key),
+                    "lean_expression": (
+                        item
+                        if isinstance(item, str)
+                        else json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    ),
+                }
+                for key, item in value.items()
+            ]
+        return value
 
     @field_validator("challenge_lean", "statement_explanation")
     @classmethod
@@ -105,7 +129,7 @@ MANDATORY_ALIGNMENT_FIELDS = (
 
 
 class AlignmentCheck(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     field: str
     passed: bool
@@ -953,7 +977,7 @@ async def run_lean_pipeline(
             "frozen_claim_contract": claim_contract,
             "challenge_lean": draft.challenge_lean,
             "generator_back_translation": draft.statement_explanation,
-            "generator_claim_map": draft.claim_map,
+            "generator_claim_map": [entry.model_dump(mode="json") for entry in draft.claim_map],
             "mandatory_alignment_fields": list(MANDATORY_ALIGNMENT_FIELDS),
             "alignment_gate_requirement": (
                 "Return exactly one explicit, explained check for every mandatory field. "

@@ -1,38 +1,194 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "required": [
-    "status",
-    "entries",
-    "claim_checks",
-    "blocking_issues"
-  ],
-  "properties": {
-    "status": {
+  "$defs": {
+    "BibliographyCorrection": {
+      "additionalProperties": false,
+      "properties": {
+        "corrected_value": {
+          "title": "Corrected Value",
+          "type": "string"
+        },
+        "field": {
+          "title": "Field",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "corrected_value"
+      ],
+      "title": "BibliographyCorrection",
+      "type": "object"
+    },
+    "BibliographyEntryAudit": {
+      "additionalProperties": false,
+      "properties": {
+        "authoritative_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Authoritative Evidence",
+          "type": "array"
+        },
+        "authors_verified": {
+          "title": "Authors Verified",
+          "type": "boolean"
+        },
+        "characterization_supported": {
+          "title": "Characterization Supported",
+          "type": "boolean"
+        },
+        "citation_key": {
+          "title": "Citation Key",
+          "type": "string"
+        },
+        "corrections": {
+          "items": {
+            "$ref": "#/$defs/BibliographyCorrection"
+          },
+          "title": "Corrections",
+          "type": "array"
+        },
+        "exact_title_verified": {
+          "title": "Exact Title Verified",
+          "type": "boolean"
+        },
+        "exists": {
+          "title": "Exists",
+          "type": "boolean"
+        },
+        "stable_identifier_checked": {
+          "title": "Stable Identifier Checked",
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/BibliographyEntryStatus"
+        },
+        "theorem_hypotheses_supported": {
+          "title": "Theorem Hypotheses Supported",
+          "type": "boolean"
+        },
+        "venue_or_status_verified": {
+          "title": "Venue Or Status Verified",
+          "type": "boolean"
+        },
+        "year_verified": {
+          "title": "Year Verified",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "citation_key",
+        "status",
+        "exists",
+        "exact_title_verified",
+        "authors_verified",
+        "year_verified",
+        "venue_or_status_verified",
+        "stable_identifier_checked",
+        "characterization_supported",
+        "theorem_hypotheses_supported",
+        "authoritative_evidence",
+        "corrections"
+      ],
+      "title": "BibliographyEntryAudit",
+      "type": "object"
+    },
+    "BibliographyEntryStatus": {
+      "enum": [
+        "verified",
+        "corrected",
+        "ambiguous",
+        "nonexistent"
+      ],
+      "title": "BibliographyEntryStatus",
+      "type": "string"
+    },
+    "BibliographyStatus": {
       "enum": [
         "verified",
         "corrections_required",
         "rejected"
-      ]
+      ],
+      "title": "BibliographyStatus",
+      "type": "string"
     },
-    "entries": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "claim_checks": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "blocking_issues": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
+    "RelatedWorkClaimAudit": {
+      "additionalProperties": false,
+      "properties": {
+        "citation_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Citation Keys",
+          "type": "array"
+        },
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "supported": {
+          "title": "Supported",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "claim",
+        "citation_keys",
+        "supported",
+        "evidence"
+      ],
+      "title": "RelatedWorkClaimAudit",
+      "type": "object"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "properties": {
+    "blocking_issues": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Blocking Issues",
+      "type": "array"
+    },
+    "claim_checks": {
+      "items": {
+        "$ref": "#/$defs/RelatedWorkClaimAudit"
+      },
+      "title": "Claim Checks",
+      "type": "array"
+    },
+    "correction_plan": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Correction Plan",
+      "type": "array"
+    },
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/BibliographyEntryAudit"
+      },
+      "title": "Entries",
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/BibliographyStatus"
+    }
+  },
+  "required": [
+    "status",
+    "entries",
+    "claim_checks",
+    "blocking_issues",
+    "correction_plan"
+  ],
+  "title": "BibliographyAudit",
+  "type": "object"
 }

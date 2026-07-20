@@ -1,50 +1,126 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
+  "$defs": {
+    "ResearchAssignment": {
+      "additionalProperties": false,
+      "properties": {
+        "approach_family": {
+          "title": "Approach Family",
+          "type": "string"
+        },
+        "expected_output": {
+          "title": "Expected Output",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "inputs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Inputs",
+          "type": "array"
+        },
+        "stopping_condition": {
+          "title": "Stopping Condition",
+          "type": "string"
+        },
+        "task": {
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "approach_family",
+        "task",
+        "expected_output",
+        "inputs",
+        "stopping_condition"
+      ],
+      "title": "ResearchAssignment",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "assignments": {
+      "items": {
+        "$ref": "#/$defs/ResearchAssignment"
+      },
+      "title": "Assignments",
+      "type": "array"
+    },
+    "candidate_packaging_recommended": {
+      "title": "Candidate Packaging Recommended",
+      "type": "boolean"
+    },
+    "claims_requiring_counterexample_search": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Claims Requiring Counterexample Search",
+      "type": "array"
+    },
+    "lemmas_requiring_proof_completion": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Lemmas Requiring Proof Completion",
+      "type": "array"
+    },
+    "rationale": {
+      "title": "Rationale",
+      "type": "string"
+    },
+    "redirect_assignment_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Redirect Assignment Ids",
+      "type": "array"
+    },
+    "retire_assignment_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retire Assignment Ids",
+      "type": "array"
+    },
+    "round_id": {
+      "minimum": 1,
+      "title": "Round Id",
+      "type": "integer"
+    },
+    "stop_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Stop Reason"
+    },
+    "stop_recommended": {
+      "title": "Stop Recommended",
+      "type": "boolean"
+    }
+  },
   "required": [
     "round_id",
     "assignments",
     "rationale",
-    "candidate_packaging_recommended"
+    "candidate_packaging_recommended",
+    "retire_assignment_ids",
+    "redirect_assignment_ids",
+    "claims_requiring_counterexample_search",
+    "lemmas_requiring_proof_completion",
+    "stop_recommended",
+    "stop_reason"
   ],
-  "properties": {
-    "round_id": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "rationale": {
-      "type": "string"
-    },
-    "candidate_packaging_recommended": {
-      "type": "boolean"
-    },
-    "assignments": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": [
-          "id",
-          "approach_family",
-          "task",
-          "expected_output"
-        ],
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "approach_family": {
-            "type": "string"
-          },
-          "task": {
-            "type": "string"
-          },
-          "expected_output": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": true
-      }
-    }
-  },
-  "additionalProperties": false
+  "title": "ResearchRoundPlan",
+  "type": "object"
 }

@@ -4,7 +4,7 @@ import asyncio
 import json
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from pydantic import (
     AliasChoices,
@@ -61,7 +61,7 @@ class ResearchOutcome(StrEnum):
 
 
 class ResearchAssignment(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     approach_family: str
@@ -93,15 +93,23 @@ class ResearchRoundPlan(BaseModel):
     stop_reason: str | None = None
 
 
+class ResearchSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    stable_identifier: str | None = None
+    relevance: str
+
+
 class ResearchWorkerReport(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     assignment_id: str
     status: WorkerStatus
     formal_results: list[str]
     proof_content: str
     exact_gap: str | None
-    sources: list[dict[str, Any]]
+    sources: list[ResearchSource]
     assumptions: list[str] = Field(default_factory=list)
     counterexamples: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
@@ -164,20 +172,46 @@ class ApproachRegistry(BaseModel):
         existing.assignment_ids = list(dict.fromkeys([*existing.assignment_ids, assignment.id]))
 
 
+class LemmaDependency(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lemma: str
+    dependencies: list[str]
+
+
+class ImportedTheorem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    statement: str
+    hypotheses: list[str]
+    stable_identifier: str | None = None
+
+
 class CandidateProofPackage(BaseModel):
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     exact_theorem: str = Field(validation_alias=AliasChoices("exact_theorem", "theorem_statement"))
     definitions: list[str]
-    lemma_dependency_graph: dict[str, list[str]]
+    lemma_dependency_graph: list[LemmaDependency]
     full_proof: str = Field(
         validation_alias=AliasChoices("full_proof", "proof_markdown", "proof_content")
     )
-    imported_theorems: list[dict[str, Any]]
+    imported_theorems: list[ImportedTheorem]
     exceptional_cases: list[str]
     parameter_bookkeeping: list[str]
     unresolved_items: list[str]
     quantitative_or_algorithmic: bool = False
+
+    @field_validator("lemma_dependency_graph", mode="before")
+    @classmethod
+    def accept_legacy_dependency_map(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return [
+                {"lemma": str(lemma), "dependencies": dependencies}
+                for lemma, dependencies in value.items()
+            ]
+        return value
 
     @field_validator("exact_theorem", "full_proof")
     @classmethod
@@ -188,7 +222,7 @@ class CandidateProofPackage(BaseModel):
 
 
 class AuditIssue(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     severity: str = "blocking"
     description: str = ""
@@ -445,7 +479,7 @@ async def run_adaptive_research(
             coordinator_input = json.dumps(
                 {
                     "compiled_prompt": compiled.compiled_prompt,
-                    "claim_contract": compiled.claim_contract,
+                    "claim_contract": compiled.claim_contract.as_dict(),
                     "round_id": round_number,
                     "minimum_materially_diverse_assignments": settings.minimum_initial_assignments,
                     "maximum_assignments": settings.maximum_assignments_per_round,
@@ -535,7 +569,7 @@ async def run_adaptive_research(
                 worker_input = json.dumps(
                     {
                         "compiled_prompt": compiled.compiled_prompt,
-                        "claim_contract": compiled.claim_contract,
+                        "claim_contract": compiled.claim_contract.as_dict(),
                         "assignment": assignment.model_dump(mode="json"),
                         "round_id": worker_round,
                     },
@@ -598,7 +632,7 @@ async def run_adaptive_research(
             )
         package_input = json.dumps(
             {
-                "claim_contract": compiled.claim_contract,
+                "claim_contract": compiled.claim_contract.as_dict(),
                 "approach_registry": registry.model_dump(mode="json"),
                 "visible_worker_reports": [
                     report.model_dump(mode="json") for report in all_reports
@@ -631,7 +665,10 @@ async def run_adaptive_research(
         )
         artifact_paths["candidate_dependency_graph"] = atomic_write_json(
             candidate_dir / "dependency_graph.json",
-            current_candidate.lemma_dependency_graph,
+            [
+                dependency.model_dump(mode="json")
+                for dependency in current_candidate.lemma_dependency_graph
+            ],
         )
 
         if current_candidate.unresolved_items:
@@ -665,7 +702,7 @@ async def run_adaptive_research(
 
         audit_input = json.dumps(
             {
-                "claim_contract": compiled.claim_contract,
+                "claim_contract": compiled.claim_contract.as_dict(),
                 "candidate_package": current_candidate.model_dump(mode="json"),
             },
             ensure_ascii=False,
@@ -694,7 +731,7 @@ async def run_adaptive_research(
 
         judge_input = json.dumps(
             {
-                "claim_contract": compiled.claim_contract,
+                "claim_contract": compiled.claim_contract.as_dict(),
                 "candidate_package": current_candidate.model_dump(mode="json"),
                 "independent_audits": {
                     name: audit.model_dump(mode="json") for name, audit in current_audits.items()
@@ -747,7 +784,9 @@ async def run_adaptive_research(
                 accepted=True,
                 candidate_sha256=sha256_json(current_candidate),
                 claim_contract_sha256=sha256_text(
-                    json.dumps(compiled.claim_contract, sort_keys=True, ensure_ascii=False)
+                    json.dumps(
+                        compiled.claim_contract.as_dict(), sort_keys=True, ensure_ascii=False
+                    )
                 ),
                 mandatory_audits=required_audits,
                 final_judge_response_id=final_judge_response_id,

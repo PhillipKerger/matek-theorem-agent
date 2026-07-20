@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -68,15 +69,71 @@ class LiteratureStatus(StrEnum):
 
 
 class SourceLedgerEntry(BaseModel):
-    """A permissive but traceable source record returned by the compiler."""
+    """A traceable source record returned by the compiler."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     title: str | None = None
     stable_identifier: str | None = None
     url: str | None = None
     verified: bool | None = None
     evidence: str | None = None
+
+
+class ClaimContractEntry(BaseModel):
+    """One named, theorem-specific clause in a compiled claim contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    value: str
+
+    @field_validator("key", "value")
+    @classmethod
+    def nonempty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("claim-contract keys and values must not be blank")
+        return value.strip()
+
+
+class ClaimContract(BaseModel):
+    """Closed representation of an extensible theorem claim contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[ClaimContractEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_mapping(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "entries" not in value:
+            return {
+                "entries": [
+                    {
+                        "key": str(key),
+                        "value": (
+                            item
+                            if isinstance(item, str)
+                            else json.dumps(item, ensure_ascii=False, sort_keys=True)
+                        ),
+                    }
+                    for key, item in value.items()
+                ]
+            }
+        return value
+
+    @model_validator(mode="after")
+    def unique_keys(self) -> ClaimContract:
+        keys = [entry.key for entry in self.entries]
+        if len(keys) != len(set(keys)):
+            raise ValueError("claim-contract keys must be unique")
+        return self
+
+    def as_dict(self) -> dict[str, str]:
+        return {entry.key: entry.value for entry in self.entries}
+
+    def __bool__(self) -> bool:
+        return bool(self.entries)
 
 
 class CompiledProblem(BaseModel):
@@ -87,9 +144,9 @@ class CompiledProblem(BaseModel):
     status: PromptCompilationStatus = PromptCompilationStatus.COMPILED
     title: str = ""
     normalized_statement: str = ""
-    claim_contract: dict[str, Any] = Field(default_factory=dict)
+    claim_contract: ClaimContract = Field(default_factory=ClaimContract)
     compiled_prompt: str = ""
-    source_ledger: list[dict[str, Any]] = Field(default_factory=list)
+    source_ledger: list[SourceLedgerEntry] = Field(default_factory=list)
     unresolved_ambiguities: list[str] = Field(default_factory=list)
     clarification_reason: str | None = None
     clarification_questions: list[str] = Field(default_factory=list)
@@ -193,7 +250,7 @@ class PromptCompilationResult(BaseModel):
 
     @property
     def claim_contract(self) -> dict[str, Any]:
-        return self.compiled_problem.claim_contract
+        return self.compiled_problem.claim_contract.as_dict()
 
     @property
     def compiled_prompt(self) -> str:
@@ -201,7 +258,7 @@ class PromptCompilationResult(BaseModel):
 
     @property
     def source_ledger(self) -> list[dict[str, Any]]:
-        return self.compiled_problem.source_ledger
+        return [entry.model_dump(mode="json") for entry in self.compiled_problem.source_ledger]
 
 
 def find_unresolved_placeholders(text: str, *, allowlist: Collection[str] = ()) -> list[str]:
@@ -286,7 +343,7 @@ def validate_framework_coverage(compiled_prompt: str) -> list[str]:
 
 
 def validate_source_ledger(
-    source_ledger: list[dict[str, Any]],
+    source_ledger: Sequence[SourceLedgerEntry | dict[str, Any]],
     *,
     provider_identifiers: Collection[str] = (),
 ) -> list[str]:
@@ -343,7 +400,9 @@ def validate_source_ledger(
     return issues
 
 
-def _ledger_identifiers(source_ledger: list[dict[str, Any]]) -> frozenset[str]:
+def _ledger_identifiers(
+    source_ledger: Sequence[SourceLedgerEntry | dict[str, Any]],
+) -> frozenset[str]:
     identifiers: set[str] = set()
     for raw_entry in source_ledger:
         entry = SourceLedgerEntry.model_validate(raw_entry)
@@ -462,6 +521,9 @@ async def compile_prompt(
     )
     if ledger_issues:
         raise StageValidationError("Source ledger verification failed: " + " ".join(ledger_issues))
+    compiled.source_ledger = [
+        SourceLedgerEntry.model_validate(entry) for entry in compiled.source_ledger
+    ]
 
     if compiled.status is PromptCompilationStatus.COMPILED:
         unresolved = find_unresolved_placeholders(
@@ -495,7 +557,8 @@ async def compile_prompt(
             "framework": atomic_write_bytes(destination / "framework.txt", framework_bytes),
             "compiled_problem": atomic_write_json(destination / "compiled_problem.json", compiled),
             "source_ledger": atomic_write_json(
-                destination / "source_ledger.json", compiled.source_ledger
+                destination / "source_ledger.json",
+                [entry.model_dump(mode="json") for entry in compiled.source_ledger],
             ),
         }
         if compiled.status is PromptCompilationStatus.COMPILED:

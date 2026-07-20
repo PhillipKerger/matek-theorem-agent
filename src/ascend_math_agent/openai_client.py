@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from .config import ModelSettings
 from .redaction import redact_data as _shared_redact_data
 from .redaction import redact_text as _shared_redact_text
+from .structured_schema import strict_schema_sha256
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -150,10 +151,11 @@ def normalized_model_request(
         raise ValueError("model request cache namespace must not be blank")
     settings = request.settings
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": stage.strip(),
         "cache_namespace": cache_namespace.strip(),
         "output_schema": output_schema_name(output_type),
+        "output_schema_sha256": strict_schema_sha256(output_type),
         "instructions": _normalized_text(request.instructions),
         "input_text": _normalized_text(request.input_text),
         "settings": {

@@ -1,6 +1,209 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
+  "$defs": {
+    "ClaimContract": {
+      "additionalProperties": false,
+      "description": "Closed representation of an extensible theorem claim contract.",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/ClaimContractEntry"
+          },
+          "title": "Entries",
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "title": "ClaimContract",
+      "type": "object"
+    },
+    "ClaimContractEntry": {
+      "additionalProperties": false,
+      "description": "One named, theorem-specific clause in a compiled claim contract.",
+      "properties": {
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "value"
+      ],
+      "title": "ClaimContractEntry",
+      "type": "object"
+    },
+    "LiteratureStatus": {
+      "description": "Best verified relationship between the requested target and prior literature.",
+      "enum": [
+        "unknown",
+        "no_exact_match_found",
+        "partially_resolved",
+        "fully_resolved"
+      ],
+      "title": "LiteratureStatus",
+      "type": "string"
+    },
+    "PromptCompilationStatus": {
+      "description": "Whether a unique research target could be compiled safely.",
+      "enum": [
+        "compiled",
+        "needs_clarification"
+      ],
+      "title": "PromptCompilationStatus",
+      "type": "string"
+    },
+    "SourceLedgerEntry": {
+      "additionalProperties": false,
+      "description": "A traceable source record returned by the compiler.",
+      "properties": {
+        "evidence": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Evidence"
+        },
+        "stable_identifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stable Identifier"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Url"
+        },
+        "verified": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Verified"
+        }
+      },
+      "required": [
+        "title",
+        "stable_identifier",
+        "url",
+        "verified",
+        "evidence"
+      ],
+      "title": "SourceLedgerEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Structured model output specified by ``compiled_problem.schema.json``.",
+  "properties": {
+    "candidate_interpretations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Candidate Interpretations",
+      "type": "array"
+    },
+    "claim_contract": {
+      "$ref": "#/$defs/ClaimContract"
+    },
+    "clarification_questions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Clarification Questions",
+      "type": "array"
+    },
+    "clarification_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Clarification Reason"
+    },
+    "compiled_prompt": {
+      "title": "Compiled Prompt",
+      "type": "string"
+    },
+    "literature_resolution_summary": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Literature Resolution Summary"
+    },
+    "literature_status": {
+      "$ref": "#/$defs/LiteratureStatus"
+    },
+    "normalized_statement": {
+      "title": "Normalized Statement",
+      "type": "string"
+    },
+    "source_ledger": {
+      "items": {
+        "$ref": "#/$defs/SourceLedgerEntry"
+      },
+      "title": "Source Ledger",
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/PromptCompilationStatus"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "unresolved_ambiguities": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Unresolved Ambiguities",
+      "type": "array"
+    }
+  },
   "required": [
     "status",
     "title",
@@ -15,62 +218,6 @@
     "literature_status",
     "literature_resolution_summary"
   ],
-  "properties": {
-    "status": {
-      "type": "string",
-      "enum": ["compiled", "needs_clarification"]
-    },
-    "title": {
-      "type": "string"
-    },
-    "normalized_statement": {
-      "type": "string"
-    },
-    "claim_contract": {
-      "type": "object"
-    },
-    "compiled_prompt": {
-      "type": "string"
-    },
-    "source_ledger": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "unresolved_ambiguities": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "clarification_reason": {
-      "type": ["string", "null"]
-    },
-    "clarification_questions": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "candidate_interpretations": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "literature_status": {
-      "type": "string",
-      "enum": [
-        "unknown",
-        "no_exact_match_found",
-        "partially_resolved",
-        "fully_resolved"
-      ]
-    },
-    "literature_resolution_summary": {
-      "type": ["string", "null"]
-    }
-  },
-  "additionalProperties": false
+  "title": "CompiledProblem",
+  "type": "object"
 }

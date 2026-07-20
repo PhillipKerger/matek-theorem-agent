@@ -109,15 +109,39 @@ class FrozenClaimFidelity(BaseModel):
         return value.strip()
 
 
+class ManuscriptClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str
+    proof: str
+
+
+class ProofDependency(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str
+    dependencies: list[str]
+
+
 class ManuscriptDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     paper_tex: str
     references_bib: str
-    claims: list[dict[str, Any]]
-    proof_dependency_graph: dict[str, list[str]]
+    claims: list[ManuscriptClaim]
+    proof_dependency_graph: list[ProofDependency]
     introduction_coverage: IntroductionCoverage
     frozen_claim_fidelity: FrozenClaimFidelity
+
+    @field_validator("proof_dependency_graph", mode="before")
+    @classmethod
+    def accept_legacy_dependency_map(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return [
+                {"claim": str(claim), "dependencies": dependencies}
+                for claim, dependencies in value.items()
+            ]
+        return value
 
     @field_validator("paper_tex", "references_bib")
     @classmethod
@@ -127,8 +151,15 @@ class ManuscriptDraft(BaseModel):
         return value
 
 
+class BibliographyCorrection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    corrected_value: str
+
+
 class BibliographyEntryAudit(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     citation_key: str
     status: BibliographyEntryStatus
@@ -141,7 +172,17 @@ class BibliographyEntryAudit(BaseModel):
     characterization_supported: bool
     theorem_hypotheses_supported: bool
     authoritative_evidence: list[str] = Field(default_factory=list)
-    corrections: dict[str, str] = Field(default_factory=dict)
+    corrections: list[BibliographyCorrection] = Field(default_factory=list)
+
+    @field_validator("corrections", mode="before")
+    @classmethod
+    def accept_legacy_correction_map(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return [
+                {"field": str(field), "corrected_value": corrected_value}
+                for field, corrected_value in value.items()
+            ]
+        return value
 
     @property
     def fully_verified(self) -> bool:
@@ -161,7 +202,7 @@ class BibliographyEntryAudit(BaseModel):
 
 
 class RelatedWorkClaimAudit(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     claim: str
     citation_keys: list[str] = Field(default_factory=list)
@@ -842,9 +883,13 @@ async def generate_manuscript(
         artifact_paths["references_bib"] = atomic_write_text(
             destination / "references.bib", draft.references_bib
         )
-        artifact_paths["claims"] = atomic_write_json(destination / "claims.json", draft.claims)
+        artifact_paths["claims"] = atomic_write_json(
+            destination / "claims.json",
+            [claim.model_dump(mode="json") for claim in draft.claims],
+        )
         artifact_paths["proof_dependency_graph"] = atomic_write_json(
-            destination / "proof_dependency_graph.json", draft.proof_dependency_graph
+            destination / "proof_dependency_graph.json",
+            [dependency.model_dump(mode="json") for dependency in draft.proof_dependency_graph],
         )
         artifact_paths["introduction_coverage"] = atomic_write_json(
             destination / "introduction_coverage.json", draft.introduction_coverage

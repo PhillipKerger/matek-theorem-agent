@@ -1,36 +1,77 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
+  "$defs": {
+    "AuditDecision": {
+      "enum": [
+        "pass",
+        "repairable",
+        "fail",
+        "partial_only"
+      ],
+      "title": "AuditDecision",
+      "type": "string"
+    },
+    "AuditIssue": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "repair": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Repair"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "description",
+        "repair"
+      ],
+      "title": "AuditIssue",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "issues": {
+      "items": {
+        "$ref": "#/$defs/AuditIssue"
+      },
+      "title": "Issues",
+      "type": "array"
+    },
+    "target_matches": {
+      "title": "Target Matches",
+      "type": "boolean"
+    },
+    "unresolved_obligations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Unresolved Obligations",
+      "type": "array"
+    },
+    "verdict": {
+      "$ref": "#/$defs/AuditDecision"
+    }
+  },
   "required": [
     "verdict",
     "issues",
     "unresolved_obligations",
     "target_matches"
   ],
-  "properties": {
-    "verdict": {
-      "enum": [
-        "pass",
-        "repairable",
-        "fail",
-        "partial_only"
-      ]
-    },
-    "issues": {
-      "type": "array",
-      "items": {
-        "type": "object"
-      }
-    },
-    "unresolved_obligations": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "target_matches": {
-      "type": "boolean"
-    }
-  },
-  "additionalProperties": false
+  "title": "AuditVerdict",
+  "type": "object"
 }

@@ -161,6 +161,25 @@ def test_request_cache_key_is_normalized_redacted_and_schema_sensitive() -> None
     )
 
 
+def test_request_cache_key_includes_schema_body_for_same_qualified_name() -> None:
+    class SchemaVersionOne(BaseModel):
+        value: int
+
+    class SchemaVersionTwo(BaseModel):
+        value: int
+        explanation: str
+
+    for output_type in (SchemaVersionOne, SchemaVersionTwo):
+        output_type.__module__ = "fixture.outputs"
+        output_type.__qualname__ = "StableOutput"
+
+    request = ModelRequest("instructions", "input", ModelSettings(web_search=False))
+
+    assert model_request_cache_key(
+        request, SchemaVersionOne, stage="research"
+    ) != model_request_cache_key(request, SchemaVersionTwo, stage="research")
+
+
 def test_request_estimate_reserves_max_output_and_fails_without_pricing() -> None:
     request = ModelRequest(
         "d",

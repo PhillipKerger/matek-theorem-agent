@@ -21,6 +21,7 @@ from ascend_math_agent.codex_model_backend import (
     CodexProcessCrashError,
     CodexProcessTimeoutError,
     CodexRateLimitedError,
+    CodexSchemaCompatibilityError,
     CodexSchemaValidationError,
     CodexStagePolicy,
     CodexUnauthorizedFileChangeError,
@@ -33,6 +34,22 @@ from ascend_math_agent.config import ModelSettings
 from ascend_math_agent.execution.base import CommandRequest, CommandResult, CommandTimeoutError
 from ascend_math_agent.execution.native import NativeBackend
 from ascend_math_agent.openai_client import ModelRequest
+from ascend_math_agent.reporting import ReportNarrative
+from ascend_math_agent.stages.compile_prompt import CompiledProblem
+from ascend_math_agent.stages.lean import (
+    ClaimAlignment,
+    LeanFeasibilityAssessment,
+    LeanStatementDraft,
+)
+from ascend_math_agent.stages.manuscript import BibliographyAudit, ManuscriptDraft
+from ascend_math_agent.stages.research import (
+    AuditVerdict,
+    CandidateProofPackage,
+    FinalJudgeVerdict,
+    ResearchRoundPlan,
+    ResearchWorkerReport,
+)
+from ascend_math_agent.structured_schema import StrictSchemaError, strict_json_schema
 
 ROOT_HELP = """Codex CLI
 
@@ -81,6 +98,55 @@ class Answer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     answer: int
+
+
+class OpenAnswer(BaseModel):
+    values: dict[str, int]
+
+
+def _assert_strict_objects(node: object) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _assert_strict_objects(item)
+        return
+    if not isinstance(node, dict):
+        return
+    assert "default" not in node
+    if node.get("type") == "object" or "properties" in node:
+        properties = node.get("properties", {})
+        assert isinstance(properties, dict)
+        assert node.get("additionalProperties") is False
+        assert set(node.get("required", [])) == set(properties)
+    for value in node.values():
+        _assert_strict_objects(value)
+
+
+@pytest.mark.parametrize(
+    "output_type",
+    [
+        CompiledProblem,
+        ResearchRoundPlan,
+        ResearchWorkerReport,
+        CandidateProofPackage,
+        AuditVerdict,
+        FinalJudgeVerdict,
+        ManuscriptDraft,
+        BibliographyAudit,
+        LeanFeasibilityAssessment,
+        LeanStatementDraft,
+        ClaimAlignment,
+        ReportNarrative,
+    ],
+)
+def test_every_production_model_output_schema_is_strict(
+    output_type: type[BaseModel],
+) -> None:
+    _assert_strict_objects(strict_json_schema(output_type))
+
+
+def test_open_arbitrary_key_map_is_rejected_with_schema_path() -> None:
+    with pytest.raises(StrictSchemaError, match=r"\$\.properties\.values"):
+        strict_json_schema(OpenAnswer)
 
 
 class FakeCodexBackend:
@@ -140,6 +206,26 @@ class FakeCodexBackend:
             return CommandResult(argv, request.cwd, 1, "", "web search unavailable", 0.1)
         if outcome == "crash":
             return CommandResult(argv, request.cwd, 70, "", "unexpected runtime failure", 0.1)
+        if outcome == "invalid_json_schema":
+            return CommandResult(
+                argv,
+                request.cwd,
+                1,
+                "",
+                "HTTP 400 invalid_json_schema: In context=('properties', 'claim_contract'), "
+                "'additionalProperties' is required to be supplied and to be false.",
+                0.1,
+            )
+        if outcome == "invalid_json_schema_jsonl":
+            return CommandResult(
+                argv,
+                request.cwd,
+                1,
+                '{"type":"error","error":{"code":"invalid_json_schema",'
+                '"message":"In context=(properties, claim_contract), schema rejected"}}\n',
+                "",
+                0.1,
+            )
 
         output_path = Path(argv[argv.index("--output-last-message") + 1])
         if outcome == "invalid_schema":
@@ -276,7 +362,9 @@ async def test_structured_client_builds_safe_current_cli_argv_and_manifest(
     output_path = Path(command.argv[command.argv.index("--output-last-message") + 1])
     assert schema_path.is_relative_to(run_root)
     assert output_path.is_relative_to(run_root)
-    assert json.loads(schema_path.read_text(encoding="utf-8"))["title"] == "Answer"
+    written_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert written_schema == strict_json_schema(Answer)
+    _assert_strict_objects(written_schema)
     manifest = client.backend_manifest()
     assert manifest["provider"] == "codex"
     assert manifest["backend_version"] == "codex-cli 0.test"
@@ -285,6 +373,44 @@ async def test_structured_client_builds_safe_current_cli_argv_and_manifest(
     assert manifest["last_session_id"] == "thread-123"
     assert manifest["estimated_cost_usd"] is None
     assert manifest["no_api_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_open_schema_fails_before_codex_execution(tmp_path: Path) -> None:
+    backend = FakeCodexBackend()
+    client = CodexCliModelClient(tmp_path, backend=backend).for_stage(
+        "research", run_root=_run_root(tmp_path)
+    )
+
+    with pytest.raises(CodexSchemaCompatibilityError) as caught:
+        await client.generate_structured(_request(), OpenAnswer)
+
+    assert caught.value.kind is CodexErrorKind.SCHEMA_INCOMPATIBLE
+    assert not caught.value.retryable
+    assert "$.properties.values" in caught.value.remedy
+    assert backend.exec_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["invalid_json_schema", "invalid_json_schema_jsonl"])
+async def test_provider_invalid_json_schema_is_specific_and_not_retried(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    backend = FakeCodexBackend([outcome, "success"])
+    client = CodexCliModelClient(tmp_path, backend=backend, max_attempts=2).for_stage(
+        "prompt_compilation", run_root=_run_root(tmp_path)
+    )
+
+    with pytest.raises(CodexSchemaCompatibilityError) as caught:
+        await client.generate_structured(_request(), Answer)
+
+    assert caught.value.kind is CodexErrorKind.SCHEMA_INCOMPATIBLE
+    assert not caught.value.retryable
+    assert caught.value.attempts == 1
+    assert "schema.json" in caught.value.remedy
+    assert "claim_contract" in caught.value.detail
+    assert len(backend.exec_requests) == 1
 
 
 @pytest.mark.asyncio
