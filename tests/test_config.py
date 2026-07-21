@@ -100,6 +100,34 @@ def test_codex_environment_overrides_use_documented_names(tmp_path: Path) -> Non
     assert config.codex.limits.max_agent_calls == 25
 
 
+def test_blank_codex_model_is_rejected_because_request_identity_must_be_pinned(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ascend.toml"
+    path.write_text('[codex]\nmodel = ""\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"codex\.model must not be blank"):
+        load_config(path, env={})
+
+
+def test_role_specific_research_defaults() -> None:
+    config = AppConfig()
+
+    assert config.models.research_coordinator.model == "gpt-5.6-sol"
+    assert config.models.research_coordinator.reasoning_mode == "pro"
+    assert config.models.research_coordinator.reasoning_effort == "max"
+    assert config.models.research_worker.model == "gpt-5.6-sol"
+    assert config.models.research_worker.reasoning_mode == "pro"
+    assert config.models.research_worker.reasoning_effort == "xhigh"
+    assert config.models.audit.reasoning_effort == "xhigh"
+    assert config.codex.model == "gpt-5.6-sol"
+    assert config.codex.research_coordinator_effort == "max"
+    assert config.codex.research_worker_effort == "xhigh"
+    assert config.research.maximum_pending_assignments == 32
+    assert config.research.maximum_coordinator_decisions == 256
+    assert config.codex.limits.max_research_coordinator_decisions == 256
+
+
 def test_flat_environment_names_are_supported(tmp_path: Path) -> None:
     config = load_config(
         project_root=tmp_path,
@@ -124,6 +152,32 @@ def test_legacy_api_environment_names_remain_supported(tmp_path: Path) -> None:
     assert config.api.limits.maximum_api_retries == 7
 
 
+def test_legacy_research_role_and_round_environment_names_remain_supported(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        project_root=tmp_path,
+        env={
+            "ASCEND_MODELS__RESEARCH__REASONING_EFFORT": "high",
+            "ASCEND_CODEX__RESEARCH_EFFORT": "high",
+            "ASCEND_RESEARCH__MAXIMUM_ASSIGNMENTS_PER_ROUND": "20",
+            "ASCEND_RESEARCH__MAXIMUM_ROUNDS": "3",
+            "ASCEND_CODEX__LIMITS__MAX_RESEARCH_ROUNDS": "3",
+        },
+    )
+
+    assert config.models.research_coordinator.reasoning_effort == "high"
+    assert config.models.research_worker.reasoning_effort == "high"
+    assert config.codex.research_coordinator_effort == "high"
+    assert config.codex.research_worker_effort == "high"
+    assert config.research.maximum_pending_assignments == 20
+    assert config.research.maximum_coordinator_decisions == 60
+    assert config.research.maximum_assignments_per_round == 20
+    assert config.research.maximum_rounds == 3
+    assert config.codex.limits.max_research_coordinator_decisions == 96
+    assert config.codex.limits.max_research_rounds == 3
+
+
 def test_no_lean_convenience_is_inverted(tmp_path: Path) -> None:
     assert not load_config(project_root=tmp_path, env={"ASCEND_NO_LEAN": "true"}).lean.enabled
     assert not merge_config(AppConfig(), {"no_lean": True}).lean.enabled
@@ -138,7 +192,8 @@ def test_no_web_search_disables_every_model_stage_and_defaults_remain_enabled(
         settings.web_search
         for settings in (
             default.models.prompt_compiler,
-            default.models.research,
+            default.models.research_coordinator,
+            default.models.research_worker,
             default.models.audit,
             default.models.manuscript,
         )
@@ -155,7 +210,8 @@ def test_no_web_search_disables_every_model_stage_and_defaults_remain_enabled(
             settings.web_search
             for settings in (
                 config.models.prompt_compiler,
-                config.models.research,
+                config.models.research_coordinator,
+                config.models.research_worker,
                 config.models.audit,
                 config.models.manuscript,
             )
@@ -193,13 +249,51 @@ def test_nested_and_dotted_cli_overrides_are_supported() -> None:
     nested = merge_config(AppConfig(), {"research": {"maximum_rounds": 3}})
     dotted = merge_config(AppConfig(), {"models.audit.web_search": False})
     assert nested.research.maximum_rounds == 3
+    assert nested.research.maximum_coordinator_decisions == 96
     assert not dotted.models.audit.web_search
+
+
+def test_legacy_cli_round_limit_uses_resolved_pending_capacity() -> None:
+    base = AppConfig.model_validate({"research": {"maximum_pending_assignments": 20}})
+    configured = merge_config(base, {"max_rounds": 3})
+
+    assert configured.research.maximum_pending_assignments == 20
+    assert configured.research.maximum_coordinator_decisions == 60
+
+
+def test_transitional_role_config_uses_legacy_base_and_explicit_role_overrides() -> None:
+    config = AppConfig.model_validate(
+        {
+            "api": {
+                "models": {
+                    "research": {
+                        "model": "gpt-5.6-terra",
+                        "reasoning_effort": "high",
+                    },
+                    "research_coordinator": {"reasoning_effort": "max"},
+                    "research_worker": {"web_search": False},
+                }
+            },
+            "codex": {
+                "research_effort": "high",
+                "research_coordinator_effort": "max",
+            },
+        }
+    )
+
+    assert config.models.research_coordinator.model == "gpt-5.6-terra"
+    assert config.models.research_coordinator.reasoning_effort == "max"
+    assert config.models.research_worker.model == "gpt-5.6-terra"
+    assert config.models.research_worker.reasoning_effort == "high"
+    assert not config.models.research_worker.web_search
+    assert config.codex.research_coordinator_effort == "max"
+    assert config.codex.research_worker_effort == "high"
 
 
 def test_toml_values_are_not_silently_coerced(tmp_path: Path) -> None:
     path = tmp_path / "ascend.toml"
     path.write_text('[research]\nmaximum_rounds = "4"\n', encoding="utf-8")
-    with pytest.raises(ConfigError, match="maximum_rounds"):
+    with pytest.raises(ConfigError, match="maximum_coordinator_decisions"):
         load_config(path, env={})
 
 
@@ -302,14 +396,18 @@ maximum_api_retries = 9
 
     assert config.config_version == 2
     assert config.backend.provider == "api"
-    assert config.api.models.research.model == "gpt-5.6-terra"
-    assert config.api.models.research.reasoning_effort == "high"
+    assert config.api.models.research_coordinator.model == "gpt-5.6-terra"
+    assert config.api.models.research_coordinator.reasoning_effort == "high"
+    assert config.api.models.research_worker.model == "gpt-5.6-terra"
+    assert config.api.models.research_worker.reasoning_effort == "high"
     assert config.api.limits.maximum_cost_usd == 42.5
     assert config.api.limits.maximum_api_retries == 9
     assert config.migration_notice is not None
 
     rendered = config_as_toml(config)
-    assert "[api.models.research]" in rendered
+    assert "[api.models.research_coordinator]" in rendered
+    assert "[api.models.research_worker]" in rendered
+    assert "[api.models.research]" not in rendered
     assert '[backend]\nprovider = "api"' in rendered
     assert "migration_notice" not in rendered
 
@@ -359,8 +457,22 @@ def test_checked_in_example_config_loads() -> None:
     assert config.api.max_parallel_agents == 32
     assert config.research.minimum_initial_agents == 16
     assert config.research.maximum_concurrent_agents == 32
+    assert config.research.maximum_pending_assignments == 32
+    assert config.research.maximum_coordinator_decisions == 256
     assert config.research.maximum_assignments_per_round == 32
-    assert config.models.research.model == "gpt-5.6-sol"
+    assert config.research.maximum_rounds == 8
+    assert config.models.research_coordinator.model == "gpt-5.6-sol"
+    assert config.models.research_coordinator.reasoning_effort == "max"
+    assert config.models.research_worker.model == "gpt-5.6-sol"
+    assert config.models.research_worker.reasoning_effort == "xhigh"
+    assert config.models.audit.reasoning_effort == "xhigh"
+    assert config.models.research is config.models.research_worker
+    assert config.codex.model == "gpt-5.6-sol"
+    assert config.codex.research_coordinator_effort == "max"
+    assert config.codex.research_worker_effort == "xhigh"
+    assert config.codex.research_effort == "xhigh"
+    assert config.codex.limits.max_research_coordinator_decisions == 256
+    assert config.codex.limits.max_research_rounds == 8
     assert config.lean.docker_image == "ascend-math-agent:latest"
     assert set(config.pricing.models) == {
         "gpt-5.6-sol",

@@ -158,18 +158,23 @@ def ingest_problem(
         "authentication_class": "unverified",
         "backend_version": None,
         "model_requested": (
-            config.codex.model or None
+            {
+                "research_coordinator": config.codex.model,
+                "research_worker": config.codex.model,
+            }
             if backend_provider == "codex"
             else {
                 "prompt_compiler": config.models.prompt_compiler.model,
-                "research": config.models.research.model,
+                "research_coordinator": config.models.research_coordinator.model,
+                "research_worker": config.models.research_worker.model,
                 "audit": config.models.audit.model,
                 "manuscript": config.models.manuscript.model,
             }
         ),
         "reasoning_effort_requested": (
             {
-                "research": config.codex.research_effort,
+                "research_coordinator": config.codex.research_coordinator_effort,
+                "research_worker": config.codex.research_worker_effort,
                 "audit": config.codex.audit_effort,
                 "manuscript": config.codex.manuscript_effort,
                 "formalization": config.codex.formalization_effort,
@@ -243,10 +248,33 @@ def ingest_problem(
                 "authentication_class": backend_manifest["authentication_class"],
                 "automatic_fallback": False,
                 "prompt_compiler_model": config.models.prompt_compiler.model,
+                "research_coordinator_model": (
+                    config.codex.model
+                    if backend_provider == "codex"
+                    else config.models.research_coordinator.model
+                ),
+                "research_coordinator_effort": (
+                    config.codex.research_coordinator_effort
+                    if backend_provider == "codex"
+                    else config.models.research_coordinator.reasoning_effort
+                ),
+                "research_worker_model": (
+                    config.codex.model
+                    if backend_provider == "codex"
+                    else config.models.research_worker.model
+                ),
+                "research_worker_effort": (
+                    config.codex.research_worker_effort
+                    if backend_provider == "codex"
+                    else config.models.research_worker.reasoning_effort
+                ),
                 "minimum_initial_agents": config.research.minimum_initial_agents,
-                "maximum_assignments_per_round": (config.research.maximum_assignments_per_round),
-                "maximum_rounds": config.research.maximum_rounds,
+                "maximum_pending_assignments": (config.research.maximum_pending_assignments),
+                "maximum_coordinator_decisions": (config.research.maximum_coordinator_decisions),
                 "maximum_concurrent_agents": config.research.maximum_concurrent_agents,
+                "knowledge_graph_vault": ".ascend/knowledge",
+                "graph_maximum_context_nodes": config.graph.maximum_context_nodes,
+                "graph_maximum_context_characters": config.graph.maximum_context_characters,
                 "maximum_cost_usd": config.limits.maximum_cost_usd,
                 "lean_enabled": config.lean.enabled,
             },

@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+import ascend_math_agent.stages.research as research_stage
+from ascend_math_agent.budget import BudgetExceeded, BudgetSnapshot
 from ascend_math_agent.codex_client import CodexRequest, CodexResult
 from ascend_math_agent.config import ModelSettings
 from ascend_math_agent.execution.base import CommandRequest, CommandResult
@@ -76,9 +78,9 @@ from ascend_math_agent.stages.research import (
     ImportedTheorem,
     ResearchAcceptanceGate,
     ResearchAssignment,
+    ResearchCoordinatorDecision,
     ResearchOutcome,
     ResearchResult,
-    ResearchRoundPlan,
     ResearchWorkerReport,
     ResearchWorkflowSettings,
     WorkerStatus,
@@ -611,41 +613,53 @@ class SuccessfulResearchClient:
     ) -> ModelResult[Any]:
         self.calls += 1
         response_id = f"research-{self.calls}"
-        if output_type is ResearchRoundPlan:
-            parsed: BaseModel = ResearchRoundPlan(
-                round_id=1,
-                assignments=[
-                    ResearchAssignment(
-                        id=f"worker-{index}",
-                        approach_family=family,
-                        task=f"Investigate {family}",
-                        expected_output="A formal proof or exact obstruction",
-                    )
-                    for index, family in enumerate(
-                        (
-                            "direct",
-                            "structural",
-                            "counterexample",
-                            "literature",
-                            "probabilistic",
-                            "computational",
-                            "inductive",
-                            "algebraic",
-                            "geometric",
-                            "topological",
-                            "analytic",
-                            "combinatorial",
-                            "variational",
-                            "spectral",
-                            "logical",
-                            "formalization-aware",
-                        ),
-                        start=1,
-                    )
-                ],
-                rationale="Independent mechanisms",
-                candidate_packaging_recommended=True,
-            )
+        if output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            if payload["initial_portfolio"]:
+                target = payload["minimum_materially_diverse_initial_assignments"]
+                parsed: BaseModel = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[
+                        ResearchAssignment(
+                            id=f"worker-{index}",
+                            approach_family=family,
+                            task=f"Investigate {family}",
+                            expected_output="A formal proof or exact obstruction",
+                        )
+                        for index, family in enumerate(
+                            (
+                                "direct",
+                                "structural",
+                                "counterexample",
+                                "literature",
+                                "probabilistic",
+                                "computational",
+                                "inductive",
+                                "algebraic",
+                                "geometric",
+                                "topological",
+                                "analytic",
+                                "combinatorial",
+                                "variational",
+                                "spectral",
+                                "logical",
+                                "formalization-aware",
+                            )[:target],
+                            start=1,
+                        )
+                    ],
+                    rationale="Independent mechanisms",
+                )
+            else:
+                parsed = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[],
+                    rationale="The remaining obligation cannot be resolved offline.",
+                    stop_recommended=True,
+                    stop_reason="No further admissible research route remains.",
+                )
         elif output_type is ResearchWorkerReport:
             assignment = json.loads(request.input_text)["assignment"]
             self.active += 1
@@ -684,6 +698,117 @@ class SuccessfulResearchClient:
         return ModelResult(parsed=parsed, response_id=response_id)
 
 
+class PolicyAssertingResearchClient(SuccessfulResearchClient):
+    def __init__(self, *, expected_web_search: bool, response_prefix: str) -> None:
+        super().__init__()
+        self.expected_web_search = expected_web_search
+        self.response_prefix = response_prefix
+        self.output_types: list[type[Any]] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        assert request.settings.web_search is self.expected_web_search
+        self.output_types.append(output_type)
+        result = await super().generate_structured(request, output_type)
+        return ModelResult(
+            parsed=result.parsed,
+            response_id=f"{self.response_prefix}-{self.calls}",
+        )
+
+
+class CompletionDrainResearchClient(SuccessfulResearchClient):
+    """Expose a slower candidate after an ordinary report without another decision."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.progress_completed = asyncio.Event()
+        self.candidate_cancelled = False
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        if output_type is ResearchCoordinatorDecision:
+            self.calls += 1
+            call_number = self.calls
+            payload = json.loads(request.input_text)
+            assert payload["initial_portfolio"]
+            assignments = [
+                ResearchAssignment(
+                    id=assignment_id,
+                    approach_family=family,
+                    task=f"Investigate {family}",
+                    expected_output="A formal proof or exact obstruction",
+                )
+                for assignment_id, family in (
+                    ("fast-progress", "direct"),
+                    ("slower-candidate", "structural"),
+                    ("other-counterexample", "counterexample"),
+                    ("other-literature", "literature"),
+                )
+            ]
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=assignments,
+                    rationale="Launch four independent families.",
+                ),
+                response_id=f"drain-{call_number}",
+            )
+        if output_type is ResearchWorkerReport:
+            self.calls += 1
+            call_number = self.calls
+            assignment = json.loads(request.input_text)["assignment"]
+            assignment_id = assignment["id"]
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            try:
+                if assignment_id == "fast-progress":
+                    self.progress_completed.set()
+                    status = WorkerStatus.PROGRESS
+                    proof_content = "A useful intermediate lemma."
+                    exact_gap = "Complete the structural argument."
+                else:
+                    await self.progress_completed.wait()
+                    try:
+                        await asyncio.sleep(0.02 if assignment_id == "slower-candidate" else 0.04)
+                    except asyncio.CancelledError:
+                        if assignment_id == "slower-candidate":
+                            self.candidate_cancelled = True
+                        raise
+                    status = (
+                        WorkerStatus.CANDIDATE_COMPLETE
+                        if assignment_id == "slower-candidate"
+                        else WorkerStatus.PROGRESS
+                    )
+                    proof_content = (
+                        "A complete proof of the exact target."
+                        if status is WorkerStatus.CANDIDATE_COMPLETE
+                        else "Another useful partial result."
+                    )
+                    exact_gap = (
+                        None
+                        if status is WorkerStatus.CANDIDATE_COMPLETE
+                        else "Combine with the structural route."
+                    )
+            finally:
+                self.active -= 1
+            return ModelResult(
+                parsed=ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=status,
+                    formal_results=[f"Result from {assignment_id}"],
+                    proof_content=proof_content,
+                    exact_gap=exact_gap,
+                    sources=[],
+                    mechanism=assignment["task"],
+                ),
+                response_id=f"drain-{call_number}",
+            )
+        return await super().generate_structured(request, output_type)
+
+
 class OfflineIdentifierVerifier:
     def __init__(self, verified: Collection[str] = ()) -> None:
         self.verified = set(verified)
@@ -717,12 +842,15 @@ class ContinuityResearchClient(SuccessfulResearchClient):
     async def generate_structured(
         self, request: ModelRequest, output_type: type[Any]
     ) -> ModelResult[Any]:
-        if output_type is ResearchRoundPlan:
+        if output_type is ResearchCoordinatorDecision:
             self.calls += 1
             payload = json.loads(request.input_text)
             self.coordinator_payloads.append(payload)
-            round_id = len(self.coordinator_payloads)
-            if round_id == 1:
+            decision_id = payload["decision_id"]
+            completed_ids = {
+                report["assignment_id"] for report in payload["visible_worker_reports"]
+            }
+            if payload["initial_portfolio"]:
                 families = ("direct", "structural", "counterexample", "literature")
                 assignments = [
                     ResearchAssignment(
@@ -733,7 +861,12 @@ class ContinuityResearchClient(SuccessfulResearchClient):
                     )
                     for index, family in enumerate(families, start=1)
                 ]
-            else:
+            elif {
+                "route-1",
+                "route-2",
+                "route-3",
+                "route-4",
+            }.issubset(completed_ids) and "continuity-synthesis" not in completed_ids:
                 assignments = [
                     ResearchAssignment(
                         id="continuity-synthesis",
@@ -742,14 +875,16 @@ class ContinuityResearchClient(SuccessfulResearchClient):
                         expected_output="a complete proof",
                     )
                 ]
+            else:
+                assignments = []
             return ModelResult(
-                parsed=ResearchRoundPlan(
-                    round_id=round_id,
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=decision_id,
+                    after_event_sequence=payload["after_event_sequence"],
                     assignments=assignments,
-                    rationale="Use the durable cross-round mathematical handoff.",
-                    candidate_packaging_recommended=False,
+                    rationale="Use the durable event-indexed mathematical handoff.",
                 ),
-                response_id=f"continuity-plan-{round_id}",
+                response_id=f"continuity-decision-{decision_id}",
             )
         if output_type is ResearchWorkerReport:
             self.calls += 1
@@ -812,6 +947,482 @@ class ContinuityResearchClient(SuccessfulResearchClient):
         return await super().generate_structured(request, output_type)
 
 
+class RollingPoolResearchClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.slow_started = asyncio.Event()
+        self.release_slow = asyncio.Event()
+        self.followup_started = asyncio.Event()
+        self.slow_completed = False
+        self.slow_cancelled = False
+        self.coordinator_payloads: list[dict[str, Any]] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        self.calls += 1
+        response_id = f"rolling-{self.calls}"
+        if output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            self.coordinator_payloads.append(payload)
+            if payload["initial_portfolio"]:
+                assignments = [
+                    ResearchAssignment(
+                        id="fast-route",
+                        approach_family="direct",
+                        task="Prove a useful reduction quickly",
+                        expected_output="A reduction lemma",
+                    ),
+                    ResearchAssignment(
+                        id="slow-route",
+                        approach_family="structural",
+                        task="Explore a deliberately slow structural route",
+                        expected_output="A structural lemma",
+                    ),
+                    ResearchAssignment(
+                        id="queued-counterexample",
+                        approach_family="counterexample",
+                        task="Search for obstructions",
+                        expected_output="A counterexample or exclusion",
+                    ),
+                    ResearchAssignment(
+                        id="queued-literature",
+                        approach_family="literature",
+                        task="Check nearby results",
+                        expected_output="A verified theorem map",
+                    ),
+                ]
+                retire_ids: list[str] = []
+            else:
+                assert self.slow_started.is_set()
+                assert not self.slow_completed
+                assert {item["id"] for item in payload["active_assignments"]} == {"slow-route"}
+                assert [
+                    report["assignment_id"] for report in payload["visible_worker_reports"]
+                ] == ["fast-route"]
+                assert payload["visible_worker_reports"][0]["proof_content"] == (
+                    "Full proof of the reduction lemma."
+                )
+                assert any(
+                    event["kind"] == "worker_report_accepted"
+                    and event["assignment_id"] == "fast-route"
+                    for event in payload["unacknowledged_events"]
+                )
+                assignments = [
+                    ResearchAssignment(
+                        id="targeted-followup",
+                        approach_family="targeted synthesis",
+                        task="Use the reduction lemma to finish the proof",
+                        expected_output="A complete proof",
+                    )
+                ]
+                retire_ids = ["queued-counterexample", "queued-literature"]
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=assignments,
+                    rationale="Continuously react to the newest durable report.",
+                    retire_assignment_ids=retire_ids,
+                ),
+                response_id=response_id,
+            )
+        if output_type is ResearchWorkerReport:
+            assignment = json.loads(request.input_text)["assignment"]
+            assignment_id = assignment["id"]
+            if assignment_id == "fast-route":
+                await self.slow_started.wait()
+                parsed: BaseModel = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=["Reduction lemma"],
+                    proof_content="Full proof of the reduction lemma.",
+                    exact_gap="Apply the reduction lemma to the boundary case.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            elif assignment_id == "slow-route":
+                self.slow_started.set()
+                try:
+                    await self.release_slow.wait()
+                except asyncio.CancelledError:
+                    self.slow_cancelled = True
+                    raise
+                self.slow_completed = True
+                parsed = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=["Slow structural lemma"],
+                    proof_content="Slow proof.",
+                    exact_gap="Finish the theorem.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            elif assignment_id == "targeted-followup":
+                self.followup_started.set()
+                assert not self.slow_completed
+                parsed = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.CANDIDATE_COMPLETE,
+                    formal_results=["The target theorem"],
+                    proof_content="Complete proof using the reduction lemma.",
+                    exact_gap=None,
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            else:  # pragma: no cover - retired assignments must never launch
+                raise AssertionError(f"unexpected worker launch: {assignment_id}")
+        elif output_type is CandidateProofPackage:
+            parsed = candidate_package()
+        elif output_type is AuditVerdict:
+            parsed = passing_audit()
+        elif output_type is FinalJudgeVerdict:
+            parsed = FinalJudgeVerdict(
+                verdict=FinalJudgeDecision.ACCEPTED,
+                strongest_result="Fixture theorem",
+            )
+        else:  # pragma: no cover - a stage adding an unexpected call should fail loudly
+            raise AssertionError(output_type)
+        return ModelResult(parsed=parsed, response_id=response_id)
+
+
+class ReservationReplacementResearchClient:
+    """Exercise coordinator feedback while every configured call slot is reserved."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.coordinator_payloads: list[dict[str, Any]] = []
+        self.worker_ids: list[str] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        self.calls += 1
+        response_id = f"reservation-replacement-{self.calls}"
+        if output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            self.coordinator_payloads.append(payload)
+            if payload["initial_portfolio"]:
+                parsed: BaseModel = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[
+                        ResearchAssignment(
+                            id="fast-feedback",
+                            approach_family="direct",
+                            task="Produce immediate feedback",
+                            expected_output="A concrete reduction",
+                        ),
+                        ResearchAssignment(
+                            id="replaceable-structural",
+                            approach_family="structural",
+                            task="Explore a replaceable structural route",
+                            expected_output="A structural lemma",
+                        ),
+                        ResearchAssignment(
+                            id="replaceable-counterexample",
+                            approach_family="counterexample",
+                            task="Explore a replaceable obstruction route",
+                            expected_output="An obstruction",
+                        ),
+                        ResearchAssignment(
+                            id="replaceable-literature",
+                            approach_family="literature",
+                            task="Explore a replaceable literature route",
+                            expected_output="A theorem map",
+                        ),
+                    ],
+                    rationale="Start with four materially distinct routes.",
+                )
+            else:
+                assert [
+                    report["assignment_id"] for report in payload["visible_worker_reports"]
+                ] == ["fast-feedback"]
+                assert payload["refundable_unlaunched_assignment_count"] == 3
+                assert {assignment["id"] for assignment in payload["queued_assignments"]} == {
+                    "replaceable-structural",
+                    "replaceable-counterexample",
+                    "replaceable-literature",
+                }
+                assert payload["maximum_new_assignments_this_decision"] >= 1
+                parsed = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[
+                        ResearchAssignment(
+                            id="targeted-replacement",
+                            approach_family="targeted synthesis",
+                            task="Use the new reduction instead of the stale queued routes",
+                            expected_output="A sharpened reduction",
+                        )
+                    ],
+                    rationale="Replace unlaunched work in response to durable feedback.",
+                    retire_assignment_ids=[
+                        "replaceable-structural",
+                        "replaceable-counterexample",
+                        "replaceable-literature",
+                    ],
+                )
+            return ModelResult(parsed=parsed, response_id=response_id)
+        if output_type is ResearchWorkerReport:
+            assignment = json.loads(request.input_text)["assignment"]
+            assignment_id = assignment["id"]
+            self.worker_ids.append(assignment_id)
+            assert assignment_id in {"fast-feedback", "targeted-replacement"}
+            return ModelResult(
+                parsed=ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=[f"Progress from {assignment_id}."],
+                    proof_content=f"Full durable reasoning from {assignment_id}.",
+                    exact_gap="A final lemma remains.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                ),
+                response_id=response_id,
+            )
+        raise AssertionError(output_type)
+
+
+class CleanupCandidateRaceResearchClient:
+    """Return a complete candidate only while terminal cleanup cancels its task."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.candidate_started = asyncio.Event()
+        self.cleanup_cancelled_candidate = False
+        self.coordinator_payloads: list[dict[str, Any]] = []
+        self.gate_output_types: list[type[Any]] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        self.calls += 1
+        response_id = f"cleanup-candidate-race-{self.calls}"
+        if output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            self.coordinator_payloads.append(payload)
+            if payload["initial_portfolio"]:
+                parsed: BaseModel = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[
+                        ResearchAssignment(
+                            id="fast-terminal-feedback",
+                            approach_family="direct",
+                            task="Produce feedback that triggers terminal handling",
+                            expected_output="An exact remaining gap",
+                        ),
+                        ResearchAssignment(
+                            id="cleanup-candidate",
+                            approach_family="structural",
+                            task="Finish the proof concurrently",
+                            expected_output="A complete proof",
+                        ),
+                        ResearchAssignment(
+                            id="unused-counterexample",
+                            approach_family="counterexample",
+                            task="Search for an obstruction",
+                            expected_output="A counterexample or exclusion",
+                        ),
+                        ResearchAssignment(
+                            id="unused-literature",
+                            approach_family="literature",
+                            task="Search nearby literature",
+                            expected_output="A verified theorem map",
+                        ),
+                    ],
+                    rationale="Run diverse work concurrently.",
+                )
+            else:
+                assert self.candidate_started.is_set()
+                assert {item["id"] for item in payload["active_assignments"]} == {
+                    "cleanup-candidate"
+                }
+                parsed = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[],
+                    rationale="The visible partial report does not justify more work.",
+                    retire_assignment_ids=["unused-counterexample", "unused-literature"],
+                    stop_recommended=True,
+                    stop_reason="No route visible to the coordinator remains fundable.",
+                    stop_category="scientific",
+                )
+            return ModelResult(parsed=parsed, response_id=response_id)
+        if output_type is ResearchWorkerReport:
+            assignment = json.loads(request.input_text)["assignment"]
+            assignment_id = assignment["id"]
+            if assignment_id == "fast-terminal-feedback":
+                await self.candidate_started.wait()
+                parsed = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=["A reduction with one apparent gap."],
+                    proof_content="Proof of the reduction.",
+                    exact_gap="The coordinator sees no way to close the gap.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            elif assignment_id == "cleanup-candidate":
+                self.candidate_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cleanup_cancelled_candidate = True
+                parsed = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.CANDIDATE_COMPLETE,
+                    formal_results=["The exact target theorem."],
+                    proof_content="Complete proof discovered before cleanup finished.",
+                    exact_gap=None,
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            else:  # pragma: no cover - queued work must be retired, never launched
+                raise AssertionError(f"unexpected worker launch: {assignment_id}")
+            return ModelResult(parsed=parsed, response_id=response_id)
+
+        self.gate_output_types.append(output_type)
+        if output_type is CandidateProofPackage:
+            parsed = candidate_package()
+        elif output_type is AuditVerdict:
+            parsed = passing_audit()
+        elif output_type is FinalJudgeVerdict:
+            parsed = FinalJudgeVerdict(
+                verdict=FinalJudgeDecision.ACCEPTED,
+                reasons=["The cleanup-time candidate passes every independent check."],
+                strongest_result="Fixture theorem",
+            )
+        else:  # pragma: no cover - a new gate call should fail this regression loudly
+            raise AssertionError(output_type)
+        return ModelResult(parsed=parsed, response_id=response_id)
+
+
+class DeferredCandidateGateClient:
+    """Reject one candidate, then accept a distinct proof completed during its audit."""
+
+    def __init__(
+        self,
+        *,
+        package_repair_combination: bool = False,
+        reject_repair_combination: bool = False,
+    ) -> None:
+        self.calls = 0
+        self.package_repair_combination = package_repair_combination
+        self.reject_repair_combination = reject_repair_combination
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.packaged_ids: list[str] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        self.calls += 1
+        response_id = f"deferred-candidate-{self.calls}"
+        payload = json.loads(request.input_text)
+        if output_type is ResearchCoordinatorDecision:
+            if payload["initial_portfolio"]:
+                assignments = [
+                    ResearchAssignment(
+                        id=assignment_id,
+                        approach_family=family,
+                        task=f"Investigate {family}",
+                        expected_output="A complete proof or exact obstruction",
+                    )
+                    for assignment_id, family in (
+                        ("first-candidate", "direct"),
+                        ("second-candidate", "structural"),
+                        ("unused-counterexample", "counterexample"),
+                        ("unused-literature", "literature"),
+                    )
+                ]
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=assignments,
+                        rationale="Start independent candidate routes.",
+                    ),
+                    response_id=response_id,
+                )
+            if self.package_repair_combination:
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=[],
+                        rationale="Combine the original proof with the new repair lemma.",
+                        candidate_packaging_recommended=True,
+                        candidate_report_ids=["first-candidate", "second-candidate"],
+                    ),
+                    response_id=response_id,
+                )
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[],
+                    rationale="The first audited candidate failed, so recommend stopping.",
+                    stop_recommended=True,
+                    stop_reason="No further work is needed if no other candidate passes.",
+                    stop_category="scientific",
+                ),
+                response_id=response_id,
+            )
+        if output_type is ResearchWorkerReport:
+            assignment_id = payload["assignment"]["id"]
+            if assignment_id == "first-candidate":
+                await self.second_started.wait()
+            elif assignment_id == "second-candidate":
+                self.second_started.set()
+                await self.release_second.wait()
+            else:  # pragma: no cover - finite gate budget retires queued work
+                raise AssertionError(f"unexpected worker launch: {assignment_id}")
+            return ModelResult(
+                parsed=ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.CANDIDATE_COMPLETE,
+                    formal_results=[f"Candidate theorem from {assignment_id}."],
+                    proof_content=f"Complete proof text from {assignment_id}.",
+                    exact_gap=None,
+                    sources=[],
+                    mechanism=payload["assignment"]["task"],
+                ),
+                response_id=response_id,
+            )
+        if output_type is CandidateProofPackage:
+            assignment_id = "+".join(payload["candidate_trigger_assignment_ids"])
+            self.packaged_ids.append(assignment_id)
+            if assignment_id == "first-candidate":
+                self.release_second.set()
+            package = candidate_package().model_copy(
+                update={"full_proof": f"Packaged proof from {assignment_id}."}
+            )
+            return ModelResult(parsed=package, response_id=response_id)
+        if output_type is AuditVerdict:
+            return ModelResult(parsed=passing_audit(), response_id=response_id)
+        if output_type is FinalJudgeVerdict:
+            proof = payload["candidate_package"]["full_proof"]
+            accepted = "second-candidate" in proof and not (
+                self.reject_repair_combination and "+" in proof
+            )
+            return ModelResult(
+                parsed=FinalJudgeVerdict(
+                    verdict=(
+                        FinalJudgeDecision.ACCEPTED if accepted else FinalJudgeDecision.REJECTED
+                    ),
+                    reasons=[
+                        "The second independent proof passes." if accepted else "First fails."
+                    ],
+                    unresolved_obligations=([] if accepted else ["Use the second proof route."]),
+                    strongest_result=("Fixture theorem" if accepted else "First partial lemma"),
+                ),
+                response_id=response_id,
+            )
+        raise AssertionError(output_type)
+
+
 def candidate_package() -> CandidateProofPackage:
     return CandidateProofPackage(
         exact_theorem="For every n, P n.",
@@ -822,6 +1433,7 @@ def candidate_package() -> CandidateProofPackage:
         exceptional_cases=[],
         parameter_bookkeeping=["n is arbitrary"],
         unresolved_items=[],
+        quantitative_or_algorithmic=False,
     )
 
 
@@ -834,17 +1446,720 @@ def passing_audit() -> AuditVerdict:
     )
 
 
-def test_research_workflow_defaults_use_sixteen_initial_and_thirty_two_per_round() -> None:
+@pytest.mark.asyncio
+async def test_fast_worker_triggers_followup_while_slow_worker_is_still_running(
+    tmp_path: Path,
+) -> None:
+    client = RollingPoolResearchClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=4,
+            maximum_model_calls=11,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert client.followup_started.is_set()
+    assert not client.slow_completed
+    assert client.slow_cancelled
+    assert len(client.coordinator_payloads) == 2
+    assert [decision.after_event_sequence for decision in result.coordinator_decisions] == [
+        0,
+        client.coordinator_payloads[1]["after_event_sequence"],
+    ]
+    assert result.coordinator_decisions[1].assignments[0].id == "targeted-followup"
+    assert result.calls.model_calls == 11
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    assert scheduler["model_calls"] == 11
+    assert len(scheduler["model_call_keys"]) == 11
+    assert scheduler["latest_candidate_attempt"]["judge_call_reservation_key"] is None
+    assert (tmp_path / "workers" / "targeted-followup.json").is_file()
+    assert not (tmp_path / "workers" / "slow-route.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_initial_coordinator_cannot_stop_instead_of_launching_funded_portfolio(
+    tmp_path: Path,
+) -> None:
+    class InitialStopClient:
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            assert output_type is ResearchCoordinatorDecision
+            payload = json.loads(request.input_text)
+            assignments = [
+                ResearchAssignment(
+                    id=f"route-{index}",
+                    approach_family=family,
+                    task=f"Investigate {family}",
+                    expected_output="A proof or exact obstruction",
+                )
+                for index, family in enumerate(
+                    ("direct", "structural", "counterexample", "literature"), start=1
+                )
+            ]
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=assignments,
+                    rationale="Stop without executing the required portfolio.",
+                    stop_recommended=True,
+                    stop_reason="No research attempted.",
+                ),
+                response_id="initial-stop",
+            )
+
+    with pytest.raises(StageValidationError, match="must launch the funded diverse portfolio"):
+        await run_adaptive_research(
+            client=InitialStopClient(),  # type: ignore[arg-type]
+            compiled_problem=compiled_problem(),
+            research_dir=tmp_path,
+            workflow_settings=ResearchWorkflowSettings(minimum_initial_assignments=4),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_changed_completed_coordinator_request(tmp_path: Path) -> None:
+    await run_adaptive_research(
+        client=SuccessfulResearchClient(),
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+    )
+    request_path = tmp_path / "coordinator" / "requests" / "00000001.json"
+    request_path.write_text(request_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(StageValidationError, match="request 1 is missing or changed"):
+        await run_adaptive_research(
+            client=SuccessfulResearchClient(),
+            compiled_problem=compiled_problem(),
+            research_dir=tmp_path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_completes_state_first_pending_event_publication(tmp_path: Path) -> None:
+    original = await run_adaptive_research(
+        client=SuccessfulResearchClient(),
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+    )
+    scheduler_path = tmp_path / "coordinator" / "state.json"
+    scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    event_paths = sorted((tmp_path / "events").glob("*.json"))
+    final_event_path = event_paths[-1]
+    final_event = json.loads(final_event_path.read_text(encoding="utf-8"))
+    assert final_event["kind"] == "research_finished"
+    final_event_path.unlink()
+    scheduler["pending_event"] = final_event
+    scheduler_path.write_text(
+        json.dumps(scheduler, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    resume_client = SuccessfulResearchClient()
+
+    resumed = await run_adaptive_research(
+        client=resume_client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+    )
+
+    assert resumed.outcome is original.outcome is ResearchOutcome.ACCEPTED
+    assert resume_client.calls == 0
+    repaired = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    assert repaired["pending_event"] is None
+    assert json.loads(final_event_path.read_text(encoding="utf-8")) == final_event
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_scheduler_response_missing_from_accounting_journal(
+    tmp_path: Path,
+) -> None:
+    await run_adaptive_research(
+        client=SuccessfulResearchClient(),
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+    )
+    scheduler_path = tmp_path / "coordinator" / "state.json"
+    scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    judge_response_id = scheduler["final_acceptance_gate"]["final_judge_response_id"]
+    accounted = dict(scheduler["model_response_ids_by_call_key"])
+    missing_judge_keys = [
+        key for key, response_id in accounted.items() if response_id == judge_response_id
+    ]
+    assert len(missing_judge_keys) == 1
+    accounted.pop(missing_judge_keys[0])
+
+    class MissingJudgeAccountingClient(SuccessfulResearchClient):
+        def accounted_request_keys(self, request_keys: Collection[str]) -> dict[str, str]:
+            return {key: accounted[key] for key in request_keys if key in accounted}
+
+    with pytest.raises(StageValidationError, match="durable model-call accounting journal"):
+        await run_adaptive_research(
+            client=MissingJudgeAccountingClient(),
+            compiled_problem=compiled_problem(),
+            research_dir=tmp_path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_research_resume_freezes_old_requests_and_rekeys_unlaunched_work(
+    tmp_path: Path,
+) -> None:
+    class InterruptingClient:
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                assignments = [
+                    ResearchAssignment(
+                        id=f"route-{index}",
+                        approach_family=family,
+                        task=f"Investigate {family}",
+                        expected_output="A proof or exact obstruction",
+                    )
+                    for index, family in enumerate(
+                        ("direct", "structural", "counterexample", "literature"), start=1
+                    )
+                ]
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=assignments,
+                        rationale="Launch the required portfolio.",
+                    ),
+                    response_id="interrupting-coordinator",
+                )
+            raise RuntimeError("simulated worker interruption")
+
+    web_enabled = ModelSettings(web_search=True)
+    with pytest.raises(RuntimeError, match="simulated worker interruption"):
+        await run_adaptive_research(
+            client=InterruptingClient(),  # type: ignore[arg-type]
+            compiled_problem=compiled_problem(),
+            research_dir=tmp_path,
+            workflow_settings=ResearchWorkflowSettings(
+                minimum_initial_assignments=4,
+                maximum_concurrent_agents=1,
+                maximum_coordinator_decisions=1,
+            ),
+            coordinator_settings=web_enabled,
+            worker_settings=web_enabled,
+        )
+
+    class ResumeClient:
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            assert output_type is ResearchWorkerReport
+            assignment = json.loads(request.input_text)["assignment"]
+            return ModelResult(
+                parsed=ResearchWorkerReport(
+                    assignment_id=assignment["id"],
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=["A preserved partial result."],
+                    proof_content="Proof of the partial result.",
+                    exact_gap="No coordinator decisions remain.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                ),
+                response_id="resumed-worker",
+            )
+
+    web_disabled = ModelSettings(web_search=False)
+    result = await run_adaptive_research(
+        client=ResumeClient(),  # type: ignore[arg-type]
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_coordinator_decisions=1,
+        ),
+        coordinator_settings=web_disabled,
+        worker_settings=web_disabled,
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    assert scheduler["decisions"][0]["request_settings"]["web_search"] is True
+    by_id = {item["assignment"]["id"]: item for item in scheduler["assignments"]}
+    assert by_id["route-1"]["request_settings"]["web_search"] is True
+    assert all(
+        by_id[f"route-{index}"]["request_settings"]["web_search"] is False for index in (2, 3, 4)
+    )
+
+
+@pytest.mark.asyncio
+async def test_wal_only_coordinator_request_uses_resumed_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write = research_stage._atomic_write_immutable_json
+    interrupted = False
+
+    def interrupt_after_coordinator_wal(path: Path, value: object) -> Path:
+        nonlocal interrupted
+        written = original_write(path, value)
+        expected = tmp_path / "coordinator" / "requests" / "00000001.json"
+        if path == expected and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated crash after coordinator WAL")
+        return written
+
+    first_client = PolicyAssertingResearchClient(
+        expected_web_search=True,
+        response_prefix="before-coordinator-wal",
+    )
+    web_enabled = ModelSettings(web_search=True)
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            research_stage,
+            "_atomic_write_immutable_json",
+            interrupt_after_coordinator_wal,
+        )
+        with pytest.raises(RuntimeError, match="simulated crash after coordinator WAL"):
+            await run_adaptive_research(
+                client=first_client,
+                compiled_problem=compiled_problem(),
+                research_dir=tmp_path,
+                workflow_settings=ResearchWorkflowSettings(
+                    minimum_initial_assignments=4,
+                    maximum_concurrent_agents=1,
+                    maximum_coordinator_decisions=1,
+                ),
+                coordinator_settings=web_enabled,
+                worker_settings=web_enabled,
+                audit_settings=web_enabled,
+                final_judge_settings=web_enabled,
+            )
+
+    assert interrupted
+    assert first_client.calls == 0
+    pending_state = json.loads(
+        (tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8")
+    )
+    assert pending_state["pending_coordinator_request"]["request_settings"]["web_search"] is True
+    assert pending_state["model_call_keys"] == []
+
+    resume_client = PolicyAssertingResearchClient(
+        expected_web_search=False,
+        response_prefix="after-coordinator-wal",
+    )
+    web_disabled = ModelSettings(web_search=False)
+    result = await run_adaptive_research(
+        client=resume_client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_coordinator_decisions=1,
+        ),
+        coordinator_settings=web_disabled,
+        worker_settings=web_disabled,
+        audit_settings=web_disabled,
+        final_judge_settings=web_disabled,
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    assert scheduler["decisions"][0]["request_settings"]["web_search"] is False
+    latest_attempt = scheduler["latest_candidate_attempt"]
+    assert latest_attempt["packager_settings"]["web_search"] is False
+    assert latest_attempt["audit_settings"]["web_search"] is False
+    assert latest_attempt["judge_settings"]["web_search"] is False
+
+
+@pytest.mark.asyncio
+async def test_wal_only_candidate_attempt_uses_resumed_gate_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write = research_stage._atomic_write_immutable_json
+    interrupted = False
+
+    def interrupt_after_candidate_wal(path: Path, value: object) -> Path:
+        nonlocal interrupted
+        written = original_write(path, value)
+        if (
+            isinstance(value, dict)
+            and value.get("kind") == "candidate_audit_started"
+            and not interrupted
+        ):
+            interrupted = True
+            raise RuntimeError("simulated crash after candidate WAL")
+        return written
+
+    first_client = PolicyAssertingResearchClient(
+        expected_web_search=True,
+        response_prefix="before-candidate-wal",
+    )
+    web_enabled = ModelSettings(web_search=True)
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            research_stage,
+            "_atomic_write_immutable_json",
+            interrupt_after_candidate_wal,
+        )
+        with pytest.raises(RuntimeError, match="simulated crash after candidate WAL"):
+            await run_adaptive_research(
+                client=first_client,
+                compiled_problem=compiled_problem(),
+                research_dir=tmp_path,
+                workflow_settings=ResearchWorkflowSettings(
+                    minimum_initial_assignments=4,
+                    maximum_concurrent_agents=1,
+                    maximum_coordinator_decisions=1,
+                ),
+                coordinator_settings=web_enabled,
+                worker_settings=web_enabled,
+                audit_settings=web_enabled,
+                final_judge_settings=web_enabled,
+            )
+
+    assert interrupted
+    assert first_client.output_types == [ResearchCoordinatorDecision, ResearchWorkerReport]
+    pending_state = json.loads(
+        (tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8")
+    )
+    pending_attempt = pending_state["active_candidate_attempt"]
+    assert pending_attempt["packager_settings"]["web_search"] is True
+    assert pending_attempt["packager_response_id"] is None
+
+    resume_client = PolicyAssertingResearchClient(
+        expected_web_search=False,
+        response_prefix="after-candidate-wal",
+    )
+    web_disabled = ModelSettings(web_search=False)
+    result = await run_adaptive_research(
+        client=resume_client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_coordinator_decisions=1,
+        ),
+        coordinator_settings=web_disabled,
+        worker_settings=web_disabled,
+        audit_settings=web_disabled,
+        final_judge_settings=web_disabled,
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert resume_client.output_types == [
+        CandidateProofPackage,
+        AuditVerdict,
+        AuditVerdict,
+        AuditVerdict,
+        AuditVerdict,
+        FinalJudgeVerdict,
+    ]
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    latest_attempt = scheduler["latest_candidate_attempt"]
+    assert latest_attempt["packager_settings"]["web_search"] is False
+    assert latest_attempt["audit_settings"]["web_search"] is False
+    assert latest_attempt["judge_settings"]["web_search"] is False
+
+
+@pytest.mark.asyncio
+async def test_finite_call_budget_can_exchange_unlaunched_reservations_for_feedback(
+    tmp_path: Path,
+) -> None:
+    client = ReservationReplacementResearchClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+            # This exactly funds the initial coordinator and its four required
+            # assignments. Adaptive feedback must exchange, not exceed, a reserved slot.
+            maximum_model_calls=5,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert len(client.coordinator_payloads) == 2
+    assert client.worker_ids == ["fast-feedback", "targeted-replacement"]
+    assert result.calls.model_calls <= 5
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    assert scheduler["model_calls"] == len(scheduler["model_call_keys"])
+    assert scheduler["model_calls"] <= 5
+    lifecycle = {
+        record["assignment"]["id"]: record["status"] for record in scheduler["assignments"]
+    }
+    assert lifecycle["targeted-replacement"] == "completed"
+    assert {
+        lifecycle[assignment_id]
+        for assignment_id in (
+            "replaceable-structural",
+            "replaceable-counterexample",
+            "replaceable-literature",
+        )
+    } == {"retired"}
+
+
+@pytest.mark.asyncio
+async def test_resumed_borrowed_headroom_uses_current_worker_policy(tmp_path: Path) -> None:
+    class InterruptingHeadroomClient(ReservationReplacementResearchClient):
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            if output_type is ResearchCoordinatorDecision:
+                payload = json.loads(request.input_text)
+                if not payload["initial_portfolio"]:
+                    raise RuntimeError("simulated coordinator interruption")
+            return await super().generate_structured(request, output_type)
+
+    web_enabled = ModelSettings(web_search=True)
+    with pytest.raises(RuntimeError, match="simulated coordinator interruption"):
+        await run_adaptive_research(
+            client=InterruptingHeadroomClient(),
+            compiled_problem=compiled_problem(),
+            research_dir=tmp_path,
+            workflow_settings=ResearchWorkflowSettings(
+                minimum_initial_assignments=4,
+                maximum_concurrent_agents=1,
+                maximum_pending_assignments=4,
+                maximum_coordinator_decisions=2,
+                maximum_model_calls=5,
+            ),
+            coordinator_settings=web_enabled,
+            worker_settings=web_enabled,
+        )
+
+    interrupted = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    pending = interrupted["pending_coordinator_request"]
+    assert pending["headroom_assignment_id"] == "replaceable-literature"
+    interrupted_by_id = {item["assignment"]["id"]: item for item in interrupted["assignments"]}
+    assert interrupted_by_id["replaceable-literature"]["request_key"] is None
+    assert interrupted_by_id["replaceable-literature"]["request_settings"]["web_search"] is True
+
+    class ResumeHeadroomClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                assert request.settings.web_search is True
+                assert payload["coordinator_headroom_borrowed_assignment_id"] == (
+                    "replaceable-literature"
+                )
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=[],
+                        rationale="Retire one stale route and restore the borrowed worker.",
+                        retire_assignment_ids=["replaceable-structural"],
+                    ),
+                    response_id=f"resume-headroom-{self.calls}",
+                )
+            if output_type is ResearchWorkerReport:
+                assert request.settings.web_search is False
+                assignment = payload["assignment"]
+                return ModelResult(
+                    parsed=ResearchWorkerReport(
+                        assignment_id=assignment["id"],
+                        status=WorkerStatus.PROGRESS,
+                        formal_results=["A preserved partial result."],
+                        proof_content="Proof of the partial result.",
+                        exact_gap="No coordinator decisions remain.",
+                        sources=[],
+                        mechanism=assignment["task"],
+                    ),
+                    response_id=f"resume-headroom-{self.calls}",
+                )
+            raise AssertionError(output_type)
+
+    web_disabled = ModelSettings(web_search=False)
+    result = await run_adaptive_research(
+        client=ResumeHeadroomClient(),  # type: ignore[arg-type]
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+            maximum_model_calls=5,
+        ),
+        coordinator_settings=web_disabled,
+        worker_settings=web_disabled,
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    assert scheduler["pending_coordinator_request"] is None
+    assert scheduler["decisions"][1]["request_settings"]["web_search"] is True
+    by_id = {item["assignment"]["id"]: item for item in scheduler["assignments"]}
+    assert by_id["replaceable-literature"]["request_settings"]["web_search"] is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_time_candidate_is_audited_before_coordinator_stop(
+    tmp_path: Path,
+) -> None:
+    client = CleanupCandidateRaceResearchClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+            maximum_model_calls=10,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert result.accepted_for_manuscript
+    assert client.cleanup_cancelled_candidate
+    assert len(client.coordinator_payloads) == 2
+    assert client.gate_output_types.count(CandidateProofPackage) == 1
+    assert client.gate_output_types.count(AuditVerdict) == 4
+    assert client.gate_output_types.count(FinalJudgeVerdict) == 1
+    assert result.calls.model_calls == 10
+    candidate_report = next(
+        report for report in result.worker_reports if report.assignment_id == "cleanup-candidate"
+    )
+    assert candidate_report.status is WorkerStatus.CANDIDATE_COMPLETE
+    assert (tmp_path / "candidate" / "package.json").is_file()
+    assert (tmp_path / "verdict.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_deferred_distinct_candidate_is_gated_even_when_coordinator_stops(
+    tmp_path: Path,
+) -> None:
+    client = DeferredCandidateGateClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+            maximum_model_calls=16,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert client.packaged_ids == ["first-candidate", "second-candidate"]
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text())
+    assert scheduler["attempted_candidate_report_sets"] == [
+        ["first-candidate"],
+        ["second-candidate"],
+    ]
+    assert scheduler["deferred_candidate_report_ids"] == []
+    assert scheduler["stop_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_repair_can_repackage_prior_proof_with_new_candidate_report(
+    tmp_path: Path,
+) -> None:
+    client = DeferredCandidateGateClient(package_repair_combination=True)
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+            maximum_model_calls=16,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert client.packaged_ids == [
+        "first-candidate",
+        "first-candidate+second-candidate",
+    ]
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text())
+    assert scheduler["attempted_candidate_report_sets"] == [
+        ["first-candidate"],
+        ["first-candidate", "second-candidate"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_grouped_repair_preserves_singleton_candidate_for_gate(
+    tmp_path: Path,
+) -> None:
+    client = DeferredCandidateGateClient(
+        package_repair_combination=True,
+        reject_repair_combination=True,
+    )
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+            maximum_model_calls=22,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert client.packaged_ids == [
+        "first-candidate",
+        "first-candidate+second-candidate",
+        "second-candidate",
+    ]
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text())
+    assert scheduler["attempted_candidate_report_sets"] == [
+        ["first-candidate"],
+        ["first-candidate", "second-candidate"],
+        ["second-candidate"],
+    ]
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((tmp_path / "events").glob("*.json"))
+    ]
+    event_kinds = [event["kind"] for event in events]
+    assert event_kinds.index("candidate_audit_passed") < event_kinds.index("research_finished")
+    assert events[-1]["detail"] == [ResearchOutcome.ACCEPTED.value]
+
+
+def test_research_workflow_defaults_use_a_large_continuous_pending_window() -> None:
     settings = ResearchWorkflowSettings()
 
     assert settings.minimum_initial_assignments == 16
     assert settings.maximum_concurrent_agents == 32
-    assert settings.maximum_assignments_per_round == 32
+    assert settings.maximum_pending_assignments == 32
+    assert settings.maximum_coordinator_decisions == 256
     assert "maximum_research_subagents" not in type(settings).model_fields
 
 
 @pytest.mark.asyncio
-async def test_research_orchestrator_has_continuity_without_a_cumulative_worker_cap(
+async def test_research_coordinator_receives_durable_full_fidelity_continuity(
     tmp_path: Path,
 ) -> None:
     client = ContinuityResearchClient()
@@ -856,21 +2171,37 @@ async def test_research_orchestrator_has_continuity_without_a_cumulative_worker_
         workflow_settings=ResearchWorkflowSettings(
             minimum_initial_assignments=4,
             maximum_concurrent_agents=2,
-            maximum_assignments_per_round=4,
-            maximum_rounds=2,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=16,
         ),
     )
 
     assert result.outcome is ResearchOutcome.ACCEPTED
     assert result.research_subagents_assigned == 5
     assert result.research_subagents_used == 5
-    assert result.research_subagents_assigned > 4  # the per-round ceiling, not a run-wide cap
-    assert len(client.coordinator_payloads) == 2
-    later = client.coordinator_payloads[1]
+    assert result.research_subagents_assigned > 4  # the pending ceiling, not a run-wide cap
+    assert result.rounds == []
+    assert len(result.coordinator_decisions) >= 2
+    later = next(
+        payload
+        for payload in client.coordinator_payloads
+        if {report["assignment_id"] for report in payload["visible_worker_reports"]}
+        == {"route-1", "route-2", "route-3", "route-4"}
+    )
     assert later["compiled_prompt"] == compiled.compiled_prompt
     assert later["claim_contract"] == compiled.claim_contract.as_dict()
     assert "remaining_research_subagents" not in later
-    assert later["maximum_assignments"] == 4
+    assert later["maximum_open_assignments"] == 4
+    assert later["coordinator_mode"] == "continuous_event_driven"
+    assert later["after_event_sequence"] > 0
+    assert later["unacknowledged_events"]
+    assert any(
+        event["kind"] == "worker_report_accepted" for event in later["unacknowledged_events"]
+    )
+    route_one = next(
+        report for report in later["visible_worker_reports"] if report["assignment_id"] == "route-1"
+    )
+    assert route_one["proof_content"] == "Proof of Lemma A."
     continuity = later["research_continuity"]
     assert {route["assignment_id"] for route in continuity["promising_routes"]} == {
         "route-1",
@@ -883,11 +2214,14 @@ async def test_research_orchestrator_has_continuity_without_a_cumulative_worker_
     assert "Boundary lemma B" in continuity["dependencies"]
     assert "Prove the reduced boundary case." in continuity["open_gaps"]
     assert (tmp_path / "continuity.json").is_file()
-    assert (tmp_path / "rounds" / "1" / "continuity.json").is_file()
+    assert (tmp_path / "coordinator" / "decisions" / "00000001.json").is_file()
+    assert list((tmp_path / "events").glob("*.json"))
+    assert (tmp_path / "coordinator" / "mailbox.json").is_file()
+    assert (tmp_path / "workers" / "route-1.json").is_file()
 
 
 @pytest.mark.asyncio
-async def test_first_complete_proof_is_audited_before_waiting_for_the_round(
+async def test_first_complete_proof_is_audited_without_draining_the_worker_pool(
     tmp_path: Path,
 ) -> None:
     client = SuccessfulResearchClient()
@@ -906,7 +2240,7 @@ async def test_first_complete_proof_is_audited_before_waiting_for_the_round(
     assert len(result.registry.approaches) == 2
     assert client.maximum_active == 2
     assert result.calls.model_calls == 9
-    assert (tmp_path / "candidate" / "attempts" / "1-early" / "package.json").is_file()
+    assert list((tmp_path / "candidate" / "attempts").glob("event-*-attempt-1/package.json"))
     assert (tmp_path / "candidate" / "package.json").is_file()
     assert (tmp_path / "verdict.json").is_file()
 
@@ -952,7 +2286,7 @@ async def test_unverified_imported_theorem_blocks_research_acceptance(tmp_path: 
         client=SuccessfulResearchClient(imported_theorems=[theorem]),
         compiled_problem=compiled_problem(),
         research_dir=tmp_path,
-        workflow_settings=ResearchWorkflowSettings(maximum_rounds=1),
+        workflow_settings=ResearchWorkflowSettings(maximum_coordinator_decisions=32),
         source_verifier=OfflineIdentifierVerifier(),
     )
 
@@ -962,7 +2296,9 @@ async def test_unverified_imported_theorem_blocks_research_acceptance(tmp_path: 
     assert result.candidate is not None
     assert result.candidate.imported_theorems[0].verified is False
     assert not result.audits
-    assert (tmp_path / "candidate" / "attempts" / "1" / "source_verification.json").is_file()
+    assert list(
+        (tmp_path / "candidate" / "attempts").glob("event-*-attempt-1/source_verification.json")
+    )
 
 
 @pytest.mark.asyncio
@@ -978,8 +2314,178 @@ async def test_research_reports_budget_limited_initial_portfolio(tmp_path: Path)
         ),
     )
     assert result.outcome == ResearchOutcome.BUDGET_EXHAUSTED
-    assert len(result.worker_reports) == 2
+    assert result.worker_reports == []
+    assert result.calls.model_calls == 0
+    assert "cannot fund" in result.unresolved_obligations[0]
     assert result.acceptance_gate is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_scheduler_file_cannot_replace_missing_canonical_checkpoint(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "scheduler_state.json").write_text("{}\n", encoding="utf-8")
+    client = SuccessfulResearchClient()
+
+    with pytest.raises(StageValidationError, match="not a resumable continuous-coordinator"):
+        await run_adaptive_research(
+            client=client,
+            compiled_problem=compiled_problem(),
+            research_dir=tmp_path,
+        )
+
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_research_scales_initial_portfolio_to_available_budget_above_safety_floor(
+    tmp_path: Path,
+) -> None:
+    client = SuccessfulResearchClient()
+
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            maximum_model_calls=10,
+            maximum_concurrent_agents=9,
+        ),
+    )
+
+    initial = result.coordinator_decisions[0]
+    assert len(initial.assignments) == 9
+    assert len({assignment.approach_family for assignment in initial.assignments}) >= 4
+    assert result.research_subagents_assigned == 9
+    assert result.research_subagents_used == 9
+    assert len(result.worker_reports) == 9
+    assert result.calls.model_calls == 10
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_decision_cap_drains_admitted_workers_and_audits_later_candidate(
+    tmp_path: Path,
+) -> None:
+    client = CompletionDrainResearchClient()
+
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_coordinator_decisions=1,
+            maximum_concurrent_agents=4,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert result.accepted_for_manuscript
+    assert not client.candidate_cancelled
+    assert any(
+        report.assignment_id == "slower-candidate"
+        and report.status is WorkerStatus.CANDIDATE_COMPLETE
+        for report in result.worker_reports
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_call_cap_drains_every_already_funded_worker_report(tmp_path: Path) -> None:
+    client = CompletionDrainResearchClient()
+
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_model_calls=5,
+            maximum_concurrent_agents=4,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert result.calls.model_calls == 5
+    assert len(result.worker_reports) == 4
+    assert not client.candidate_cancelled
+    assert any(
+        report.assignment_id == "slower-candidate"
+        and report.status is WorkerStatus.CANDIDATE_COMPLETE
+        for report in result.worker_reports
+    )
+    assert any(
+        "could not be independently audited" in item for item in result.unresolved_obligations
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_worker_budget_failures_preserve_truthful_budget_outcome(
+    tmp_path: Path,
+) -> None:
+    class ConcurrentBudgetFailureClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                assignments = [
+                    ResearchAssignment(
+                        id=f"route-{index}",
+                        approach_family=family,
+                        task=f"Investigate {family}",
+                        expected_output="A proof or exact obstruction",
+                    )
+                    for index, family in enumerate(
+                        ("direct", "structural", "counterexample", "literature"), start=1
+                    )
+                ]
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=assignments,
+                        rationale="Launch the diverse portfolio.",
+                    ),
+                    response_id="budget-failure-coordinator",
+                )
+            await asyncio.sleep(0)
+            raise BudgetExceeded("calls", 4, 5, BudgetSnapshot())
+
+    client = ConcurrentBudgetFailureClient()
+    result = await run_adaptive_research(
+        client=client,  # type: ignore[arg-type]
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=4,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert result.acceptance_gate is None
+    assert "budget exhausted" in result.unresolved_obligations[-1].casefold()
+
+
+@pytest.mark.asyncio
+async def test_research_honors_remaining_run_wide_model_calls(tmp_path: Path) -> None:
+    client = SuccessfulResearchClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        remaining_run_model_calls=3,
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert result.calls.model_calls == 0
+    assert client.calls == 0
+    assert "cannot fund" in result.unresolved_obligations[0]
 
 
 class VerdictResearchClient(SuccessfulResearchClient):
@@ -990,6 +2496,27 @@ class VerdictResearchClient(SuccessfulResearchClient):
     async def generate_structured(
         self, request: ModelRequest, output_type: type[Any]
     ) -> ModelResult[Any]:
+        if output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            if payload["initial_portfolio"]:
+                return await super().generate_structured(request, output_type)
+            self.calls += 1
+            latest_verdict = payload["latest_final_judge_verdict"]
+            assert latest_verdict is not None
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[],
+                    rationale="Stop only after processing the independent gate evidence.",
+                    stop_recommended=True,
+                    stop_reason="The independent candidate gate is conclusive for this fixture.",
+                    stop_category=(
+                        "refuted" if self.decision is FinalJudgeDecision.REJECTED else "scientific"
+                    ),
+                ),
+                response_id=f"research-{self.calls}",
+            )
         if output_type is not FinalJudgeVerdict:
             return await super().generate_structured(request, output_type)
         self.calls += 1
@@ -1031,16 +2558,18 @@ async def test_research_preserves_rejected_and_partial_candidates(
 class RepairResearchClient(SuccessfulResearchClient):
     def __init__(self) -> None:
         super().__init__()
-        self.round_number = 0
+        self.coordinator_payloads: list[dict[str, Any]] = []
         self.judgments = 0
+        self.release_unrelated_workers = asyncio.Event()
 
     async def generate_structured(
         self, request: ModelRequest, output_type: type[Any]
     ) -> ModelResult[Any]:
-        if output_type is ResearchRoundPlan:
+        if output_type is ResearchCoordinatorDecision:
             self.calls += 1
-            self.round_number += 1
-            if self.round_number == 1:
+            payload = json.loads(request.input_text)
+            self.coordinator_payloads.append(payload)
+            if payload["initial_portfolio"]:
                 assignments = [
                     ResearchAssignment(
                         id=f"initial-{index}",
@@ -1070,9 +2599,9 @@ class RepairResearchClient(SuccessfulResearchClient):
                         start=1,
                     )
                 ]
+                retire_assignment_ids: list[str] = []
             else:
-                payload = json.loads(request.input_text)
-                assert payload["repair_obligations"] == ["prove the missing boundary case"]
+                assert payload["audit_repair_obligations"] == ["prove the missing boundary case"]
                 assert payload["approach_registry"]
                 assignments = [
                     ResearchAssignment(
@@ -1082,15 +2611,58 @@ class RepairResearchClient(SuccessfulResearchClient):
                         expected_output="a complete boundary proof",
                     )
                 ]
+                retire_assignment_ids = [
+                    assignment["id"]
+                    for assignment in [
+                        *payload["queued_assignments"],
+                        *payload["active_assignments"],
+                    ]
+                ]
             return ModelResult(
-                parsed=ResearchRoundPlan(
-                    round_id=self.round_number,
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
                     assignments=assignments,
                     rationale="Adaptive fixture plan",
-                    candidate_packaging_recommended=True,
+                    retire_assignment_ids=retire_assignment_ids,
                 ),
                 response_id=f"research-{self.calls}",
             )
+        if output_type is ResearchWorkerReport:
+            self.calls += 1
+            assignment = json.loads(request.input_text)["assignment"]
+            assignment_id = assignment["id"]
+            if assignment_id.startswith("initial-") and assignment_id != "initial-1":
+                await self.release_unrelated_workers.wait()
+            return ModelResult(
+                parsed=ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.CANDIDATE_COMPLETE,
+                    formal_results=[f"Proof route from {assignment_id}"],
+                    proof_content="Detailed proof.",
+                    exact_gap=None,
+                    sources=[],
+                    mechanism=assignment["task"],
+                ),
+                response_id=f"research-{self.calls}",
+            )
+        if output_type is CandidateProofPackage:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            package = candidate_package()
+            if "boundary-repair" in payload["candidate_trigger_assignment_ids"]:
+                package = package.model_copy(
+                    update={
+                        "full_proof": (
+                            "Proof of the lemma, the repaired boundary case, and the theorem."
+                        ),
+                        "parameter_bookkeeping": [
+                            "n is arbitrary",
+                            "the boundary case is discharged",
+                        ],
+                    }
+                )
+            return ModelResult(parsed=package, response_id=f"research-{self.calls}")
         if output_type is FinalJudgeVerdict:
             self.calls += 1
             self.judgments += 1
@@ -1113,7 +2685,7 @@ class RepairResearchClient(SuccessfulResearchClient):
 
 
 @pytest.mark.asyncio
-async def test_failed_early_audit_uses_other_round_results_before_replanning(
+async def test_failed_early_audit_returns_exact_obligations_to_the_coordinator(
     tmp_path: Path,
 ) -> None:
     client = RepairResearchClient()
@@ -1121,14 +2693,19 @@ async def test_failed_early_audit_uses_other_round_results_before_replanning(
         client=client,
         compiled_problem=compiled_problem(),
         research_dir=tmp_path,
-        workflow_settings=ResearchWorkflowSettings(maximum_rounds=2),
+        workflow_settings=ResearchWorkflowSettings(maximum_coordinator_decisions=8),
     )
     assert result.outcome == ResearchOutcome.ACCEPTED
-    assert result.repair_rounds == 0
+    assert result.repair_rounds == 1
     assert client.judgments == 2
-    assert [round_plan.round_id for round_plan in result.rounds] == [1]
-    assert (tmp_path / "candidate" / "attempts" / "1-early" / "package.json").is_file()
-    assert (tmp_path / "candidate" / "attempts" / "1" / "package.json").is_file()
+    assert [decision.decision_id for decision in result.coordinator_decisions] == [1, 2]
+    assert client.coordinator_payloads[1]["audit_repair_obligations"] == [
+        "prove the missing boundary case"
+    ]
+    assert "boundary-repair" in {report.assignment_id for report in result.worker_reports}
+    assert (
+        len(list((tmp_path / "candidate" / "attempts").glob("event-*-attempt-*/package.json"))) == 2
+    )
 
 
 def accepted_research() -> ResearchResult:

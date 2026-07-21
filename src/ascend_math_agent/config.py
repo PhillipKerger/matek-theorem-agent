@@ -75,15 +75,45 @@ class ModelSettings(_StrictSettings):
 
 class ModelsSettings(_StrictSettings):
     prompt_compiler: ModelSettings = Field(default_factory=ModelSettings)
-    research: ModelSettings = Field(
+    research_coordinator: ModelSettings = Field(
         default_factory=lambda: ModelSettings(reasoning_effort="max", max_output_tokens=120_000)
     )
+    research_worker: ModelSettings = Field(
+        default_factory=lambda: ModelSettings(reasoning_effort="xhigh", max_output_tokens=120_000)
+    )
     audit: ModelSettings = Field(
-        default_factory=lambda: ModelSettings(reasoning_effort="max", max_output_tokens=120_000)
+        default_factory=lambda: ModelSettings(reasoning_effort="xhigh", max_output_tokens=120_000)
     )
     manuscript: ModelSettings = Field(
         default_factory=lambda: ModelSettings(max_output_tokens=120_000)
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_research_role(cls, value: Any) -> Any:
+        """Apply the old shared ``research`` model settings to both new roles.
+
+        Role-specific values win field by field when a transitional configuration
+        includes both the legacy table and one of the new tables.
+        """
+
+        if not isinstance(value, Mapping) or "research" not in value:
+            return value
+        normalized = copy.deepcopy(dict(value))
+        legacy = normalized.pop("research")
+        for role in ("research_coordinator", "research_worker"):
+            explicit = normalized.get(role)
+            if isinstance(legacy, Mapping) and isinstance(explicit, Mapping):
+                normalized[role] = _deep_merge(dict(legacy), explicit)
+            elif role not in normalized:
+                normalized[role] = copy.deepcopy(legacy)
+        return normalized
+
+    @property
+    def research(self) -> ModelSettings:
+        """Compatibility view of the former shared research-worker settings."""
+
+        return self.research_worker
 
 
 class BackendSettings(_StrictSettings):
@@ -107,18 +137,44 @@ class CodexLimits(_StrictSettings):
     """Subscription/credit limits, intentionally separate from API dollars."""
 
     max_agent_calls: int | None = Field(default=None, gt=0)
-    max_research_rounds: int = Field(default=8, gt=0)
+    max_research_coordinator_decisions: int = Field(default=256, gt=0)
     max_codex_threads: int | None = Field(default=None, gt=0)
     max_wall_clock_minutes: int | None = Field(default=None, gt=0)
     max_formalization_iterations: int = Field(default=60, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_research_round_limit(cls, value: Any) -> Any:
+        """Budget an old round as up to 32 completion-driven decisions."""
+
+        if not isinstance(value, Mapping) or "max_research_rounds" not in value:
+            return value
+        normalized = copy.deepcopy(dict(value))
+        legacy = normalized.pop("max_research_rounds")
+        migrated = (
+            legacy * 32 if isinstance(legacy, int) and not isinstance(legacy, bool) else legacy
+        )
+        normalized.setdefault("max_research_coordinator_decisions", migrated)
+        return normalized
+
+    @property
+    def max_research_rounds(self) -> int:
+        """Compatibility estimate using the historical 32-worker round capacity."""
+
+        return (self.max_research_coordinator_decisions + 31) // 32
 
 
 class CodexSettings(_StrictSettings):
     """Safe, backend-specific settings for official ``codex exec`` runs."""
 
     executable: str = "codex"
-    model: str = ""
-    research_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "xhigh"
+    model: str = "gpt-5.6-sol"
+    research_coordinator_effort: Literal[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    ] = "max"
+    research_worker_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = (
+        "xhigh"
+    )
     audit_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "xhigh"
     manuscript_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "high"
     formalization_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = (
@@ -131,6 +187,19 @@ class CodexSettings(_StrictSettings):
     extra_args: list[str] = Field(default_factory=list)
     limits: CodexLimits = Field(default_factory=CodexLimits)
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_research_effort(cls, value: Any) -> Any:
+        """Use a legacy shared effort for both research roles unless specialized."""
+
+        if not isinstance(value, Mapping) or "research_effort" not in value:
+            return value
+        normalized = copy.deepcopy(dict(value))
+        legacy = normalized.pop("research_effort")
+        normalized.setdefault("research_coordinator_effort", legacy)
+        normalized.setdefault("research_worker_effort", legacy)
+        return normalized
+
     @field_validator("executable")
     @classmethod
     def _executable_must_not_be_blank(cls, value: str) -> str:
@@ -141,8 +210,13 @@ class CodexSettings(_StrictSettings):
 
     @field_validator("model")
     @classmethod
-    def _empty_model_means_codex_default(cls, value: str) -> str:
-        return value.strip()
+    def _codex_model_must_be_pinned(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(
+                "codex.model must not be blank; durable request identity requires an explicit model"
+            )
+        return normalized
 
     @field_validator("extra_args")
     @classmethod
@@ -192,25 +266,73 @@ class CodexSettings(_StrictSettings):
             )
         return self
 
+    @property
+    def research_effort(
+        self,
+    ) -> Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]:
+        """Compatibility view of the former shared research-worker effort."""
+
+        return self.research_worker_effort
+
 
 class ResearchSettings(_StrictSettings):
     minimum_initial_agents: int = Field(default=16, ge=4)
     maximum_concurrent_agents: int = Field(default=32, gt=0)
-    maximum_assignments_per_round: int = Field(default=32, gt=0)
-    maximum_rounds: int = Field(default=8, gt=0)
-    require_foundational_audit: bool = True
-    require_domain_audit: bool = True
-    require_hostile_audit: bool = True
-    require_source_theorem_audit: bool = True
+    maximum_pending_assignments: int = Field(default=32, gt=0)
+    maximum_coordinator_decisions: int = Field(default=256, gt=0)
+    require_foundational_audit: Literal[True] = True
+    require_domain_audit: Literal[True] = True
+    require_hostile_audit: Literal[True] = True
+    require_source_theorem_audit: Literal[True] = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_round_limits(cls, value: Any) -> Any:
+        """Translate fixed-round limit names into continuous-scheduler controls."""
+
+        if not isinstance(value, Mapping):
+            return value
+        normalized = copy.deepcopy(dict(value))
+        missing = object()
+        legacy_pending = normalized.pop("maximum_assignments_per_round", missing)
+        legacy_rounds = normalized.pop("maximum_rounds", missing)
+        if legacy_pending is not missing:
+            normalized.setdefault("maximum_pending_assignments", legacy_pending)
+        if legacy_rounds is not missing:
+            pending = normalized.get("maximum_pending_assignments", 32)
+            migrated = (
+                legacy_rounds * pending
+                if isinstance(legacy_rounds, int)
+                and not isinstance(legacy_rounds, bool)
+                and isinstance(pending, int)
+                and not isinstance(pending, bool)
+                else legacy_rounds
+            )
+            normalized.setdefault("maximum_coordinator_decisions", migrated)
+        return normalized
 
     @model_validator(mode="after")
-    def round_assignment_cap_funds_initial_portfolio(self) -> ResearchSettings:
-        if self.maximum_assignments_per_round < self.minimum_initial_agents:
+    def pending_assignment_cap_funds_initial_portfolio(self) -> ResearchSettings:
+        if self.maximum_pending_assignments < self.minimum_initial_agents:
             raise ValueError(
-                "research.maximum_assignments_per_round cannot be less than "
+                "research.maximum_pending_assignments (legacy "
+                "maximum_assignments_per_round) cannot be less than "
                 "research.minimum_initial_agents"
             )
         return self
+
+    @property
+    def maximum_assignments_per_round(self) -> int:
+        """Compatibility name for the pending assignment-window limit."""
+
+        return self.maximum_pending_assignments
+
+    @property
+    def maximum_rounds(self) -> int:
+        """Compatibility estimate in full pending-window equivalents."""
+
+        pending = self.maximum_pending_assignments
+        return (self.maximum_coordinator_decisions + pending - 1) // pending
 
 
 class ManuscriptSettings(_StrictSettings):
@@ -347,6 +469,18 @@ class ApiSettings(_StrictSettings):
     pricing: PricingSettings = Field(default_factory=PricingSettings)
 
 
+class GraphSettings(_StrictSettings):
+    """Persistent Markdown knowledge-graph limits.
+
+    The vault location is deliberately fixed beneath ``.ascend`` so routine runs
+    preserve ASCEND's no-project-source-write guarantee. It remains a normal
+    Obsidian vault and is independent of individual run directories.
+    """
+
+    maximum_context_nodes: int = Field(default=40, ge=4, le=200)
+    maximum_context_characters: int = Field(default=60_000, ge=1_000, le=500_000)
+
+
 class ConfigMigrationNotice(_StrictSettings):
     """A nonsecret runtime notice for one durable, user-facing migration message."""
 
@@ -362,6 +496,7 @@ class AppConfig(_StrictSettings):
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     manuscript: ManuscriptSettings = Field(default_factory=ManuscriptSettings)
     lean: LeanSettings = Field(default_factory=LeanSettings)
+    graph: GraphSettings = Field(default_factory=GraphSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
     # Runtime context, not emitted into resolved TOML snapshots.
@@ -388,7 +523,8 @@ class AppConfig(_StrictSettings):
             return self
         selected = {
             self.models.prompt_compiler.model,
-            self.models.research.model,
+            self.models.research_coordinator.model,
+            self.models.research_worker.model,
             self.models.audit.model,
             self.models.manuscript.model,
         }
@@ -444,7 +580,8 @@ class AppConfig(_StrictSettings):
             settings.web_search
             for settings in (
                 self.models.prompt_compiler,
-                self.models.research,
+                self.models.research_coordinator,
+                self.models.research_worker,
                 self.models.audit,
                 self.models.manuscript,
             )
@@ -455,6 +592,8 @@ _CONVENIENCE_PATHS: dict[str, tuple[str, ...]] = {
     "BACKEND": ("backend", "provider"),
     "BUDGET_USD": ("api", "limits", "maximum_cost_usd"),
     "MAXIMUM_COST_USD": ("api", "limits", "maximum_cost_usd"),
+    "MAX_COORDINATOR_DECISIONS": ("research", "maximum_coordinator_decisions"),
+    "MAXIMUM_COORDINATOR_DECISIONS": ("research", "maximum_coordinator_decisions"),
     "MAX_ROUNDS": ("research", "maximum_rounds"),
     "MAXIMUM_ROUNDS": ("research", "maximum_rounds"),
     "MAX_AGENTS": ("research", "maximum_concurrent_agents"),
@@ -466,13 +605,20 @@ _CONVENIENCE_PATHS: dict[str, tuple[str, ...]] = {
 _CLI_PATHS: dict[str, tuple[str, ...]] = {
     "backend": ("backend", "provider"),
     "budget_usd": ("api", "limits", "maximum_cost_usd"),
+    "max_coordinator_decisions": ("research", "maximum_coordinator_decisions"),
     "max_rounds": ("research", "maximum_rounds"),
     "max_agents": ("research", "maximum_concurrent_agents"),
     "sandbox": ("lean", "execution_backend"),
     "no_lean": ("lean", "enabled"),
 }
 
-_MODEL_STAGE_NAMES = ("prompt_compiler", "research", "audit", "manuscript")
+_MODEL_STAGE_NAMES = (
+    "prompt_compiler",
+    "research_coordinator",
+    "research_worker",
+    "audit",
+    "manuscript",
+)
 
 
 def _set_all_web_search(target: dict[str, Any], enabled: bool) -> None:
@@ -498,6 +644,80 @@ def _deep_merge(base: dict[str, Any], update: Mapping[str, Any]) -> dict[str, An
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def _normalize_continuous_research_aliases(
+    values: Mapping[str, Any],
+    *,
+    legacy_pending_capacity: int = 32,
+) -> dict[str, Any]:
+    """Normalize legacy fixed-round/shared-role keys in one precedence layer.
+
+    Each source layer is migrated before it is merged with built-in defaults.  This is
+    important: migrating only during final Pydantic validation would make a built-in
+    role-specific default look explicit and could hide an older user setting.
+    """
+
+    normalized = copy.deepcopy(dict(values))
+
+    api = normalized.get("api")
+    if isinstance(api, Mapping):
+        api_data = copy.deepcopy(dict(api))
+        models = api_data.get("models")
+        if isinstance(models, Mapping) and "research" in models:
+            model_data = copy.deepcopy(dict(models))
+            legacy = model_data.pop("research")
+            for role in ("research_coordinator", "research_worker"):
+                explicit = model_data.get(role)
+                if isinstance(legacy, Mapping) and isinstance(explicit, Mapping):
+                    model_data[role] = _deep_merge(dict(legacy), explicit)
+                elif role not in model_data:
+                    model_data[role] = copy.deepcopy(legacy)
+            api_data["models"] = model_data
+        normalized["api"] = api_data
+
+    codex = normalized.get("codex")
+    if isinstance(codex, Mapping):
+        codex_data = copy.deepcopy(dict(codex))
+        if "research_effort" in codex_data:
+            legacy_effort = codex_data.pop("research_effort")
+            codex_data.setdefault("research_coordinator_effort", legacy_effort)
+            codex_data.setdefault("research_worker_effort", legacy_effort)
+        limits = codex_data.get("limits")
+        if isinstance(limits, Mapping) and "max_research_rounds" in limits:
+            limit_data = copy.deepcopy(dict(limits))
+            legacy_rounds = limit_data.pop("max_research_rounds")
+            migrated_decisions = (
+                legacy_rounds * 32
+                if isinstance(legacy_rounds, int) and not isinstance(legacy_rounds, bool)
+                else legacy_rounds
+            )
+            limit_data.setdefault("max_research_coordinator_decisions", migrated_decisions)
+            codex_data["limits"] = limit_data
+        normalized["codex"] = codex_data
+
+    research = normalized.get("research")
+    if isinstance(research, Mapping):
+        research_data = copy.deepcopy(dict(research))
+        missing = object()
+        legacy_pending = research_data.pop("maximum_assignments_per_round", missing)
+        legacy_rounds = research_data.pop("maximum_rounds", missing)
+        if legacy_pending is not missing:
+            research_data.setdefault("maximum_pending_assignments", legacy_pending)
+        if legacy_rounds is not missing:
+            pending = research_data.get("maximum_pending_assignments", legacy_pending_capacity)
+            migrated_decisions = (
+                legacy_rounds * pending
+                if isinstance(legacy_rounds, int)
+                and not isinstance(legacy_rounds, bool)
+                and isinstance(pending, int)
+                and not isinstance(pending, bool)
+                else legacy_rounds
+            )
+            research_data.setdefault("maximum_coordinator_decisions", migrated_decisions)
+        normalized["research"] = research_data
+
+    return normalized
 
 
 def _migrate_config_mapping(values: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -538,7 +758,7 @@ def _migrate_config_mapping(values: Mapping[str, Any]) -> tuple[dict[str, Any], 
 
     if is_pre_v2:
         migrated["config_version"] = CURRENT_CONFIG_VERSION
-    return migrated, inferred_api
+    return _normalize_continuous_research_aliases(migrated), inferred_api
 
 
 def _v2_path(path: tuple[str, ...]) -> tuple[str, ...]:
@@ -615,6 +835,7 @@ def environment_overrides(
     environment: Mapping[str, str] | None = None,
     *,
     defaults: AppConfig | None = None,
+    legacy_pending_capacity: int = 32,
 ) -> dict[str, Any]:
     """Convert supported ``ASCEND_*`` variables to a nested config mapping."""
 
@@ -654,6 +875,75 @@ def environment_overrides(
                 raise ConfigError(f"invalid value for environment variable {key}: must be >= 1")
             _set_total_time_limit(overrides, minutes)
             continue
+        canonical_suffix = suffix.replace("__", "_")
+        legacy_model_tail: str | None = None
+        for prefix in ("MODELS_RESEARCH_", "API_MODELS_RESEARCH_"):
+            if canonical_suffix.startswith(prefix):
+                candidate = canonical_suffix[len(prefix) :]
+                model_fields = {
+                    name.upper(): name for name in ModelSettings().model_dump(mode="python")
+                }
+                if candidate in model_fields:
+                    legacy_model_tail = model_fields[candidate]
+                break
+        if legacy_model_tail is not None:
+            role_template_path = (
+                "api",
+                "models",
+                "research_worker",
+                legacy_model_tail,
+            )
+            legacy_model_value = _parse_environment_value(
+                raw,
+                _lookup_template(template, role_template_path),
+                key,
+            )
+            _set_nested(
+                overrides,
+                ("api", "models", "research", legacy_model_tail),
+                legacy_model_value,
+            )
+            continue
+        legacy_environment_paths: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+            "CODEX_RESEARCH_EFFORT": (
+                ("codex", "research_effort"),
+                ("codex", "research_worker_effort"),
+            ),
+            "CODEX_LIMITS_MAX_RESEARCH_ROUNDS": (
+                ("codex", "limits", "max_research_rounds"),
+                ("codex", "limits", "max_research_coordinator_decisions"),
+            ),
+            "RESEARCH_MAXIMUM_ASSIGNMENTS_PER_ROUND": (
+                ("research", "maximum_assignments_per_round"),
+                ("research", "maximum_pending_assignments"),
+            ),
+            "MAXIMUM_ASSIGNMENTS_PER_ROUND": (
+                ("research", "maximum_assignments_per_round"),
+                ("research", "maximum_pending_assignments"),
+            ),
+            "RESEARCH_MAXIMUM_ROUNDS": (
+                ("research", "maximum_rounds"),
+                ("research", "maximum_coordinator_decisions"),
+            ),
+            "MAX_ROUNDS": (
+                ("research", "maximum_rounds"),
+                ("research", "maximum_coordinator_decisions"),
+            ),
+            "MAXIMUM_ROUNDS": (
+                ("research", "maximum_rounds"),
+                ("research", "maximum_coordinator_decisions"),
+            ),
+        }
+        legacy_paths = legacy_environment_paths.get(canonical_suffix)
+        if legacy_paths is not None:
+            legacy_path, legacy_template_path = legacy_paths
+            legacy_value = _parse_environment_value(
+                raw,
+                _lookup_template(template, legacy_template_path),
+                key,
+            )
+            _set_nested(overrides, legacy_path, legacy_value)
+            continue
         path = _CONVENIENCE_PATHS.get(suffix) or flat_paths.get(suffix)
         if path is None:
             if "__" not in suffix:
@@ -665,18 +955,25 @@ def environment_overrides(
         expected = _lookup_template(template, path)
         if path[-1:] == ("maximum_wall_clock_hours",):
             try:
-                parsed: Any = float(raw.strip())
+                parsed_value: Any = float(raw.strip())
             except ValueError as exc:
                 raise ConfigError(
                     f"invalid value for environment variable {key}: expected a number"
                 ) from exc
         else:
-            parsed = _parse_environment_value(raw, expected, key)
-        _set_nested(overrides, path, parsed)
-    return overrides
+            parsed_value = _parse_environment_value(raw, expected, key)
+        _set_nested(overrides, path, parsed_value)
+    return _normalize_continuous_research_aliases(
+        overrides,
+        legacy_pending_capacity=legacy_pending_capacity,
+    )
 
 
-def normalize_cli_overrides(overrides: ConfigMapping | None) -> dict[str, Any]:
+def normalize_cli_overrides(
+    overrides: ConfigMapping | None,
+    *,
+    legacy_pending_capacity: int = 32,
+) -> dict[str, Any]:
     """Normalize nested, dotted, or common CLI option names.
 
     ``None`` values are omitted, matching the usual semantics of optional Typer
@@ -731,14 +1028,23 @@ def normalize_cli_overrides(overrides: ConfigMapping | None) -> dict[str, Any]:
                 raise ConfigError("CLI override no_lean must be a boolean")
             value = not value
         _set_nested(normalized, path, value)
-    return normalized
+    return _normalize_continuous_research_aliases(
+        normalized,
+        legacy_pending_capacity=legacy_pending_capacity,
+    )
 
 
 def merge_config(config: AppConfig, overrides: ConfigMapping | None) -> AppConfig:
     """Return a validated copy of ``config`` with CLI-style overrides applied."""
 
     data = config.model_dump(mode="python")
-    merged = _deep_merge(data, normalize_cli_overrides(overrides))
+    merged = _deep_merge(
+        data,
+        normalize_cli_overrides(
+            overrides,
+            legacy_pending_capacity=config.research.maximum_pending_assignments,
+        ),
+    )
     try:
         result = AppConfig.model_validate(merged)
     except ValidationError as exc:
@@ -802,8 +1108,37 @@ def load_config(
         if inferred_api:
             migration_notice = ConfigMigrationNotice()
 
-    data = _deep_merge(data, environment_overrides(env, defaults=defaults))
-    data = _deep_merge(data, normalize_cli_overrides(cli_overrides))
+    file_research = data.get("research")
+    file_pending = (
+        file_research.get("maximum_pending_assignments", 32)
+        if isinstance(file_research, Mapping)
+        else 32
+    )
+    if not isinstance(file_pending, int) or isinstance(file_pending, bool):
+        file_pending = 32
+    data = _deep_merge(
+        data,
+        environment_overrides(
+            env,
+            defaults=defaults,
+            legacy_pending_capacity=file_pending,
+        ),
+    )
+    resolved_research = data.get("research")
+    resolved_pending = (
+        resolved_research.get("maximum_pending_assignments", 32)
+        if isinstance(resolved_research, Mapping)
+        else 32
+    )
+    if not isinstance(resolved_pending, int) or isinstance(resolved_pending, bool):
+        resolved_pending = 32
+    data = _deep_merge(
+        data,
+        normalize_cli_overrides(
+            cli_overrides,
+            legacy_pending_capacity=resolved_pending,
+        ),
+    )
 
     root = project_root
     if root is None and discovered_path is not None:
@@ -903,6 +1238,7 @@ __all__ = [
     "CodexSettings",
     "ConfigError",
     "ConfigMigrationNotice",
+    "GraphSettings",
     "LeanSettings",
     "Limits",
     "LoggingSettings",

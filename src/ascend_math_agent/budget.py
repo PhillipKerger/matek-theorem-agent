@@ -115,6 +115,7 @@ class BudgetRemaining:
     cost_usd: float
     tokens: int | None
     wall_clock_seconds: float | None
+    calls: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +207,14 @@ class BudgetTracker:
                     else max(
                         0.0,
                         self.limits.maximum_wall_clock_hours * 3600 - snapshot.elapsed_seconds,
+                    )
+                ),
+                calls=(
+                    None
+                    if self.maximum_calls is None
+                    else max(
+                        0,
+                        self.maximum_calls - snapshot.calls - len(self._reservations),
                     )
                 ),
             )

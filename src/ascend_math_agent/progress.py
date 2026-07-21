@@ -11,12 +11,16 @@ class Ascension(IntEnum):
 
     FETCH_PROBLEM = 0
     FORMULATE_PROMPT = 1
-    PLAN_RESEARCH = 2
-    RUN_RESEARCH = 3
+    START_RESEARCH_COORDINATOR = 2
+    MANAGE_RESEARCH_POOL = 3
     AUDIT_RESEARCH = 4
     WRITE_MANUSCRIPT = 5
     FORMALIZE_LEAN = 6
     PREPARE_REPORT = 7
+
+    # Compatibility aliases for integrations written before the continuous scheduler.
+    PLAN_RESEARCH = START_RESEARCH_COORDINATOR
+    RUN_RESEARCH = MANAGE_RESEARCH_POOL
 
 
 ProgressReporter = Callable[[Ascension, str], None]

@@ -107,6 +107,29 @@ def test_budget_reservations_are_atomic_and_reconcile_actual_usage() -> None:
     assert tracker.remaining().tokens == 70
 
 
+def test_budget_remaining_calls_subtracts_live_reservations() -> None:
+    tracker = BudgetTracker(
+        Limits(maximum_cost_usd=1.0),
+        maximum_calls=3,
+        enforce_cost_budget=False,
+    )
+
+    first = tracker.reserve(estimated_cost_usd=0.0, estimated_tokens=0)
+    second = tracker.reserve(estimated_cost_usd=0.0, estimated_tokens=0)
+
+    assert tracker.snapshot().calls == 0
+    assert tracker.remaining().calls == 1
+    tracker.release(first)
+    assert tracker.remaining().calls == 2
+    tracker.reconcile(
+        second,
+        UsageRecord(response_id="codex-reserved", cost_usd=None),
+        enforce=False,
+    )
+    assert tracker.snapshot().calls == 1
+    assert tracker.remaining().calls == 2
+
+
 def test_budget_carries_elapsed_time_across_resume() -> None:
     ticks = iter([10.0, 15.0])
     tracker = BudgetTracker(
@@ -145,9 +168,12 @@ def test_subscription_budget_tracks_unknown_cost_without_applying_api_dollar_gat
         enforce_cost_budget=False,
         maximum_calls=2,
     )
+    assert tracker.remaining().calls == 2
     tracker.record(UsageRecord(response_id="codex-1", cost_usd=None))
+    assert tracker.remaining().calls == 1
     tracker.ensure_available(estimated_calls=1)
     tracker.record(UsageRecord(response_id="codex-2", cost_usd=None))
+    assert tracker.remaining().calls == 0
 
     with pytest.raises(BudgetExceeded) as error:
         tracker.ensure_available(estimated_calls=1)

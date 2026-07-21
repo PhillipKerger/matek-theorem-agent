@@ -61,6 +61,7 @@ class FinalReport(BaseModel):
     literature_resolution_summary: str | None = None
     prompt_validation_warnings: list[str] = Field(default_factory=list)
     lean_consent: dict[str, Any] = Field(default_factory=dict)
+    knowledge_graph: dict[str, Any] = Field(default_factory=dict)
     reproducibility: list[str] = Field(default_factory=list)
     narrative: ReportNarrative | None = None
 
@@ -192,10 +193,17 @@ def build_final_report(
         lean_consent=(
             dict(metadata["lean_consent"]) if isinstance(metadata.get("lean_consent"), dict) else {}
         ),
+        knowledge_graph=(
+            dict(metadata["knowledge_graph"])
+            if isinstance(metadata.get("knowledge_graph"), dict)
+            else {}
+        ),
         reproducibility=[
             f"ascend status {state.run_id}",
             f"ascend verify {state.run_id}",
             f"ascend resume {state.run_id}",
+            "ascend graph validate",
+            "ascend graph status",
         ],
         narrative=narrative,
     )
@@ -263,6 +271,20 @@ def render_report_markdown(report: FinalReport) -> str:
                 "",
                 f"- Outcome: `{report.lean_consent.get('outcome', 'unknown')}`",
                 f"- Proceeded: `{report.lean_consent.get('proceed', False)}`",
+                "",
+            ]
+        )
+
+    if report.knowledge_graph:
+        lines.extend(
+            [
+                "## Persistent knowledge graph",
+                "",
+                f"- Problem node: `{report.knowledge_graph.get('problem_id', 'unknown')}`",
+                f"- Revision: `{report.knowledge_graph.get('revision', 'unknown')}`",
+                "- Obsidian vault: [open Home](../../../knowledge/Home.md) "
+                "(project path: `.ascend/knowledge`)",
+                "- Rebuildable index: project path `.ascend/graph-index.sqlite`",
                 "",
             ]
         )

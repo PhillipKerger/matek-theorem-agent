@@ -5,6 +5,11 @@ Include the exact theorem, definitions, dependency graph, proof of every new lem
 theorems with exact hypotheses, exceptional cases, quantitative bookkeeping, and final
 logical deduction.
 
+Explicitly classify whether the result is quantitative or algorithmic. Set
+`quantitative_or_algorithmic` to true whenever correctness depends on constants, rates,
+probabilities, precision, runtime, sample size, bit complexity, or another quantitative bound;
+the field is mandatory and must not be omitted.
+
 Do not hide unresolved obligations. If the route is incomplete, return an incomplete package
 with a precise obligation list rather than presenting it as solved.
 

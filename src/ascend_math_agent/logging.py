@@ -350,6 +350,37 @@ class ModelCallStore:
             )
         return record
 
+    def load_by_request_key(
+        self,
+        request_key: str,
+        *,
+        expected_stage: str,
+        expected_cache_namespace: str,
+    ) -> ModelCallRecord | None:
+        """Load a checkpoint when a durable caller already owns its exact key.
+
+        This is intentionally scoped by stage and cache generation. It supports
+        crash recovery of a scheduler request map without making unrelated or
+        archived model calls transferable budget credit.
+        """
+
+        path = self._record_path(request_key)
+        if not path.is_file():
+            return None
+        try:
+            record = ModelCallRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValidationError, ValueError) as exc:
+            raise ModelCallJournalError(f"model-call checkpoint is invalid: {path}") from exc
+        if (
+            record.request_key != request_key
+            or record.stage != expected_stage
+            or record.cache_namespace != expected_cache_namespace
+        ):
+            raise ModelCallJournalError(
+                f"model-call checkpoint does not match the owning scheduler scope: {path}"
+            )
+        return record
+
     def persist(
         self,
         identity: ModelCallIdentity,

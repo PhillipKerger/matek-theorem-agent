@@ -14,10 +14,23 @@ implementation reveals a concrete blocker.
 
 ## Orchestration
 
+Persistent research memory uses an application-level typed knowledge graph. Obsidian is the
+recommended human view, not a runtime dependency or database. Markdown/frontmatter is
+authoritative, SQLite is derived, and the vault stays beneath `.ascend/` to preserve the existing
+write boundary. The central coordinator alone creates tasks and accepts validated worker patches;
+subagents never mutate shared graph files concurrently.
+
 - Explicit application-level agents are the stable default.
 - Run workers concurrently with `asyncio` and bounded concurrency.
-- The research coordinator creates an initial diverse portfolio and dynamically plans later
-  rounds based on an explicit approach registry.
+- Research uses one durable logical coordinator with a completion-driven mailbox and live worker
+  pool, not fixed rounds or wait-for-all worker batches.
+- The coordinator creates an initial diverse portfolio of sixteen, then reacts to persisted
+  worker/audit events and dynamically refills up to 32 active workers by default.
+- The canonical atomic coordinator checkpoint owns scheduler state and a pending-event write-ahead
+  record. Full raw reports, per-assignment source verification, and atomically created immutable
+  event/decision files validate that checkpoint. The mailbox, assignment files, approach registry,
+  and continuity view aid delivery and navigation but may not replace either the checkpoint or its
+  evidence; correctness may not depend on hidden provider memory.
 - Hosted multi-agent features may later be added as an experimental backend, never as a
   required dependency.
 
@@ -28,11 +41,17 @@ implementation reveals a concrete blocker.
 - The direct OpenAI Responses API remains available only through explicit `api` selection and
   separate Platform billing.
 - Never silently fall back between providers.
-- All model IDs, reasoning modes, efforts, token limits, and tool availability are config.
-- Suggested API-backend defaults:
-  - prompt compiler: `gpt-5.6-sol`, pro/xhigh, web search on;
-  - research coordinator/workers/auditors: `gpt-5.6-sol`, pro/max, web search configurable;
-  - manuscript and bibliography agents: `gpt-5.6-sol`, pro/high or xhigh, web search on;
+- All model IDs, backend-supported reasoning modes, efforts, token limits, and tool availability
+  are configurable.
+- The closest reproducible analogue to a GPT 5.6 Sol Ultra research session is the explicit
+  application-level coordinator above. `Ultra session` is a product behavior target, not a Codex
+  or Responses API parameter.
+- Default research-role targets use `gpt-5.6-sol`; the Responses API sends pro mode while Codex CLI
+  uses its model and reasoning-effort controls without a separate Responses API mode field:
+  - prompt compiler: xhigh effort, web search on;
+  - research coordinator and final research judge: max effort, web search configurable;
+  - research workers and independent proof auditors: xhigh effort, web search configurable;
+  - manuscript and bibliography agents: high or xhigh effort, web search on;
   - low-risk formatting/status tasks may use a cheaper configurable model later.
 - Do not encode ChatGPT product labels such as “Ultra session” as API primitives.
 

@@ -19,8 +19,8 @@ Requirements:
      open-problem status report;
   2. the boundary conventions and most important outcomes that do not count;
   3. that the search begins with independent, genuinely different approaches, is managed
-     adaptively rather than by fixed quotas, and persists through new rounds when early routes
-     fail;
+     adaptively rather than by fixed quotas or fixed rounds, and dynamically redirects/refills
+     work when early routes fail;
   4. that candidate arguments must survive problem-specific adversarial checks;
   5. the permitted public-search boundary; and
   6. that only an audited complete solution satisfies the primary completion condition, while a

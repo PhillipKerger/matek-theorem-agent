@@ -12,14 +12,16 @@ problem.md + CLI/environment/project configuration
        -> clarification request + final report, when no unique target can be identified
        -> compiled_research_prompt.md + compiled_problem.json, otherwise
   -> verified prior-literature classification
-  -> dedicated adaptive research orchestrator
-       -> round plans
-       -> parallel independent workers
-       -> approach registry
+  -> durable event-driven research coordinator
+       -> coordinator decisions + assignment lifecycle state
+       -> canonical atomic scheduler checkpoint + immutable per-event evidence
+       -> materialized mailbox and navigation views
+       -> live pool of independent workers
+       -> full raw reports + approach registry
        -> targeted counterexample/lemma workers
-  -> candidate proof package
-  -> independent audit suite
-  -> final research judge
+       -> candidate proof package
+            -> independent audit suite + final research judge
+            `-> failed-audit events return immediately to coordinator
   -> LaTeX manuscript writer
   -> bibliography verifier
   -> LaTeX compiler
@@ -101,6 +103,11 @@ Legacy configurations with the original top-level API model/budget sections migr
 `provider = "api"` and the namespaced `[api]` layout. Migration retains all values and emits a
 one-time notice.
 
+Legacy research keys `maximum_assignments_per_round`, `maximum_rounds`,
+`max_research_rounds`, and the CLI `--max-rounds` input migrate to
+`maximum_pending_assignments` and a scaled `maximum_coordinator_decisions` budget. Compatibility
+never reintroduces fixed-round scheduling or a batch barrier.
+
 ### Workspace
 
 Discover the project root, create `.ascend/runs/<run-id>/`, enforce path confinement, and write
@@ -126,27 +133,85 @@ decision.
 
 ### Research engine
 
-The application-managed coordinator loop is provider-independent:
+The research engine is a provider-independent, application-managed actor loop. Its purpose is to
+reproduce the useful behavior of a GPT 5.6 Sol Ultra research session without depending on an
+`Ultra` API primitive or a hosted multi-agent implementation. The logical coordinator defaults to
+`gpt-5.6-sol` with max effort; independent workers default to the same model with xhigh effort.
+The Responses API adapter additionally sends `reasoning.mode = "pro"` for both roles. The Codex
+adapter uses Codex CLI's model and reasoning-effort controls and does not treat the Responses API
+mode field as a Codex setting. Role-specific settings remain configurable within backend
+capabilities.
 
-1. A dedicated research orchestrator, distinct from the outer workflow runner, receives the
-   complete compiled prompt and exact claim contract and creates a diverse `ResearchRoundPlan`.
-2. Workers run concurrently under backend-specific semaphores.
-3. ASCEND updates the `ApproachRegistry` and a durable cross-round `ResearchContinuityState` that
-   separates promising, partial, refuted, and blocked routes with their mathematical evidence.
-4. It chooses focused follow-up work, candidate packaging, or a budget-aware stop.
-5. Fresh independent audits and the final judge gate any candidate.
+`research/coordinator/state.json` is the canonical atomic scheduler checkpoint. Immutable files
+under `research/events/<zero-padded-sequence>.json`, immutable coordinator decisions, complete raw
+worker/source/audit reports, and their hashes are durable evidence used to validate it. Event
+publication is a state-first transaction: the checkpoint temporarily records the complete pending
+event, the event file is created idempotently, and a final checkpoint clears the pending field.
+`research/coordinator/mailbox.json`, assignment files, the registry, and continuity data are
+materialized delivery/navigation views. They can be refreshed from the canonical checkpoint and
+evidence, but deleting or corrupting the canonical checkpoint is not advertised as recoverable.
+Provider calls may use fresh contexts; application artifacts—not hidden conversation memory—define
+the logical coordinator.
 
-Every later orchestrator call receives the original compiled prompt and claim contract, the
-continuity state, the registry, all visible reports, and audit obligations. This explicit handoff
-preserves continuity across providers and process restarts without relying on hidden model memory.
-There is no cumulative logical-worker ceiling across rounds. Per-round assignment and
-concurrent-call ceilings are separate controls and both default to 32 research workers.
+The event loop is:
+
+1. Start or restore the logical coordinator with the complete compiled prompt and exact claim
+   contract. Its first decision supplies a diverse portfolio of sixteen assignments by default.
+2. Persist and validate the decision, then admit independent workers under research and
+   backend-specific semaphores. The default open-work limit is 32 queued-plus-running assignments;
+   the concurrency limit permits up to 32 members of that set to be active.
+3. On each completion, atomically persist the entire raw report and its hash, checkpoint the
+   transition with a pending-event write-ahead record, create one monotonically sequenced immutable
+   event file, clear the pending record, and refresh the mailbox view. The ordering ensures every
+   visible completion points to durable evidence and an interrupted event publication can finish
+   idempotently.
+4. Wake the coordinator on useful new events. Each activation receives the original main prompt,
+   claim contract, unacknowledged events, lifecycle state, registry, audit obligations, and the
+   corresponding full raw reports. It may add, retire, redirect, package, or stop work without
+   waiting for all active workers.
+5. Persist the zero-padded immutable decision before scheduling its effects, then materialize the
+   acknowledgement cursor. Event IDs, decision IDs, assignment IDs, and report hashes make replay
+   idempotent after interruption.
+6. When a candidate is triggered, pause new admissions and run fresh independent audits plus the
+   final judge immediately. In-flight completions still enter the mailbox. Acceptance terminates
+   research; failure appends full audit reports and repair obligations as high-priority events,
+   wakes the coordinator, and resumes/refills the pool.
+
+`ResearchContinuityState` is a derived navigation index separating promising, partial, refuted,
+and blocked routes with their mathematical evidence. It may help fit a fresh model context, but it
+never overwrites or substitutes for the canonical scheduler checkpoint, immutable event evidence,
+or full raw reports.
+There is no cumulative logical-worker ceiling and no fixed-round synchronization barrier.
+Total-open-assignment, concurrent-call, coordinator-decision, model-call, cost, token, and
+wall-clock limits are separate controls.
 
 The compiled problem carries a prior-literature classification. Exact known solutions remain
 eligible for source verification, proof reconstruction, exposition, and formalization, but must
 never be reported as mathematically novel.
 
 Codex internal subagents are not a substitute for ASCEND's independent roles and checkpoints.
+
+### Persistent knowledge graph
+
+The research engine uses a narrow deterministic `KnowledgeGraph` service, not Obsidian. Before
+each coordinator activation it queries a typed frontier from authoritative Markdown. Coordinator
+assignments become persistent task nodes; each worker receives only a bounded
+dependency/evidence slice. Worker output may contain a typed `GraphPatch`, but workers never
+write shared notes. The service serializes commits with a project lock, performs optimistic
+revision/hash conflict checks, writes a recovery intent, atomically replaces changed notes and
+state, saves a revision snapshot, then rebuilds navigation and SQLite views.
+
+Graph nodes distinguish mathematical claims from candidate proofs, audits, counterexamples,
+sources, and Lean formalizations. Status promotion and staleness are deterministic application
+rules. The manuscript and Lean stages consume accepted graph slices, and their mappings and exact
+verification records are written back only after existing gates pass.
+
+`.ascend/knowledge/` is an ordinary Obsidian-compatible vault and the portable source of truth.
+`.ascend/graph-state.json` stores revision/hashes, ownership baselines, source-problem mappings,
+processed operation IDs, and change records; `.ascend/snapshots/` supports diffs and safe stale
+rebases. `.ascend/graph-index.sqlite` is derived and may be deleted/rebuilt. A pending transaction
+file plus `.ascend/locks/graph.lock` makes multi-note commits crash-recoverable and cross-process
+serialized. This placement preserves the default no-write-outside-`.ascend/` boundary.
 
 ### Command execution backends
 
@@ -185,6 +250,12 @@ Domain models do not import the SDK, CLI presentation, or subprocess implementat
 - Successfully returned provider work is checkpointed before the stage checkpoint whenever the
   backend supports call/session recovery.
 - An interrupted stage preserves completed outputs and diagnostics.
+- An interrupted research stage loads the canonical coordinator checkpoint, completes any event in
+  its pending-event write-ahead field, and validates its cursor, decisions, completed assignments,
+  and hashes against immutable event/evidence files. It refreshes materialized mailbox and index
+  views as execution continues. A missing or invalid canonical checkpoint blocks ordinary resume;
+  ASCEND does not infer scheduler state from the evidence files alone. Completed events are not
+  redelivered after acknowledgement, and unacknowledged events are replayed idempotently.
 - `resume` starts at the first incomplete stage with the frozen backend.
 - `--force-stage NAME` invalidates that boundary and downstream stages while preserving prior
   provider records as audit history.

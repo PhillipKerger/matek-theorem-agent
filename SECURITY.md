@@ -41,6 +41,14 @@ are created in a disposable private temporary directory and removed afterward.
 
 ## Filesystem confinement
 
+The persistent graph vault is `.ascend/knowledge/`, not a top-level project directory. This is a
+normal Obsidian vault while retaining the default no-write-outside-`.ascend/` guarantee. Graph
+paths are confinement-checked; a project-scoped advisory lock serializes writers. Workers return
+data-only patches and never receive filesystem authority to edit shared notes. A write-ahead
+transaction, node hashes, machine-field ownership hashes, snapshots, and operation IDs prevent
+partial, conflicting, or duplicated commits. SQLite is untrusted derived state and is rebuildable
+from Markdown.
+
 - Resolve, normalize, and boundary-check every path.
 - By default, writes are permitted only under `.ascend/runs/<run-id>/`.
 - Reject symlinks, traversal, special files, and broader writable parents.

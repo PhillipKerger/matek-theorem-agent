@@ -6,8 +6,9 @@ allow_automatic_fallback = false
 
 [codex]
 executable = "codex"
-model = ""
-research_effort = "xhigh"
+model = "gpt-5.6-sol"
+research_coordinator_effort = "max"
+research_worker_effort = "xhigh"
 audit_effort = "xhigh"
 manuscript_effort = "high"
 formalization_effort = "xhigh"
@@ -20,7 +21,7 @@ extra_args = []
 [codex.limits]
 # No wall-clock limit is imposed unless --time-limit-minutes or an explicit limit is set.
 # No call-count limit is imposed unless max_agent_calls or max_codex_threads is set explicitly.
-max_research_rounds = 8
+max_research_coordinator_decisions = 256
 max_formalization_iterations = 60
 
 [api]
@@ -34,7 +35,7 @@ web_search = true
 maximum_web_search_calls = 8
 max_output_tokens = 100000
 
-[api.models.research]
+[api.models.research_coordinator]
 model = "gpt-5.6-sol"
 reasoning_mode = "pro"
 reasoning_effort = "max"
@@ -42,10 +43,18 @@ web_search = true
 maximum_web_search_calls = 8
 max_output_tokens = 120000
 
+[api.models.research_worker]
+model = "gpt-5.6-sol"
+reasoning_mode = "pro"
+reasoning_effort = "xhigh"
+web_search = true
+maximum_web_search_calls = 8
+max_output_tokens = 120000
+
 [api.models.audit]
 model = "gpt-5.6-sol"
 reasoning_mode = "pro"
-reasoning_effort = "max"
+reasoning_effort = "xhigh"
 web_search = true
 maximum_web_search_calls = 8
 max_output_tokens = 120000
@@ -61,12 +70,17 @@ max_output_tokens = 120000
 [research]
 minimum_initial_agents = 16
 maximum_concurrent_agents = 32
-maximum_assignments_per_round = 32
-maximum_rounds = 8
+maximum_pending_assignments = 32
+maximum_coordinator_decisions = 256
 require_foundational_audit = true
 require_domain_audit = true
 require_hostile_audit = true
 require_source_theorem_audit = true
+
+[graph]
+# Context slices are bounded; workers never receive or mutate the whole vault.
+maximum_context_nodes = 40
+maximum_context_characters = 60000
 
 [manuscript]
 enabled = true

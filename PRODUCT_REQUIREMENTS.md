@@ -62,39 +62,100 @@ formalization, and generates a reproducible final report.
 
 ### FR-3 Adaptive research
 
-- Start with a research-orchestrator-generated portfolio of sixteen research assignments by
-  default,
-  spanning at least four materially different approaches unless the configured budget is lower.
+- Approximate the behavior of giving the complete main research prompt to a GPT 5.6 Sol Ultra
+  research session through explicit application-level orchestration. `Ultra` is a product/session
+  label, not a model-backend or Responses API primitive. The Responses API adapter defaults the
+  logical coordinator to `gpt-5.6-sol` with `reasoning.mode = "pro"` and
+  `reasoning.effort = "max"`, and workers to the same model and mode with
+  `reasoning.effort = "xhigh"`. The default Codex adapter requests `gpt-5.6-sol` with `max`
+  coordinator effort and `xhigh` worker effort through Codex CLI's reasoning-effort control; it
+  does not present the Responses API `reasoning.mode` field as a Codex setting. Every role remains
+  configurable within the selected backend's capabilities.
+- Start or resume one durable logical research coordinator with the complete, unabridged compiled
+  prompt and exact claim contract. Provider calls may use fresh contexts; correctness must come
+  from application-owned state rather than a surviving provider conversation.
+- Have the coordinator create sixteen initial assignments by default, spanning at least four
+  materially different approaches unless the configured budget is lower.
 - Keep initial workers independent; do not reveal the favored route to all workers.
-- Run research under a dedicated model-driven research orchestrator that receives the complete
-  compiled prompt and exact claim contract on every round, separately from the deterministic
-  outer workflow orchestrator.
-- Store every worker assignment and result.
+- Run research as a completion-driven event loop rather than fixed rounds. Atomically preserve
+  every assignment and full raw worker report, then atomically write one immutable zero-padded
+  completion-event file and refresh the materialized mailbox snapshot. Activate the coordinator
+  as useful events arrive.
+- Give every coordinator activation the complete main prompt and claim contract, all
+  not-yet-acknowledged mailbox events, the approach registry, audit obligations, and direct access
+  to the complete raw reports. Derived summaries or continuity snapshots must never replace or
+  truncate the underlying reports.
+- Refill useful work dynamically after completions instead of waiting for a batch barrier. Permit
+  up to 32 total open assignments (queued plus running) by default. Permit up to 32 of that open
+  set to be active research workers, subject to backend and budget limits.
 - Maintain an approach registry containing mechanism, result, assumptions, bottleneck,
   counterexamples, dependencies, and status.
-- Support multiple rounds within cost, token, wall-clock, per-round assignment, and concurrency
-  limits.
-- Do not impose a cumulative research-worker count ceiling across rounds. Permit up to 32
-  assignments and 32 concurrent research workers in one round by default. Do not impose a
-  global Codex call-count limit by default; retain explicit configurable call-count limits.
-- Persist an explicit cross-round continuity handoff separating promising routes, partial
-  results, ruled-out directions and counterexamples, blocked routes and exact gaps, dependencies,
-  prior directives, and audit repair obligations. Supply it and the visible underlying reports
-  to every later research-orchestrator call.
+- Support cost, token, active wall-clock, total-open-assignment, concurrency,
+  coordinator-decision, and explicit call-count limits without turning any limit into a
+  synchronization barrier.
+- Name the primary scheduler controls `research.maximum_pending_assignments` and
+  `research.maximum_coordinator_decisions`. Migrate legacy fixed-round settings and
+  `--max-rounds` into scaled decision budgets for compatibility without restoring round
+  semantics.
+- Do not impose a cumulative research-worker count ceiling. Do not impose a global Codex
+  call-count limit by default; retain explicit configurable limits.
+- Persist `research/coordinator/state.json` as the canonical atomic scheduler checkpoint. Use its
+  pending-event field as a write-ahead record: checkpoint the transition and proposed event first,
+  create the immutable zero-padded event evidence, then clear the pending field. Validate the
+  checkpoint against immutable coordinator decisions, full raw reports, per-assignment source
+  verification, event hashes, and candidate/audit evidence on resume. Treat the mailbox,
+  assignment files, registry, and continuity view as materialized navigation/delivery views; the
+  continuity view separates promising routes, partial results, ruled-out directions and
+  counterexamples, blocked routes and exact gaps, dependencies, prior directives, and audit repair
+  obligations. Ordinary resume must fail truthfully if the canonical scheduler checkpoint is
+  missing or invalid rather than claiming it can be reconstructed from evidence alone.
 - Launch targeted counterexample and lemma-audit tasks when promising claims arise.
-- Produce a candidate proof package when the research orchestrator recommends it or a worker explicitly
+- Produce a candidate proof package when the coordinator recommends it or a worker explicitly
   reports a full proof of the exact success criterion.
-- When a worker reports a complete proof, pause unfinished work and run the full independent
-  acceptance gate immediately. Advance only if it passes; otherwise resume remaining routes
-  with the audit obligations preserved.
+- When a candidate is triggered, pause admission of new research workers and run the full
+  independent acceptance gate immediately without waiting for unrelated active workers. Preserve
+  any reports that finish while admission is paused in the mailbox. Advance only if the candidate
+  passes; otherwise append the complete failed-audit reports and exact repair obligations as
+  high-priority events, reactivate the coordinator immediately, and refill the live pool.
 - Expose a total active wall-clock limit for the complete run, persist elapsed time across resume,
   and use the remaining allowance to bound in-flight model calls. Keep this limit disabled by
   default and require explicit user configuration.
+
+### FR-3A Persistent mathematical knowledge graph
+
+- ASCEND shall maintain one project-scoped, persistent graph per source problem beneath
+  `.ascend/knowledge/`, independent of run directories and reusable by later runs.
+- Portable Markdown with flat typed YAML frontmatter is authoritative. The SQLite index is a
+  disposable acceleration layer rebuildable from Markdown.
+- The graph shall represent problem, definition, claim, proof, approach, task, counterexample,
+  experiment, source, audit, formalization, run, artifact, and human-note nodes with immutable
+  stable IDs and typed, constraint-checked relations.
+- Epistemic and workflow statuses are separate. Only deterministic Lean verification may assign
+  `lean_verified`; worker proposals cannot bypass research/audit gates.
+- The coordinator shall query a research frontier and create graph-scoped tasks. Workers receive
+  bounded context slices and return structured optimistic-concurrency patches rather than
+  mutating the shared vault.
+- Patch merges shall validate types, IDs, relation constraints, dependency acyclicity, duplicate
+  likelihood, node hashes, status transitions, and base revisions before an atomic commit and
+  snapshot/index update.
+- Dependency and exact-statement changes shall propagate staleness. Lean evidence is bound to an
+  exact claim ID, statement version/hash, declaration, source hash, toolchain, mathlib revision,
+  build result, and axiom report.
+- Distilled failed/blocked work and valid partial results shall persist across incomplete runs;
+  raw transcripts remain run artifacts rather than first-class graph nodes.
+- Humans may rename notes and edit prose outside generated blocks. Exact-statement/proof edits
+  trigger versioning/re-audit; machine-field conflicts fail validation instead of being silently
+  overwritten.
+- The graph shall be navigable in Obsidian through Home, dashboards, links/backlinks, and curated
+  canvases, while all validation/query operations remain usable without Obsidian.
 
 ### FR-4 Research acceptance gate
 
 - Run fresh-context foundational, domain-specialist, hostile counterexample, and, when
   relevant, complexity/quantitative audits.
+- Require the candidate package to classify quantitative or algorithmic content explicitly, and
+  require the independent foundational auditor to block a false negative so the packager cannot
+  bypass an applicable complexity audit.
 - Run a final judge that sees the problem contract, candidate package, and audit reports.
 - Accept only if the exact target is established, all mandatory audits pass, and unresolved
   theorem-strength obligations are empty.

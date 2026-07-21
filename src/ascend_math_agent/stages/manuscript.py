@@ -742,6 +742,7 @@ async def generate_manuscript(
     research_result: ResearchResult,
     claim_contract: dict[str, Any],
     source_ledger: list[dict[str, Any]],
+    knowledge_graph_context: dict[str, object] | None = None,
     manuscript_dir: Path,
     writer_settings: ModelSettings | None = None,
     verifier_settings: ModelSettings | None = None,
@@ -838,6 +839,7 @@ async def generate_manuscript(
             name: audit.model_dump(mode="json") for name, audit in research_result.audits.items()
         },
         "source_ledger": source_ledger,
+        "knowledge_graph_context": knowledge_graph_context,
         "mandatory_structured_content": {
             "introduction_coverage": (
                 "Provide verbatim substantial Introduction excerpts for related work, "
@@ -1115,6 +1117,7 @@ async def resume_manuscript_bibliography(
     research_result: ResearchResult,
     claim_contract: dict[str, Any],
     source_ledger: list[dict[str, Any]],
+    knowledge_graph_context: dict[str, object] | None = None,
     manuscript_dir: Path,
     maximum_additional_correction_cycles: int = 1,
     writer_settings: ModelSettings | None = None,
@@ -1148,6 +1151,7 @@ async def resume_manuscript_bibliography(
         research_result=research_result,
         claim_contract=claim_contract,
         source_ledger=source_ledger,
+        knowledge_graph_context=knowledge_graph_context,
         manuscript_dir=manuscript_dir,
         writer_settings=writer_settings,
         verifier_settings=verifier_settings,

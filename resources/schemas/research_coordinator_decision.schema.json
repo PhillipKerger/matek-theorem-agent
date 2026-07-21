@@ -52,8 +52,13 @@
     }
   },
   "additionalProperties": false,
-  "description": "Legacy fixed-round plan retained for completed-run compatibility.\n\nNew research runs use :class:`ResearchCoordinatorDecision`; keeping this model lets\nASCEND read old ``result.json`` and schema artifacts without silently reinterpreting\ntheir scheduling semantics.",
+  "description": "One event-indexed decision from the continuous logical coordinator.",
   "properties": {
+    "after_event_sequence": {
+      "minimum": 0,
+      "title": "After Event Sequence",
+      "type": "integer"
+    },
     "assignments": {
       "items": {
         "$ref": "#/$defs/ResearchAssignment"
@@ -65,12 +70,24 @@
       "title": "Candidate Packaging Recommended",
       "type": "boolean"
     },
+    "candidate_report_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Candidate Report Ids",
+      "type": "array"
+    },
     "claims_requiring_counterexample_search": {
       "items": {
         "type": "string"
       },
       "title": "Claims Requiring Counterexample Search",
       "type": "array"
+    },
+    "decision_id": {
+      "minimum": 1,
+      "title": "Decision Id",
+      "type": "integer"
     },
     "lemmas_requiring_proof_completion": {
       "items": {
@@ -97,10 +114,14 @@
       "title": "Retire Assignment Ids",
       "type": "array"
     },
-    "round_id": {
-      "minimum": 1,
-      "title": "Round Id",
-      "type": "integer"
+    "stop_category": {
+      "enum": [
+        "scientific",
+        "refuted",
+        "budget"
+      ],
+      "title": "Stop Category",
+      "type": "string"
     },
     "stop_reason": {
       "anyOf": [
@@ -119,17 +140,20 @@
     }
   },
   "required": [
-    "round_id",
+    "decision_id",
+    "after_event_sequence",
     "assignments",
     "rationale",
-    "candidate_packaging_recommended",
     "retire_assignment_ids",
     "redirect_assignment_ids",
     "claims_requiring_counterexample_search",
     "lemmas_requiring_proof_completion",
+    "candidate_packaging_recommended",
+    "candidate_report_ids",
     "stop_recommended",
-    "stop_reason"
+    "stop_reason",
+    "stop_category"
   ],
-  "title": "ResearchRoundPlan",
+  "title": "ResearchCoordinatorDecision",
   "type": "object"
 }

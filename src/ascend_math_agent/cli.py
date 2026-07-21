@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from collections.abc import Coroutine, Mapping
+import tomllib
+from collections.abc import Coroutine, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -43,6 +44,12 @@ from .execution.docker import DockerBackend
 from .execution.native import NativeBackend
 from .initialization import InitializationError, initialize_project
 from .intake import IntakeError, normalize_problem_text
+from .knowledge_graph import (
+    GraphValidationError,
+    KnowledgeGraph,
+    KnowledgeGraphError,
+    RelationType,
+)
 from .logging import JournalCorruptionError
 from .models import RunState, StageName, StageStatus
 from .openai_client import (
@@ -68,6 +75,11 @@ app = typer.Typer(
     no_args_is_help=True,
     help="ASCEND: auditable mathematical research and optional Lean verification.",
 )
+graph_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect and maintain the persistent Obsidian-compatible knowledge graph.",
+)
+app.add_typer(graph_app, name="graph")
 console = Console()
 
 T = TypeVar("T")
@@ -81,6 +93,12 @@ class SandboxChoice(StrEnum):
 class BackendChoice(StrEnum):
     CODEX = "codex"
     API = "api"
+
+
+class GraphExportChoice(StrEnum):
+    JSON = "json"
+    GRAPHVIZ = "graphviz"
+    MERMAID = "mermaid"
 
 
 class _OfflineModelClient:
@@ -168,7 +186,7 @@ def _live_runner(config: AppConfig) -> WorkflowRunner:
         model_client: ModelClient = CodexCliModelClient(
             workspace_root,
             executable=config.codex.executable,
-            model=config.codex.model or None,
+            model=config.codex.model,
             persist_sessions=config.codex.persist_sessions,
             skip_git_repo_check=config.codex.skip_git_repo_check,
             extra_args=config.codex.extra_args,
@@ -196,7 +214,7 @@ def _live_runner(config: AppConfig) -> WorkflowRunner:
                     if config.backend.provider == "codex"
                     else config.lean.codex_command
                 ),
-                model=config.codex.model or None,
+                model=config.codex.model,
                 reasoning_effort=config.codex.formalization_effort,
             ),
             progress=_print_progress,
@@ -224,6 +242,8 @@ def _error_code(exc: BaseException) -> int:
         return 5
     if isinstance(exc, (ArtifactIntegrityError, StateCorruptionError, JournalCorruptionError)):
         return 6
+    if isinstance(exc, GraphValidationError):
+        return 6
     if isinstance(exc, CodexBackendError):
         return 3
     if isinstance(exc, ModelAdapterError):
@@ -239,6 +259,7 @@ def _error_code(exc: BaseException) -> int:
             RunNotFoundError,
             WorkflowError,
             WorkspaceError,
+            KnowledgeGraphError,
             ValueError,
         ),
     ):
@@ -262,6 +283,7 @@ def _config_overrides(
     *,
     backend: BackendChoice | None = None,
     budget_usd: float | None = None,
+    max_coordinator_decisions: int | None = None,
     max_rounds: int | None = None,
     max_agents: int | None = None,
     time_limit_minutes: int | None = None,
@@ -270,9 +292,14 @@ def _config_overrides(
     sandbox: SandboxChoice | None = None,
     verbose: bool = False,
 ) -> dict[str, Any]:
+    if max_coordinator_decisions is not None and max_rounds is not None:
+        raise ConfigError(
+            "--max-coordinator-decisions and deprecated --max-rounds cannot be combined"
+        )
     return {
         "backend": backend.value if backend is not None else None,
         "budget_usd": budget_usd,
+        "max_coordinator_decisions": max_coordinator_decisions,
         "max_rounds": max_rounds,
         "max_agents": max_agents,
         "time_limit_minutes": time_limit_minutes,
@@ -343,6 +370,16 @@ def _print_result(result: WorkflowResult) -> None:
     console.print(f"Report: {result.report.report_markdown}")
 
 
+def _project_graph() -> KnowledgeGraph:
+    root = _project_root()
+    config = load_config(project_root=root)
+    return KnowledgeGraph(
+        root,
+        maximum_context_nodes=config.graph.maximum_context_nodes,
+        maximum_context_characters=config.graph.maximum_context_characters,
+    )
+
+
 @app.command()
 def init(
     force: bool = typer.Option(False, "--force", help="Replace existing starter files."),
@@ -352,12 +389,191 @@ def init(
     try:
         root = _project_root()
         result = initialize_project(root, force=force)
+        graph = _project_graph()
+        graph.initialize()
         for path in result.created:
             console.print(f"[green]✓[/green] Created {path.relative_to(root)}")
         for path in result.overwritten:
             console.print(f"[yellow]![/yellow] Replaced {path.relative_to(root)}")
         for path in result.preserved:
             console.print(f"[dim]- Preserved {path.relative_to(root)}[/dim]")
+        console.print(f"[green]✓[/green] Knowledge vault {graph.vault_root.relative_to(root)}")
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("init")
+def graph_init() -> None:
+    """Create the portable Markdown vault and rebuildable graph index."""
+
+    try:
+        graph = _project_graph()
+        state = graph.initialize()
+        console.print(f"Vault: {graph.vault_root}")
+        console.print(f"Revision: {state.revision}")
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("validate")
+def graph_validate() -> None:
+    """Validate Markdown, machine ownership, relations, DAGs, and index revision."""
+
+    try:
+        report = _project_graph().validate()
+        console.print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+        if not report.valid:
+            raise typer.Exit(code=6)
+    except typer.Exit:
+        raise
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("status")
+def graph_status_command() -> None:
+    """Show the current graph revision and typed node/status counts."""
+
+    try:
+        status_value = _project_graph().status()
+        console.print(json.dumps(status_value.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("frontier")
+def graph_frontier(problem_id: str | None = typer.Option(None, "--problem-id")) -> None:
+    """Show unresolved claims, audits, contradictions, blockers, and active tasks."""
+
+    try:
+        frontier_value = _project_graph().frontier(problem_id)
+        console.print(json.dumps(frontier_value.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("rebuild-index")
+def graph_rebuild_index() -> None:
+    """Rebuild the disposable SQLite index from authoritative Markdown notes."""
+
+    try:
+        path = _project_graph().rebuild_index()
+        console.print(f"Rebuilt {path}")
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("open")
+def graph_open() -> None:
+    """Open the vault in Obsidian when available, otherwise print its path."""
+
+    try:
+        opened, path, detail = _project_graph().open_in_obsidian()
+        console.print(f"Vault: {path}")
+        console.print(("Opened in Obsidian. " if opened else "Obsidian unavailable. ") + detail)
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("export")
+def graph_export(
+    output_format: GraphExportChoice = typer.Option(GraphExportChoice.JSON, "--format"),
+    output: Path | None = typer.Option(None, "--output", dir_okay=False),
+) -> None:
+    """Export JSON, Graphviz DOT, or Mermaid without requiring Obsidian."""
+
+    try:
+        rendered = _project_graph().export(output_format=output_format.value)
+        if output is None:
+            console.print(rendered, markup=False, end="")
+        else:
+            destination = output.expanduser().resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(rendered, encoding="utf-8")
+            console.print(f"Wrote {destination}")
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("diff")
+def graph_diff(revision_a: str, revision_b: str) -> None:
+    """Compare two durable graph snapshots."""
+
+    try:
+        difference = _project_graph().diff(revision_a, revision_b)
+        console.print(json.dumps(difference.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("show")
+def graph_show(node_id: str) -> None:
+    """Show one node by immutable ID."""
+
+    try:
+        node = _project_graph().show(node_id)
+        console.print(json.dumps(node.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+def _print_graph_nodes(nodes: Sequence[BaseModel]) -> None:
+    console.print(
+        json.dumps([node.model_dump(mode="json") for node in nodes], indent=2, sort_keys=True)
+    )
+
+
+@graph_app.command("dependencies")
+def graph_dependencies(node_id: str) -> None:
+    """Traverse mathematical dependencies of a node."""
+
+    try:
+        _print_graph_nodes(
+            _project_graph().traverse(node_id, downstream=False, relation=RelationType.DEPENDS_ON)
+        )
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("downstream")
+def graph_downstream(node_id: str) -> None:
+    """Traverse nodes invalidated when this dependency changes."""
+
+    try:
+        _print_graph_nodes(
+            _project_graph().traverse(node_id, downstream=True, relation=RelationType.DEPENDS_ON)
+        )
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("stale")
+def graph_stale(problem_id: str | None = typer.Option(None, "--problem-id")) -> None:
+    """List stale nodes and invalidation reasons."""
+
+    try:
+        _print_graph_nodes(_project_graph().list_stale(problem_id))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("tasks")
+def graph_tasks(problem_id: str | None = typer.Option(None, "--problem-id")) -> None:
+    """List persistent graph-scoped research tasks."""
+
+    try:
+        _print_graph_nodes(_project_graph().list_tasks(problem_id))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("tombstone")
+def graph_tombstone(node_id: str, reason: str = typer.Option(..., "--reason")) -> None:
+    """Retain a superseded node identity and invalidate its dependents."""
+
+    try:
+        result = _project_graph().tombstone(node_id, reason=reason)
+        console.print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
@@ -433,7 +649,18 @@ def run(
         help="Model backend: codex (recommended/default) or api (advanced, separately billed).",
     ),
     budget_usd: float | None = typer.Option(None, "--budget-usd", min=0.0),
-    max_rounds: int | None = typer.Option(None, "--max-rounds", min=1),
+    max_coordinator_decisions: int | None = typer.Option(
+        None,
+        "--max-coordinator-decisions",
+        min=1,
+        help="Limit event-driven coordinator decisions (default 256).",
+    ),
+    max_rounds: int | None = typer.Option(
+        None,
+        "--max-rounds",
+        min=1,
+        help="Deprecated: migrate each historical round to one pending-window of decisions.",
+    ),
     max_agents: int | None = typer.Option(None, "--max-agents", min=1),
     time_limit_minutes: int | None = typer.Option(
         None,
@@ -461,6 +688,7 @@ def run(
         overrides = _config_overrides(
             backend=backend,
             budget_usd=budget_usd,
+            max_coordinator_decisions=max_coordinator_decisions,
             max_rounds=max_rounds,
             max_agents=max_agents,
             time_limit_minutes=time_limit_minutes,
@@ -513,9 +741,14 @@ def run(
                     "enabled per stage" if config.web_search_enabled else "disabled globally"
                 ),
                 "initial research agents": config.research.minimum_initial_agents,
-                "maximum assignments per round": (config.research.maximum_assignments_per_round),
-                "research rounds": config.research.maximum_rounds,
+                "maximum pending assignments": (config.research.maximum_pending_assignments),
+                "coordinator decisions": (config.research.maximum_coordinator_decisions),
                 "concurrent agents": config.research.maximum_concurrent_agents,
+                "persistent knowledge graph": root / ".ascend" / "knowledge",
+                "graph context limit": (
+                    f"{config.graph.maximum_context_nodes} nodes / "
+                    f"{config.graph.maximum_context_characters} characters"
+                ),
                 "total active time limit": _time_limit_display(config),
                 "usage limit": (
                     (
@@ -559,6 +792,7 @@ def run(
                         "config": str(config_path) if config_path else None,
                         "backend": config.backend.provider,
                         "budget_usd": budget_usd,
+                        "max_coordinator_decisions": max_coordinator_decisions,
                         "max_rounds": max_rounds,
                         "max_agents": max_agents,
                         "time_limit_minutes": time_limit_minutes,
@@ -639,6 +873,36 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
             f"live web search {search_setting}; "
             f"automatic fallback {backend.get('automatic_fallback', False)}"
         )
+        configuration = state.metadata.get("configuration_summary", {})
+        if isinstance(configuration, dict):
+            console.print(
+                "Research roles: "
+                f"coordinator {configuration.get('research_coordinator_model', 'unobserved')} "
+                f"at {configuration.get('research_coordinator_effort', 'unobserved')}; "
+                f"workers {configuration.get('research_worker_model', 'unobserved')} "
+                f"at {configuration.get('research_worker_effort', 'unobserved')}"
+            )
+        scheduler_path = state.run_root / "research" / "coordinator" / "state.json"
+        if scheduler_path.is_file():
+            scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+            assignments = scheduler.get("assignments", [])
+            if not isinstance(assignments, list):
+                raise ConfigError("research coordinator assignment state is invalid")
+            counts = {
+                status: sum(
+                    isinstance(item, dict) and item.get("status") == status for item in assignments
+                )
+                for status in ("queued", "running", "completed")
+            }
+            console.print(
+                "Research coordinator: "
+                f"phase {scheduler.get('phase', 'unknown')}; "
+                f"decisions {len(scheduler.get('decisions', []))}; "
+                "mailbox acknowledged through event "
+                f"{scheduler.get('coordinator_ack_event_sequence', 0)}; "
+                f"queued {counts['queued']}; active {counts['running']}; "
+                f"completed {counts['completed']}"
+            )
         lean_consent = state.metadata.get("lean_consent")
         if isinstance(lean_consent, dict):
             console.print(
@@ -707,7 +971,12 @@ def resume(
         help="Explicitly migrate the remaining run to codex or api; provenance will differ.",
     ),
     budget_usd: float | None = typer.Option(None, "--budget-usd", min=0.0),
-    max_rounds: int | None = typer.Option(None, "--max-rounds", min=1),
+    max_coordinator_decisions: int | None = typer.Option(
+        None, "--max-coordinator-decisions", min=1
+    ),
+    max_rounds: int | None = typer.Option(
+        None, "--max-rounds", min=1, help="Deprecated compatibility option."
+    ),
     max_agents: int | None = typer.Option(None, "--max-agents", min=1),
     time_limit_minutes: int | None = typer.Option(
         None,
@@ -733,6 +1002,21 @@ def resume(
             project_root=root,
             env={},
         )
+        state = StateStore(run_root).load()
+        pending_migration = state.metadata.get("pending_backend_migration")
+        if pending_migration is not None:
+            if not isinstance(pending_migration, dict) or not isinstance(
+                pending_migration.get("target_config_toml"), str
+            ):
+                raise ConfigError("pending backend migration checkpoint is invalid")
+            try:
+                pending_mapping = tomllib.loads(pending_migration["target_config_toml"])
+                pending_mapping["project_root"] = root
+                frozen = AppConfig.model_validate(pending_mapping)
+            except Exception as exc:
+                raise ConfigError(
+                    "pending backend migration target configuration is invalid"
+                ) from exc
         _show_migration_notice(frozen)
         if budget_usd is not None and budget_usd < frozen.limits.maximum_cost_usd:
             raise ConfigError(
@@ -742,6 +1026,7 @@ def resume(
         overrides = _config_overrides(
             backend=backend,
             budget_usd=budget_usd,
+            max_coordinator_decisions=max_coordinator_decisions,
             max_rounds=max_rounds,
             max_agents=max_agents,
             time_limit_minutes=time_limit_minutes,
@@ -749,7 +1034,6 @@ def resume(
             verbose=verbose,
         )
         config = merge_config(frozen, overrides)
-        state = StateStore(run_root).load()
         if config.backend.provider != frozen.backend.provider:
             if force_stage is None and first_incomplete_stage(state) is None:
                 raise ConfigError(

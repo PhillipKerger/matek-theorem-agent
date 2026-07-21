@@ -824,6 +824,7 @@ async def run_lean_pipeline(
     research_result: ResearchResult,
     manuscript_result: ManuscriptResult,
     claim_contract: dict[str, Any],
+    knowledge_graph_context: dict[str, object] | None = None,
     lean_dir: Path,
     lean_project_root: Path,
     workflow_settings: LeanWorkflowSettings | None = None,
@@ -898,11 +899,12 @@ async def run_lean_pipeline(
         response_ids.append(result.response_id)
         return result.parsed
 
-    common_input = {
+    common_input: dict[str, Any] = {
         "frozen_claim_contract": claim_contract,
         "frozen_proof_package": research_result.candidate.model_dump(mode="json"),
         "verified_manuscript": manuscript_result.draft.paper_tex,
         "lean_project_root": str(lean_project_root.resolve()),
+        "knowledge_graph_context": knowledge_graph_context,
     }
     feasibility_model = await model_call(
         prompt_text["feasibility"], common_input, LeanFeasibilityAssessment

@@ -1451,7 +1451,16 @@ class CodexCliModelClient:
         effort = policy.reasoning_effort or request.settings.reasoning_effort
         if effort not in _REASONING_EFFORTS:
             raise ValueError(f"unsupported Codex reasoning effort: {effort}")
-        model = policy.model or self._model
+        configured_model = policy.model or self._model
+        requested_model = request.settings.model
+        if configured_model is not None and configured_model != requested_model:
+            raise ValueError(
+                "Codex execution model does not match the durable request identity: "
+                f"configured={configured_model!r}, request={requested_model!r}"
+            )
+        # Always pass the request's explicit model. Inheriting a mutable CLI default
+        # would make an on-disk cache key insufficient to identify the actual call.
+        model = requested_model
         paths: list[Path] = []
         for path in policy.allowed_write_paths:
             resolved = path.expanduser().resolve(strict=True)

@@ -258,11 +258,20 @@ def _run_root(tmp_path: Path) -> Path:
     return run_root
 
 
-def _request(*, web_search: bool = True, effort: str = "xhigh") -> ModelRequest:
+def _request(
+    *,
+    web_search: bool = True,
+    effort: str = "xhigh",
+    model: str = "gpt-5.6-sol",
+) -> ModelRequest:
     return ModelRequest(
         instructions="Return the answer.",
         input_text="The answer is 42.",
-        settings=ModelSettings(web_search=web_search, reasoning_effort=effort),  # type: ignore[arg-type]
+        settings=ModelSettings(
+            model=model,
+            web_search=web_search,
+            reasoning_effort=effort,  # type: ignore[arg-type]
+        ),
     )
 
 
@@ -357,7 +366,8 @@ async def test_structured_client_builds_safe_current_cli_argv_and_manifest(
     assert ("--sandbox", "read-only") in tuple(zip(command.argv, command.argv[1:], strict=False))
     config_index = command.argv.index("--config")
     assert command.argv[config_index + 1] == 'model_reasoning_effort="xhigh"'
-    assert "--model" not in command.argv
+    model_index = command.argv.index("--model")
+    assert command.argv[model_index + 1] == "gpt-5.6-sol"
     schema_path = Path(command.argv[command.argv.index("--output-schema") + 1])
     output_path = Path(command.argv[command.argv.index("--output-last-message") + 1])
     assert schema_path.is_relative_to(run_root)
@@ -425,7 +435,7 @@ async def test_optional_model_search_and_stage_reasoning_policy(tmp_path: Path) 
         extra_args=("--color", "never"),
     ).for_stage("manuscript", run_root=run_root)
 
-    await client.generate_structured(_request(web_search=False), Answer)
+    await client.generate_structured(_request(web_search=False, model="gpt-5.6"), Answer)
 
     argv = backend.exec_requests[0].argv
     assert "--search" not in argv
@@ -434,6 +444,21 @@ async def test_optional_model_search_and_stage_reasoning_policy(tmp_path: Path) 
     config_index = argv.index("--config")
     assert argv[config_index + 1] == 'model_reasoning_effort="high"'
     assert argv[-3:] == ("--color", "never", "-")
+
+
+@pytest.mark.asyncio
+async def test_configured_model_must_match_durable_request_identity(tmp_path: Path) -> None:
+    backend = FakeCodexBackend()
+    client = CodexCliModelClient(
+        tmp_path,
+        backend=backend,
+        model="gpt-5.6-terra",
+    ).for_stage("research", run_root=_run_root(tmp_path))
+
+    with pytest.raises(ValueError, match="durable request identity"):
+        await client.generate_structured(_request(model="gpt-5.6-sol"), Answer)
+
+    assert backend.exec_requests == []
 
 
 def test_extra_args_reject_backend_or_sandbox_overrides(tmp_path: Path) -> None:

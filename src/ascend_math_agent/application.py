@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tomllib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from .codex_client import CodexClient
 from .config import AppConfig, ModelSettings, config_as_toml, load_config, merge_config
 from .execution.base import ExecutionBackend
 from .intake import ingest_problem
+from .knowledge_graph import GraphValidationError, KnowledgeGraph
 from .logging import RunLogger, load_usage_journal_strict
 from .models import RunState, ScientificStatus, StageName, StageStatus
 from .openai_client import ModelClient, ModelRequest
@@ -228,6 +230,130 @@ class WorkflowRunner:
         self.config = config
         self.dependencies = dependencies
 
+    def _knowledge_graph(self, project_root: Path) -> KnowledgeGraph:
+        return KnowledgeGraph(
+            project_root,
+            maximum_context_nodes=self.config.graph.maximum_context_nodes,
+            maximum_context_characters=self.config.graph.maximum_context_characters,
+        )
+
+    @staticmethod
+    def _graph_problem_id(state: RunState) -> str:
+        raw = state.metadata.get("knowledge_graph")
+        if not isinstance(raw, dict) or not isinstance(raw.get("problem_id"), str):
+            raise StateCorruptionError("run has no persistent knowledge-graph problem identity")
+        return str(raw["problem_id"])
+
+    def _ensure_graph(
+        self,
+        state: RunState,
+        *,
+        source_path: Path | None = None,
+        problem_text: str | None = None,
+    ) -> KnowledgeGraph:
+        """Initialize/reconcile the persistent graph and reject conflicting edits."""
+
+        graph = self._knowledge_graph(state.project_root)
+        graph_metadata = state.metadata.get("knowledge_graph")
+        if not isinstance(graph_metadata, dict) or not isinstance(
+            graph_metadata.get("problem_id"), str
+        ):
+            if source_path is None:
+                invocation_path = state.run_root / "input" / "invocation.json"
+                try:
+                    invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+                    candidate = Path(str(invocation["problem_file"]))
+                    source_path = candidate if candidate.is_file() else None
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    source_path = None
+            source_path = source_path or (state.run_root / "input" / "problem.md")
+            problem_text = problem_text or (state.run_root / "input" / "problem.md").read_text(
+                encoding="utf-8"
+            )
+            problem_id, revision = graph.initialize_problem(
+                source_path=source_path,
+                problem_text=problem_text,
+                run_id=state.run_id,
+            )
+        else:
+            if not graph.initialized:
+                raise GraphValidationError(
+                    "run metadata references a knowledge graph that is not initialized"
+                )
+            graph.reconcile_human_edits(run_id=state.run_id)
+            problem_id = str(graph_metadata["problem_id"])
+            revision = graph.load_state().revision
+        validation = graph.validate()
+        if not validation.valid:
+            errors = [issue.message for issue in validation.issues if issue.severity == "error"]
+            raise GraphValidationError("knowledge graph validation failed: " + "; ".join(errors))
+        state.metadata["knowledge_graph"] = {
+            "problem_id": problem_id,
+            "revision": revision,
+            "vault": ".ascend/knowledge",
+            "index": ".ascend/graph-index.sqlite",
+            "validation_warnings": [
+                issue.message for issue in validation.issues if issue.severity == "warning"
+            ],
+        }
+        return graph
+
+    def _refresh_graph_metadata(self, state: RunState, graph: KnowledgeGraph) -> None:
+        raw = state.metadata.get("knowledge_graph")
+        if not isinstance(raw, dict):
+            raise StateCorruptionError("knowledge_graph metadata must be an object")
+        raw["revision"] = graph.load_state().revision
+        raw["status"] = graph.status().model_dump(mode="json")
+
+    def _record_lean_graph_result(
+        self,
+        state: RunState,
+        result: LeanPipelineResult,
+    ) -> None:
+        toolchain_path = state.project_root / "lean-toolchain"
+        lean_toolchain = (
+            toolchain_path.read_text(encoding="utf-8").strip()
+            if toolchain_path.is_file()
+            else "unknown"
+        )
+        mathlib_revision = "unknown"
+        manifest_path = state.project_root / "lake-manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                packages = manifest.get("packages", []) if isinstance(manifest, dict) else []
+                for package in packages if isinstance(packages, list) else []:
+                    if isinstance(package, dict) and package.get("name") == "mathlib":
+                        revision = package.get("rev") or package.get("revision")
+                        if isinstance(revision, str) and revision.strip():
+                            mathlib_revision = revision.strip()
+                        break
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+        source_path = next(
+            (
+                path
+                for path in (
+                    state.run_root / "lean" / "Main.lean",
+                    state.run_root / "lean" / "challenge.lean",
+                )
+                if path.is_file()
+            ),
+            None,
+        )
+        axiom_path = state.run_root / "lean" / "axioms.txt"
+        graph = self._knowledge_graph(state.project_root)
+        graph.record_lean_result(
+            problem_id=self._graph_problem_id(state),
+            run_id=state.run_id,
+            lean_result=result.model_dump(mode="json"),
+            lean_toolchain=lean_toolchain or "unknown",
+            mathlib_revision=mathlib_revision,
+            source_file_hash=sha256_file(source_path) if source_path is not None else None,
+            axiom_report_hash=sha256_file(axiom_path) if axiom_path.is_file() else None,
+        )
+        self._refresh_graph_metadata(state, graph)
+
     def _source_verifier(self, run_root: Path) -> IdentifierVerifier:
         if not self.config.web_search_enabled:
             return WebDisabledSourceVerifier()
@@ -372,7 +498,9 @@ class WorkflowRunner:
 
         base = {
             "prompt": self.config.models.prompt_compiler,
-            "research": self.config.models.research,
+            "research": self.config.models.research_worker,
+            "research_coordinator": self.config.models.research_coordinator,
+            "research_worker": self.config.models.research_worker,
             "audit": self.config.models.audit,
             "manuscript": self.config.models.manuscript,
         }.get(category)
@@ -381,12 +509,22 @@ class WorkflowRunner:
         if self.config.backend.provider == "api":
             return base
         effort = {
-            "prompt": self.config.codex.research_effort,
-            "research": self.config.codex.research_effort,
+            "prompt": self.config.codex.research_worker_effort,
+            "research": self.config.codex.research_worker_effort,
+            "research_coordinator": self.config.codex.research_coordinator_effort,
+            "research_worker": self.config.codex.research_worker_effort,
             "audit": self.config.codex.audit_effort,
             "manuscript": self.config.codex.manuscript_effort,
         }[category]
-        return base.model_copy(update={"reasoning_effort": effort})
+        return base.model_copy(
+            update={
+                # Codex execution is configured by [codex].model rather than the
+                # API-role tables. Carry that exact value into the durable request
+                # key so a cache hit can never stand in for another executed model.
+                "model": self.config.codex.model,
+                "reasoning_effort": effort,
+            }
+        )
 
     async def run_new(
         self,
@@ -417,6 +555,12 @@ class WorkflowRunner:
                     ),
                 }
             )
+            graph = self._ensure_graph(
+                intake.state,
+                source_path=problem_file,
+                problem_text=intake.problem_text,
+            )
+            self._refresh_graph_metadata(intake.state, graph)
             self._sync_backend_metadata(intake.state)
             StateStore(intake.run_root).save(intake.state)
             return await self._execute(intake.state, selected)
@@ -446,6 +590,7 @@ class WorkflowRunner:
     ) -> WorkflowResult:
         store = StateStore(run_root)
         state = store.load()
+        self._recover_research_archive(state, store)
         if state.stages[StageName.REPORT].status is StageStatus.SUCCEEDED:
             assert_report_certificate_inventory(run_root)
         if force_stage is not None:
@@ -467,6 +612,37 @@ class WorkflowRunner:
                 StageName.LEAN_VERIFICATION: StageName.LEAN_FEASIBILITY,
             }.get(force_stage, force_stage)
             invalidate_from(state, composite_boundary, "explicit --force-stage request")
+            if force_stage is StageName.PROMPT_COMPILATION:
+                # Preserve the expensive successful compiler/source calls. Only the bounded
+                # post-compilation repair gets a fresh identity for this explicit recovery.
+                state.metadata["prompt_validation_generation"] = (
+                    _prompt_validation_generation(state) + 1
+                )
+            else:
+                state.metadata["model_cache_generation"] = _model_cache_generation(state) + 1
+            if composite_boundary in {
+                StageName.PROMPT_COMPILATION,
+                StageName.RESEARCH,
+            }:
+                self._archive_research_generation(
+                    state,
+                    reason="explicit --force-stage request",
+                )
+                if force_stage is StageName.PROMPT_COMPILATION:
+                    raw_history = state.metadata.get("research_generation_history", [])
+                    if isinstance(raw_history, list) and raw_history:
+                        latest = raw_history[-1]
+                        if isinstance(latest, dict) and isinstance(latest.get("artifact"), str):
+                            replay_candidate = ensure_path_confined(
+                                state.run_root,
+                                state.run_root / latest["artifact"],
+                            )
+                            if (replay_candidate / "coordinator" / "state.json").is_file():
+                                state.metadata["research_graph_replay"] = latest["artifact"]
+                            else:
+                                state.metadata.pop("research_graph_replay", None)
+                else:
+                    state.metadata.pop("research_graph_replay", None)
             if force_stage in {
                 StageName.MANUSCRIPT,
                 StageName.BIBLIOGRAPHY,
@@ -476,14 +652,6 @@ class WorkflowRunner:
                 StageName.LEAN_VERIFICATION,
             }:
                 self._archive_lean_consent(state, reason="explicit --force-stage request")
-            if force_stage is StageName.PROMPT_COMPILATION:
-                # Preserve the expensive successful compiler/source calls. Only the bounded
-                # post-compilation repair gets a fresh identity for this explicit recovery.
-                state.metadata["prompt_validation_generation"] = (
-                    _prompt_validation_generation(state) + 1
-                )
-            else:
-                state.metadata["model_cache_generation"] = _model_cache_generation(state) + 1
             assert_recorded_artifacts(state)
         else:
             assert_recorded_artifacts(state)
@@ -535,34 +703,124 @@ class WorkflowRunner:
             project_root=state.project_root,
             env={},
         )
-        previous_provider = snapshot_config.backend.provider
-        self.config = merge_config(snapshot_config, config_overrides)
+        raw_migration_intent = state.metadata.get("pending_backend_migration")
+        migration_intent: dict[str, Any] | None = None
+        if raw_migration_intent is not None:
+            if not isinstance(raw_migration_intent, dict):
+                raise StateCorruptionError("pending_backend_migration must be an object")
+            migration_intent = dict(raw_migration_intent)
+            intent_from = migration_intent.get("from")
+            intent_to = migration_intent.get("to")
+            target_config_toml = migration_intent.get("target_config_toml")
+            target_cache_generation = migration_intent.get("target_cache_generation")
+            changed_at = migration_intent.get("changed_at")
+            if (
+                intent_from not in {"codex", "api"}
+                or intent_to not in {"codex", "api"}
+                or intent_from == intent_to
+                or not isinstance(target_config_toml, str)
+                or not target_config_toml.strip()
+                or not isinstance(target_cache_generation, int)
+                or isinstance(target_cache_generation, bool)
+                or target_cache_generation < 1
+                or not isinstance(changed_at, str)
+                or not changed_at.strip()
+            ):
+                raise StateCorruptionError("pending backend migration intent is invalid")
+            try:
+                target_mapping = tomllib.loads(target_config_toml)
+                target_mapping["project_root"] = state.project_root
+                target_config = AppConfig.model_validate(target_mapping)
+            except Exception as exc:
+                raise StateCorruptionError(
+                    "pending backend migration target configuration is invalid"
+                ) from exc
+            if target_config.backend.provider != intent_to:
+                raise StateCorruptionError(
+                    "pending backend migration target provider is inconsistent"
+                )
+            self.config = merge_config(target_config, config_overrides)
+            if self.config.backend.provider != intent_to:
+                raise WorkflowError(
+                    "cannot replace an unfinished backend migration with another provider"
+                )
+            migration_intent["target_config_toml"] = config_as_toml(self.config)
+            state.metadata["pending_backend_migration"] = migration_intent
+            previous_provider = str(intent_from)
+        else:
+            previous_provider = snapshot_config.backend.provider
+            self.config = merge_config(snapshot_config, config_overrides)
         selected_provider = self.config.backend.provider
-        if selected_provider != previous_provider:
+        if migration_intent is None and selected_provider != previous_provider:
+            migration_intent = {
+                "from": previous_provider,
+                "to": selected_provider,
+                "changed_at": datetime.now(UTC).isoformat(),
+                "target_cache_generation": _model_cache_generation(state) + 1,
+                "target_config_toml": config_as_toml(self.config),
+            }
+            state.metadata["pending_backend_migration"] = migration_intent
+            # Persist the exact migration target before any state or artifact changes.
+            store.save(state)
+        migration_in_progress = migration_intent is not None
+        if migration_in_progress:
+            assert migration_intent is not None
             history = state.metadata.setdefault("backend_history", [])
             if not isinstance(history, list):
                 raise StateCorruptionError("backend_history must be a list")
-            history.append(
-                {
-                    "from": previous_provider,
-                    "to": selected_provider,
-                    "changed_at": datetime.now(UTC).isoformat(),
-                    "reason": "explicit resume backend migration",
-                    "provenance_warning": (
-                        "Model behavior and provider provenance differ after this checkpoint."
+            changed_at = str(migration_intent["changed_at"])
+            if not any(
+                isinstance(item, dict)
+                and item.get("from") == previous_provider
+                and item.get("to") == selected_provider
+                and item.get("changed_at") == changed_at
+                for item in history
+            ):
+                history.append(
+                    {
+                        "from": previous_provider,
+                        "to": selected_provider,
+                        "changed_at": changed_at,
+                        "reason": "explicit resume backend migration",
+                        "provenance_warning": (
+                            "Model behavior and provider provenance differ after this checkpoint."
+                        ),
+                        "usage_at_switch": (
+                            dict(state.metadata["usage"])
+                            if isinstance(state.metadata.get("usage"), dict)
+                            else {}
+                        ),
+                    }
+                )
+            target_cache_generation = int(migration_intent["target_cache_generation"])
+            current_cache_generation = _model_cache_generation(state)
+            if current_cache_generation > target_cache_generation:
+                raise StateCorruptionError(
+                    "backend migration cache generation moved beyond its durable intent"
+                )
+            state.metadata["model_cache_generation"] = target_cache_generation
+            research_record = state.stages[StageName.RESEARCH]
+            if research_record.status not in {StageStatus.SUCCEEDED, StageStatus.SKIPPED}:
+                if not (
+                    research_record.status is StageStatus.PENDING
+                    and research_record.invalidated_reason
+                    == "explicit backend migration requires a fresh research scheduler"
+                ):
+                    invalidate_from(
+                        state,
+                        StageName.RESEARCH,
+                        "explicit backend migration requires a fresh research scheduler",
+                    )
+                self._archive_research_generation(
+                    state,
+                    reason=(
+                        "explicit backend migration changed provider-scoped request identities"
                     ),
-                    "usage_at_switch": (
-                        dict(state.metadata["usage"])
-                        if isinstance(state.metadata.get("usage"), dict)
-                        else {}
-                    ),
-                }
-            )
-            state.metadata["model_cache_generation"] = _model_cache_generation(state) + 1
+                )
         backend_metadata = state.metadata.get("backend", {})
         if not isinstance(backend_metadata, dict):
             raise StateCorruptionError("backend metadata must be an object")
-        if selected_provider != previous_provider:
+        if migration_in_progress:
             # Provider-specific observations from the old adapter (authentication,
             # model, version, and billing class) must never be presented as facts about
             # the explicitly selected replacement provider.
@@ -570,7 +828,7 @@ class WorkflowRunner:
                 "authentication_class": "unverified",
                 "backend_version": None,
                 "model_requested": (
-                    self.config.codex.model or None
+                    self.config.codex.model
                     if selected_provider == "codex"
                     else {
                         "prompt_compiler": self.config.models.prompt_compiler.model,
@@ -627,6 +885,9 @@ class WorkflowRunner:
         # programmatic resume that loaded the frozen provider (or explicitly migrated
         # it) but accidentally retained a client for the other billing boundary.
         self._sync_backend_metadata(state)
+        # Keep the write-ahead intent until both provider-facing configuration
+        # artifacts match the fully migrated state.
+        store.save(state)
         effective_config_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(
             effective_config_path,
@@ -638,6 +899,7 @@ class WorkflowRunner:
             backend_metadata,
             confinement_root=run_root,
         )
+        state.metadata.pop("pending_backend_migration", None)
         store.save(state)
         options = WorkflowOptions(
             framework_path=(
@@ -661,6 +923,9 @@ class WorkflowRunner:
             # A completed resume is a true no-op. In particular, do not append to the
             # logs after their hashes have been captured in the final report.
             return WorkflowResult(state=state, report=load_final_report(run_root))
+        graph = self._ensure_graph(state)
+        self._refresh_graph_metadata(state, graph)
+        store.save(state)
         logger = RunLogger(
             run_root,
             run_id=state.run_id,
@@ -1117,6 +1382,73 @@ class WorkflowRunner:
         state.metadata["lean_consent_history"] = history
         state.metadata.pop("lean_consent", None)
 
+    @staticmethod
+    def _archive_research_generation(state: RunState, *, reason: str) -> None:
+        """Move invalidated research through a state-first recoverable transaction."""
+
+        store = StateStore(state.run_root)
+        WorkflowRunner._recover_research_archive(state, store)
+        research_path = ensure_path_confined(state.run_root, state.run_root / "research")
+        if not research_path.is_dir():
+            return
+        history_root = ensure_path_confined(state.run_root, state.run_root / "research-history")
+        history_root.mkdir(parents=True, exist_ok=True)
+        suffix = 0
+        while True:
+            name = f"checkpoint-{state.checkpoint_generation:04d}"
+            if suffix:
+                name += f"-{suffix}"
+            target = ensure_path_confined(state.run_root, history_root / name)
+            if not target.exists():
+                break
+            suffix += 1
+        state.metadata["pending_research_archive"] = {
+            "source": research_path.relative_to(state.run_root).as_posix(),
+            "target": target.relative_to(state.run_root).as_posix(),
+            "reason": reason,
+        }
+        # Persist invalidation, cache-generation changes, and exact move targets before
+        # touching the directory tree. Resume can finish either side of Path.replace.
+        store.save(state)
+        WorkflowRunner._recover_research_archive(state, store)
+
+    @staticmethod
+    def _recover_research_archive(state: RunState, store: StateStore) -> None:
+        raw_intent = state.metadata.get("pending_research_archive")
+        if raw_intent is None:
+            return
+        if not isinstance(raw_intent, dict):
+            raise StateCorruptionError("pending_research_archive must be an object")
+        source_relative = raw_intent.get("source")
+        target_relative = raw_intent.get("target")
+        reason = raw_intent.get("reason")
+        if (
+            source_relative != "research"
+            or not isinstance(target_relative, str)
+            or not target_relative.startswith("research-history/checkpoint-")
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise StateCorruptionError("pending research archive intent is invalid")
+        source = ensure_path_confined(state.run_root, state.run_root / source_relative)
+        target = ensure_path_confined(state.run_root, state.run_root / target_relative)
+        if source.is_dir() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
+        elif target.is_dir() and not source.exists():
+            pass
+        else:
+            raise StateCorruptionError("pending research archive has ambiguous source/target state")
+        raw_history = state.metadata.get("research_generation_history", [])
+        history = list(raw_history) if isinstance(raw_history, list) else []
+        if not any(
+            isinstance(item, dict) and item.get("artifact") == target_relative for item in history
+        ):
+            history.append({"artifact": target_relative, "reason": reason})
+        state.metadata["research_generation_history"] = history
+        state.metadata.pop("pending_research_archive", None)
+        store.save(state)
+
     async def _confirm_lean_after_manuscript(
         self,
         state: RunState,
@@ -1186,7 +1518,16 @@ class WorkflowRunner:
     ) -> CompiledProblem:
         result_path = state.run_root / "prompts" / "compiled_problem.json"
         if not self._begin(state, store, logger, StageName.PROMPT_COMPILATION):
-            return CompiledProblem.model_validate_json(result_path.read_text(encoding="utf-8"))
+            compiled = CompiledProblem.model_validate_json(result_path.read_text(encoding="utf-8"))
+            graph = self._knowledge_graph(state.project_root)
+            graph.record_compiled_problem(
+                problem_id=self._graph_problem_id(state),
+                run_id=state.run_id,
+                compiled_problem=compiled.model_dump(mode="json"),
+            )
+            self._refresh_graph_metadata(state, graph)
+            store.save(state)
+            return compiled
         self.dependencies.progress(
             Ascension.FORMULATE_PROMPT,
             "Formulating technical research prompt.",
@@ -1282,6 +1623,13 @@ class WorkflowRunner:
         else:
             state.scientific_status = ScientificStatus.PROMPT_COMPILED
             state.metadata["research_status"] = ScientificStatus.PROMPT_COMPILED.value
+        graph = self._knowledge_graph(state.project_root)
+        graph.record_compiled_problem(
+            problem_id=self._graph_problem_id(state),
+            run_id=state.run_id,
+            compiled_problem=result.compiled_problem.model_dump(mode="json"),
+        )
+        self._refresh_graph_metadata(state, graph)
         self._checkpoint(
             state,
             store,
@@ -1305,6 +1653,13 @@ class WorkflowRunner:
         result_path = state.run_root / "research" / "result.json"
         if not self._begin(state, store, logger, StageName.RESEARCH):
             result = ResearchResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+            graph = self._knowledge_graph(state.project_root)
+            graph.record_research_result(
+                problem_id=self._graph_problem_id(state),
+                run_id=state.run_id,
+                research_result=result.model_dump(mode="json"),
+            )
+            self._refresh_graph_metadata(state, graph)
             self._finalize_research_audit(state, store, logger, result)
             return result
         names = (
@@ -1317,6 +1672,13 @@ class WorkflowRunner:
             "prompts/audit_hostile.md",
             "prompts/audit_sources.md",
             "prompts/audit_complexity.md",
+        )
+        remaining_global_calls = budget.remaining().calls
+        raw_graph_replay = state.metadata.get("research_graph_replay")
+        graph_replay_dir = (
+            ensure_path_confined(state.run_root, state.run_root / raw_graph_replay)
+            if isinstance(raw_graph_replay, str)
+            else None
         )
         try:
             with resource_paths(*names) as paths:
@@ -1340,21 +1702,22 @@ class WorkflowRunner:
                                 self.config.api.max_parallel_agents,
                             )
                         ),
-                        maximum_assignments_per_round=(
-                            self.config.research.maximum_assignments_per_round
+                        maximum_pending_assignments=(
+                            self.config.research.maximum_pending_assignments
                         ),
-                        maximum_rounds=(
+                        maximum_coordinator_decisions=(
                             min(
-                                self.config.research.maximum_rounds,
-                                self.config.codex.limits.max_research_rounds,
+                                self.config.research.maximum_coordinator_decisions,
+                                self.config.codex.limits.max_research_coordinator_decisions,
                             )
                             if self.config.backend.provider == "codex"
-                            else self.config.research.maximum_rounds
+                            else self.config.research.maximum_coordinator_decisions
                         ),
                     ),
-                    coordinator_settings=self._model_settings("research"),
-                    worker_settings=self._model_settings("research"),
+                    coordinator_settings=self._model_settings("research_coordinator"),
+                    worker_settings=self._model_settings("research_worker"),
                     audit_settings=self._model_settings("audit"),
+                    final_judge_settings=self._model_settings("research_coordinator"),
                     coordinator_prompt_path=paths[names[0]],
                     worker_prompt_path=paths[names[1]],
                     candidate_prompt_path=paths[names[2]],
@@ -1367,6 +1730,11 @@ class WorkflowRunner:
                         "complexity": paths[names[8]],
                     },
                     source_verifier=self._source_verifier(state.run_root),
+                    remaining_run_model_calls=remaining_global_calls,
+                    knowledge_graph=self._knowledge_graph(state.project_root),
+                    graph_problem_id=self._graph_problem_id(state),
+                    run_id=state.run_id,
+                    graph_replay_dir=graph_replay_dir,
                     progress=self.dependencies.progress,
                 )
         except Exception as exc:
@@ -1379,6 +1747,14 @@ class WorkflowRunner:
             ResearchOutcome.PARTIAL: ScientificStatus.RESEARCH_PARTIAL,
             ResearchOutcome.BUDGET_EXHAUSTED: ScientificStatus.RESEARCH_PARTIAL,
         }[result.outcome]
+        graph = self._knowledge_graph(state.project_root)
+        graph.record_research_result(
+            problem_id=self._graph_problem_id(state),
+            run_id=state.run_id,
+            research_result=result.model_dump(mode="json"),
+        )
+        self._refresh_graph_metadata(state, graph)
+        state.metadata.pop("research_graph_replay", None)
         state.scientific_status = status
         configuration_summary = state.metadata.get("configuration_summary", {})
         if not isinstance(configuration_summary, dict):
@@ -1443,12 +1819,23 @@ class WorkflowRunner:
     ) -> ManuscriptResult:
         result_path = state.run_root / "manuscript" / "result.json"
         if not self._begin(state, store, logger, StageName.MANUSCRIPT):
-            return ManuscriptResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+            result = ManuscriptResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+            graph = self._knowledge_graph(state.project_root)
+            graph.record_manuscript_result(
+                problem_id=self._graph_problem_id(state),
+                run_id=state.run_id,
+                manuscript_result=result.model_dump(mode="json"),
+            )
+            self._refresh_graph_metadata(state, graph)
+            store.save(state)
+            return result
         self.dependencies.progress(
             Ascension.WRITE_MANUSCRIPT,
             "Writing manuscript and verifying bibliography.",
         )
         resume_bibliography = bool(state.metadata.get("resume_bibliography_correction", False))
+        graph = self._knowledge_graph(state.project_root)
+        manuscript_graph_context = graph.manuscript_context(self._graph_problem_id(state))
         try:
             with resource_paths(
                 "prompts/manuscript_writer.md", "prompts/bibliography_verifier.md"
@@ -1466,6 +1853,7 @@ class WorkflowRunner:
                         source_ledger=[
                             entry.model_dump(mode="json") for entry in compiled.source_ledger
                         ],
+                        knowledge_graph_context=manuscript_graph_context,
                         manuscript_dir=state.run_root / "manuscript",
                         maximum_additional_correction_cycles=max(
                             1, self.config.manuscript.maximum_revision_rounds
@@ -1486,6 +1874,7 @@ class WorkflowRunner:
                         source_ledger=[
                             entry.model_dump(mode="json") for entry in compiled.source_ledger
                         ],
+                        knowledge_graph_context=manuscript_graph_context,
                         manuscript_dir=state.run_root / "manuscript",
                         maximum_correction_cycles=self.config.manuscript.maximum_revision_rounds,
                         writer_settings=self._model_settings("manuscript"),
@@ -1500,6 +1889,12 @@ class WorkflowRunner:
             raise
 
         paid_stage = StageName.BIBLIOGRAPHY if resume_bibliography else StageName.MANUSCRIPT
+        graph.record_manuscript_result(
+            problem_id=self._graph_problem_id(state),
+            run_id=state.run_id,
+            manuscript_result=result.model_dump(mode="json"),
+        )
+        self._refresh_graph_metadata(state, graph)
         for response_id in result.calls.response_ids:
             record_paid_call(state, paid_stage, response_id)
         for path in result.artifacts.paths.values():
@@ -1545,6 +1940,7 @@ class WorkflowRunner:
         result_path = state.run_root / "lean" / "result.json"
         if not self._begin(state, store, logger, StageName.LEAN_FEASIBILITY):
             result = LeanPipelineResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+            self._record_lean_graph_result(state, result)
             self._apply_lean_result(state, store, logger, result, budget)
             return
         self.dependencies.progress(
@@ -1588,6 +1984,9 @@ class WorkflowRunner:
                     ),
                     manuscript_result=manuscript,
                     claim_contract=compiled.claim_contract.as_dict(),
+                    knowledge_graph_context=self._knowledge_graph(
+                        state.project_root
+                    ).formalization_context(self._graph_problem_id(state)),
                     lean_dir=state.run_root / "lean",
                     lean_project_root=state.project_root,
                     workflow_settings=LeanWorkflowSettings(
@@ -1614,6 +2013,7 @@ class WorkflowRunner:
         for response_id in result.calls.response_ids:
             record_paid_call(state, StageName.LEAN_FEASIBILITY, response_id)
         succeed_stage(state, StageName.LEAN_FEASIBILITY)
+        self._record_lean_graph_result(state, result)
         self._apply_lean_result(state, store, logger, result, budget)
         budget.ensure_available()
 
@@ -1718,6 +2118,25 @@ class WorkflowRunner:
         existing = state.stages[StageName.REPORT]
         if existing.status is StageStatus.SUCCEEDED:
             return load_final_report(state.run_root)
+        graph = self._knowledge_graph(state.project_root)
+        raw_obligations = state.metadata.get("unresolved_obligations", [])
+        graph.record_run_status(
+            problem_id=self._graph_problem_id(state),
+            run_id=state.run_id,
+            scientific_status=state.scientific_status.value,
+            strongest_result=str(
+                state.metadata.get("strongest_result", "No complete result was established.")
+            ),
+            unresolved_obligations=(
+                [str(item) for item in raw_obligations] if isinstance(raw_obligations, list) else []
+            ),
+            complete=not any(
+                record.status in {StageStatus.PENDING, StageStatus.RUNNING}
+                for stage, record in state.stages.items()
+                if stage is not StageName.REPORT
+            ),
+        )
+        self._refresh_graph_metadata(state, graph)
         self.dependencies.progress(Ascension.PREPARE_REPORT, "Preparing final report.")
         self._begin(state, store, logger, StageName.REPORT)
         logger.event("report.generating", stage=StageName.REPORT)

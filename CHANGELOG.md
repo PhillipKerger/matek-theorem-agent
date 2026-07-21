@@ -2,20 +2,40 @@
 
 ## Unreleased
 
-- Made the dedicated research-orchestrator boundary explicit. Every coordinator round now
-  receives the full compiled prompt, claim contract, registry, visible reports, and a durable
-  continuity handoff classifying promising, partial, refuted, and blocked routes. Added distinct
-  recorded model roles and removed the cumulative logical-worker ceiling across rounds.
-- Fixed the bounded worker-window launcher so assignments after the first concurrent window are
-  not lost when that window finishes without a proof candidate.
-- Expanded the default research portfolio and capacity: sixteen initial assignments, up to 32
-  assignments in every adaptive round, and 32-agent research, backend, and web-enabled Codex
-  concurrency ceilings. The existing four-family diversity floor remains, and there is no
-  cumulative research-worker count cap. Global Codex call/thread ceilings are now optional and
-  unset by default so they do not silently undercut the 32-worker research configuration.
-- Research now audits the first worker claiming a complete proof immediately. Worker launch uses
-  a bounded active window, so routes that have not started consume no tokens when that proof
-  passes; failed early audits resume the remaining portfolio with their obligations preserved.
+- Added a persistent Obsidian-compatible typed knowledge graph under `.ascend/knowledge/` with
+  stable IDs, separate claims/proofs/audits/formalizations, typed relation constraints, portable
+  Markdown source, rebuildable SQLite indexing, snapshots, dashboards, and curated canvases.
+- Integrated graph frontier memory and graph-scoped tasks into the continuous coordinator.
+  Workers receive bounded context slices and return structured optimistic-concurrency patches;
+  the deterministic service performs conflict/duplicate/status/DAG checks and atomic idempotent
+  merges only after raw worker evidence is durable.
+- Added dependency and exact-statement invalidation, human-edit ownership rules, preservation of
+  distilled failed/partial routes, manuscript mappings, and exact-version Lean verification
+  records. Added `ascend graph` init/validate/status/frontier/rebuild/open/export/diff and focused
+  traversal commands; Obsidian remains optional.
+- Replaced fixed research rounds and wait-for-all batches with a durable, completion-driven
+  logical coordinator. Worker completions and failed audits become atomically written immutable
+  event files; the coordinator reacts and refills the live pool without waiting for unrelated
+  work.
+- Preserved every complete raw worker/audit report, assignment lifecycle, coordinator decision,
+  source-verification result, and sequenced research event as immutable evidence. The canonical
+  atomic coordinator checkpoint uses a pending-event write-ahead transaction; mailbox, assignment,
+  registry, and continuity files are materialized views that cannot compress away the evidence.
+- Kept a diverse sixteen-assignment bootstrap while allowing dynamic refill/expansion to 32
+  active workers within a default total-open ceiling of 32 queued-plus-running assignments. There
+  is no separate cumulative research-worker ceiling; global Codex call/thread limits remain
+  optional and unset by default.
+- Split research roles so the default GPT 5.6 Sol logical coordinator uses max effort while
+  independent GPT 5.6 Sol workers use xhigh. The API adapter additionally requests pro mode; Codex
+  CLI uses its own model/reasoning-effort controls. This application-level orchestration is the
+  reproducible analogue of an Ultra research session; `Ultra` is not encoded as an API primitive.
+- Replaced public fixed-round controls with `maximum_pending_assignments` and
+  `maximum_coordinator_decisions` (default 256). Legacy round settings and `--max-rounds` are
+  migrated to scaled decision budgets for compatibility and never restore a synchronization
+  barrier.
+- Candidate claims now pause new worker admission and enter the independent gate immediately.
+  In-flight reports remain durable; a failed gate feeds its complete reports and exact
+  obligations back to the coordinator as high-priority events and resumes/refills the pool.
 - Added `--time-limit-minutes` to `run` and `resume` (plus
   `ASCEND_TIME_LIMIT_MINUTES`) as one checkpointed active wall-clock allowance for the entire
   workflow; the remaining allowance now cancels overlong in-flight model calls. The option is
@@ -43,8 +63,9 @@
 ### Command-line progress
 
 - `ascend run` and active resumes now print sparse numbered `ASCENSION` milestones for intake,
-  prompt formulation, adaptive research rounds, candidate audits, manuscript generation, Lean,
-  and final reporting without streaming model reasoning or per-call noise.
+  prompt formulation, coordinator start/resume, live-pool management, candidate audits,
+  manuscript generation, Lean, and final reporting without streaming model reasoning or per-call
+  noise.
 
 ### Strict structured outputs
 

@@ -60,6 +60,13 @@
 - [x] Related-work requirement and independent bibliography verification are mandatory.
 - [x] False citations and unsupported theorem hypotheses block progression.
 - [x] LaTeX compile/citation gate implemented.
+- [x] Persistent typed Markdown graph extends the same problem across runs and keeps claims,
+  proofs, audits, sources, tasks, counterexamples, and formalizations separate.
+- [x] Coordinator frontier queries, bounded worker contexts, structured patches, atomic conflict
+  checks, partial-work retention, and dependency invalidation are covered by offline tests.
+- [x] Obsidian Home/dashboards/canvases are generated, while every graph command remains usable
+  without Obsidian.
+- [x] Human editing ownership and exact-statement/proof invalidation fail closed on conflicts.
 
 ## Lean
 
@@ -68,6 +75,8 @@
 - [x] `challenge.lean` alignment audit implemented.
 - [x] Codex noninteractive formalization adapter implemented.
 - [x] Deterministic build, placeholder, statement, and axiom checks implemented.
+- [x] Lean graph records bind exact claim version/hash, declaration, source hash, toolchain,
+  mathlib revision, build result, and axiom report.
 
 ## Security
 

@@ -27,6 +27,7 @@ from ascend_math_agent.codex_client import CodexRequest, CodexResult
 from ascend_math_agent.config import (
     AppConfig,
     BackendSettings,
+    CodexSettings,
     LeanSettings,
     Limits,
     ManuscriptSettings,
@@ -35,6 +36,7 @@ from ascend_math_agent.config import (
 )
 from ascend_math_agent.execution.base import CommandRequest, CommandResult
 from ascend_math_agent.intake import ingest_problem
+from ascend_math_agent.knowledge_graph import KnowledgeGraph, NodeType
 from ascend_math_agent.models import ScientificStatus, StageName, StageStatus
 from ascend_math_agent.openai_client import ModelRequest, ModelResult
 from ascend_math_agent.progress import Ascension
@@ -76,7 +78,7 @@ from ascend_math_agent.stages.research import (
     FinalJudgeDecision,
     FinalJudgeVerdict,
     ResearchAssignment,
-    ResearchRoundPlan,
+    ResearchCoordinatorDecision,
     ResearchWorkerReport,
     WorkerStatus,
 )
@@ -154,6 +156,7 @@ def fixture_candidate_package() -> CandidateProofPackage:
         exceptional_cases=[],
         parameter_bookkeeping=["n is arbitrary"],
         unresolved_items=[],
+        quantitative_or_algorithmic=False,
     )
 
 
@@ -179,23 +182,55 @@ class ResearchWorkflowModel:
                 source_ledger=[],
                 unresolved_ambiguities=[],
             )
-        elif output_type is ResearchRoundPlan:
-            output = ResearchRoundPlan(
-                round_id=1,
-                assignments=[
-                    ResearchAssignment(
-                        id=f"route-{index}",
-                        approach_family=family,
-                        task=f"Develop the {family} route.",
-                        expected_output="A complete proof or an exact obstruction.",
-                    )
-                    for index, family in enumerate(
-                        ("direct", "structural", "counterexample", "literature"),
-                        start=1,
-                    )
-                ],
-                rationale="Four materially different proof mechanisms.",
-                candidate_packaging_recommended=True,
+        elif output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            decision_id = int(payload["decision_id"])
+            completed_ids = [
+                report["assignment_id"] for report in payload["visible_worker_reports"]
+            ]
+            latest_verdict = payload.get("latest_final_judge_verdict")
+            definitively_refuted = (
+                not self.accepted
+                and isinstance(latest_verdict, dict)
+                and latest_verdict.get("verdict") == FinalJudgeDecision.REJECTED.value
+            )
+            output = ResearchCoordinatorDecision(
+                decision_id=decision_id,
+                after_event_sequence=int(payload["after_event_sequence"]),
+                assignments=(
+                    [
+                        ResearchAssignment(
+                            id=f"route-{index}",
+                            approach_family=family,
+                            task=f"Develop the {family} route.",
+                            expected_output="A complete proof or an exact obstruction.",
+                        )
+                        for index, family in enumerate(
+                            ("direct", "structural", "counterexample", "literature"),
+                            start=1,
+                        )
+                    ]
+                    if decision_id == 1
+                    else []
+                ),
+                rationale=(
+                    "Four materially different proof mechanisms."
+                    if decision_id == 1
+                    else "The independent judge definitively refuted the fixture candidate."
+                    if definitively_refuted
+                    else "Submit the completed route for an aggregate independent judgment."
+                ),
+                candidate_packaging_recommended=decision_id > 1 and not definitively_refuted,
+                candidate_report_ids=(
+                    completed_ids[:1] if decision_id > 1 and not definitively_refuted else []
+                ),
+                stop_recommended=definitively_refuted,
+                stop_reason=(
+                    "Independent final judgment refuted the only claimed fixture proof."
+                    if definitively_refuted
+                    else None
+                ),
+                stop_category="refuted" if definitively_refuted else "scientific",
             )
         elif output_type is ResearchWorkerReport:
             assignment = json.loads(request.input_text)["assignment"]
@@ -495,7 +530,7 @@ class AlwaysVerifiedIdentifierVerifier:
 
 
 class FullWorkflowModel(ResearchWorkflowModel):
-    """Drive the complete two-round acceptance scenario through every real stage."""
+    """Drive a completion-triggered follow-up through every real stage."""
 
     def __init__(self) -> None:
         super().__init__(accepted=True)
@@ -505,27 +540,48 @@ class FullWorkflowModel(ResearchWorkflowModel):
         request: ModelRequest,
         output_type: type[Any],
     ) -> ModelResult[Any]:
-        if output_type is ResearchRoundPlan:
+        if output_type is ResearchCoordinatorDecision:
             self.requests.append((request, output_type))
-            round_id = int(json.loads(request.input_text)["round_id"])
+            payload = json.loads(request.input_text)
+            decision_id = int(payload["decision_id"])
             families = (
                 ("direct", "structural", "counterexample", "literature")
-                if round_id == 1
+                if decision_id == 1
                 else ("synthesis",)
             )
-            parsed: BaseModel = ResearchRoundPlan(
-                round_id=round_id,
+            parsed: BaseModel = ResearchCoordinatorDecision(
+                decision_id=decision_id,
+                after_event_sequence=int(payload["after_event_sequence"]),
                 assignments=[
                     ResearchAssignment(
-                        id=f"round-{round_id}-route-{index}",
+                        id=f"decision-{decision_id}-route-{index}",
                         approach_family=family,
-                        task=f"Develop the {family} route in round {round_id}.",
+                        task=f"Develop the {family} route after decision {decision_id}.",
                         expected_output="A complete proof or an exact obstruction.",
                     )
                     for index, family in enumerate(families, start=1)
                 ],
-                rationale="The second round synthesizes the independent first-round routes.",
-                candidate_packaging_recommended=round_id == 2,
+                rationale="The follow-up synthesizes newly completed independent evidence.",
+            )
+        elif output_type is ResearchWorkerReport:
+            assignment = json.loads(request.input_text)["assignment"]
+            self.requests.append((request, output_type))
+            parsed = ResearchWorkerReport(
+                assignment_id=assignment["id"],
+                status=(
+                    WorkerStatus.CANDIDATE_COMPLETE
+                    if assignment["approach_family"] == "synthesis"
+                    else WorkerStatus.PROGRESS
+                ),
+                formal_results=[f"Lemma produced by {assignment['approach_family']} route."],
+                proof_content="A visible, checkable proof argument.",
+                exact_gap=(
+                    None
+                    if assignment["approach_family"] == "synthesis"
+                    else "Synthesize this lemma with the other independent routes."
+                ),
+                sources=[],
+                mechanism=assignment["task"],
             )
         elif output_type is ManuscriptDraft:
             self.requests.append((request, output_type))
@@ -999,7 +1055,7 @@ async def test_force_prompt_stage_reuses_compiler_and_retries_only_bounded_repai
 
 @pytest.mark.parametrize("provider", ["codex", "api"])
 @pytest.mark.asyncio
-async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
+async def test_complete_continuous_pipeline_is_lean_verified_and_resume_is_noop(
     tmp_path: Path,
     provider: Literal["codex", "api"],
 ) -> None:
@@ -1045,7 +1101,8 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
             encoding="utf-8"
         )
     )
-    assert len(research["rounds"]) == 1
+    assert research["rounds"] == []
+    assert len(research["coordinator_decisions"]) >= 2
     assert bibliography.status is BibliographyStatus.VERIFIED
     assert all(entry.status is BibliographyEntryStatus.VERIFIED for entry in bibliography.entries)
     assert result.state.scientific_status is ScientificStatus.LEAN_VERIFIED
@@ -1063,8 +1120,8 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
     assert [ascension for ascension, _ in updates] == [
         Ascension.FETCH_PROBLEM,
         Ascension.FORMULATE_PROMPT,
-        Ascension.PLAN_RESEARCH,
-        Ascension.RUN_RESEARCH,
+        Ascension.START_RESEARCH_COORDINATOR,
+        Ascension.MANAGE_RESEARCH_POOL,
         Ascension.AUDIT_RESEARCH,
         Ascension.WRITE_MANUSCRIPT,
         Ascension.FORMALIZE_LEAN,
@@ -1299,7 +1356,7 @@ async def test_cancellation_checkpoints_interrupted_stage_and_resume_completes(
 
 
 @pytest.mark.asyncio
-async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifacts(
+async def test_resume_after_worker_events_reuses_paid_calls_and_persisted_artifacts(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
@@ -1334,11 +1391,11 @@ async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifac
 
     [run_root] = (project / ".ascend" / "runs").iterdir()
     interrupted = StateStore(run_root).load()
-    plan_path = run_root / "research" / "rounds" / "1" / "plan.json"
-    worker_paths = tuple(sorted((plan_path.parent / "workers").glob("*.json")))
+    decision_path = run_root / "research" / "coordinator" / "decisions" / "00000001.json"
+    worker_paths = tuple(sorted((run_root / "research" / "workers").glob("*.json")))
     preserved_artifacts = {
         path.relative_to(run_root).as_posix(): path.read_bytes()
-        for path in (plan_path, *worker_paths)
+        for path in (decision_path, *worker_paths)
     }
     record_root = run_root / "logs" / "model_calls"
     initial_records = {path.name: path.read_bytes() for path in sorted(record_root.glob("*.json"))}
@@ -1349,7 +1406,7 @@ async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifac
     assert len(worker_paths) == 2
     assert len(initial_paid_ids) == 4  # compiler, coordinator, and two visible workers
     assert len(initial_records) == 4
-    assert sum(output_type is ResearchRoundPlan for _, output_type in model.requests) == 1
+    assert sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests) == 1
     assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 2
     assert model.candidate_attempts == 1
 
@@ -1360,7 +1417,7 @@ async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifac
     assert resumed.report.report.scientific_status == (
         ScientificStatus.RESEARCH_ACCEPTED_FOR_MANUSCRIPT.value
     )
-    assert sum(output_type is ResearchRoundPlan for _, output_type in model.requests) == 1
+    assert sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests) == 1
     assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 2
     assert sum(output_type is CandidateProofPackage for _, output_type in model.requests) == 1
     assert model.candidate_attempts == 2
@@ -1401,7 +1458,19 @@ async def test_rejected_full_run_stops_before_manuscript_and_lean(tmp_path: Path
         StageName.LEAN_VERIFICATION,
     ):
         assert result.state.stages[stage].status is StageStatus.SKIPPED
-    assert len(model.requests) == 13
+    # A second complete worker report races with the first candidate audit. It is
+    # independently packaged and checked before the coordinator's terminal stop is
+    # honored, without purchasing a redundant third coordinator activation.
+    assert len(model.requests) == 12
+    assert sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests) == 2
+    assert sum(output_type is CandidateProofPackage for _, output_type in model.requests) == 2
+    research_result = json.loads(
+        (result.state.run_root / "research" / "result.json").read_text(encoding="utf-8")
+    )
+    terminal_decision = research_result["coordinator_decisions"][-1]
+    assert terminal_decision["stop_recommended"] is True
+    assert terminal_decision["stop_category"] == "refuted"
+    assert terminal_decision["candidate_packaging_recommended"] is False
     assert backend.calls == 0
     assert codex.calls == 0
     assert result.report.report_json.is_file()
@@ -1486,6 +1555,7 @@ async def test_force_prompt_stage_reuses_successful_source_work_and_records(
     )
     calls_before = len(model.requests)
     records_before = set((initial.state.run_root / "logs" / "model_calls").glob("*.json"))
+    previous_research_result = (initial.state.run_root / "research" / "result.json").read_bytes()
 
     forced = await runner.resume(
         project,
@@ -1499,6 +1569,104 @@ async def test_force_prompt_stage_reuses_successful_source_work_and_records(
     assert forced.state.metadata["prompt_validation_generation"] == 1
     assert records_after == records_before
     assert len(forced.state.paid_call_ids) == calls_before
+    research_history = forced.state.metadata["research_generation_history"]
+    assert len(research_history) == 1
+    assert research_history[0]["reason"] == "explicit --force-stage request"
+    archived_research = forced.state.run_root / research_history[0]["artifact"]
+    assert (archived_research / "result.json").read_bytes() == previous_research_result
+    assert (archived_research / "coordinator" / "state.json").is_file()
+    assert (forced.state.run_root / "research" / "result.json").is_file()
+    assert backend.calls == 0
+    assert codex.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runner, _, _, _ = workflow_runner(project, accepted=True)
+    problem = make_problem(project)
+
+    first = await runner.run_new(
+        problem,
+        project,
+        options=WorkflowOptions(research_only=True, run_name="first-graph-run"),
+        environment_snapshot={"fixture": "offline"},
+    )
+    first_graph = dict(first.state.metadata["knowledge_graph"])
+    second = await runner.run_new(
+        problem,
+        project,
+        options=WorkflowOptions(research_only=True, run_name="second-graph-run"),
+        environment_snapshot={"fixture": "offline"},
+    )
+    second_graph = dict(second.state.metadata["knowledge_graph"])
+
+    assert first_graph["problem_id"] == second_graph["problem_id"]
+    assert first_graph["revision"] != second_graph["revision"]
+    graph = KnowledgeGraph(project)
+    nodes = graph.load_nodes()
+    assert len([node for node in nodes if node.node_type is NodeType.PROBLEM]) == 1
+    assert any(node.node_type is NodeType.TASK for node in nodes)
+    assert any(node.node_type is NodeType.APPROACH for node in nodes)
+    assert any(node.node_type is NodeType.AUDIT for node in nodes)
+    assert any(node.node_type is NodeType.PROOF for node in nodes)
+    run_ids = {node.created_in_run for node in nodes if node.node_type is NodeType.RUN}
+    assert {first.state.run_id, second.state.run_id} <= run_ids
+    assert graph.validate().valid
+
+
+@pytest.mark.asyncio
+async def test_force_research_archives_generation_and_uses_fresh_call_cache(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runner, model, backend, codex = workflow_runner(project, accepted=True)
+    initial = await runner.run_new(
+        make_problem(project),
+        project,
+        options=WorkflowOptions(research_only=True),
+        environment_snapshot={"fixture": "offline"},
+    )
+    run_root = initial.state.run_root
+    previous_research_result = (run_root / "research" / "result.json").read_bytes()
+    records_root = run_root / "logs" / "model_calls"
+    previous_records = {
+        path.name: path.read_bytes() for path in sorted(records_root.glob("*.json"))
+    }
+    compiler_calls_before = sum(output_type is CompiledProblem for _, output_type in model.requests)
+    coordinator_calls_before = sum(
+        output_type is ResearchCoordinatorDecision for _, output_type in model.requests
+    )
+    research_calls_before = len(model.requests) - compiler_calls_before
+
+    forced = await runner.resume(
+        project,
+        run_id=initial.state.run_id,
+        force_stage=StageName.RESEARCH,
+    )
+
+    assert forced.state.metadata["model_cache_generation"] == 1
+    assert forced.state.stages[StageName.RESEARCH].attempts == 2
+    assert sum(output_type is CompiledProblem for _, output_type in model.requests) == (
+        compiler_calls_before
+    )
+    assert (
+        sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests)
+        == coordinator_calls_before * 2
+    )
+    assert len(model.requests) - compiler_calls_before == research_calls_before * 2
+    research_history = forced.state.metadata["research_generation_history"]
+    assert len(research_history) == 1
+    archived_research = run_root / research_history[0]["artifact"]
+    assert (archived_research / "result.json").read_bytes() == previous_research_result
+    assert (archived_research / "coordinator" / "state.json").is_file()
+    assert (run_root / "research" / "result.json").is_file()
+    assert {
+        name: (records_root / name).read_bytes() for name in previous_records
+    } == previous_records
+    assert set(previous_records) < {path.name for path in records_root.glob("*.json")}
     assert backend.calls == 0
     assert codex.calls == 0
 
@@ -1565,11 +1733,15 @@ async def test_workflow_emits_sparse_progress_from_intake_to_prompt(tmp_path: Pa
         (Ascension.FETCH_PROBLEM, "Fetching problem."),
         (Ascension.FORMULATE_PROMPT, "Formulating technical research prompt."),
     ]
-    assert (Ascension.PLAN_RESEARCH, "Planning research round 1.") in updates
     assert (
-        Ascension.RUN_RESEARCH,
-        "Launching 4 research agents for round 1.",
+        Ascension.START_RESEARCH_COORDINATOR,
+        "Starting continuous research coordinator.",
     ) in updates
+    assert any(
+        ascension is Ascension.MANAGE_RESEARCH_POOL
+        and message.startswith("Managing adaptive research pool: 4 initial assignments")
+        for ascension, message in updates
+    )
     assert (
         Ascension.AUDIT_RESEARCH,
         "Packaging the candidate solution for independent audits.",
@@ -1712,10 +1884,55 @@ def test_cli_heavy_research_defaults_are_resolved_in_dry_run(
     assert result.exit_code == 0, result.output
     assert "initial research agents" in result.output
     assert "16" in result.output
-    assert "maximum assignments per round" in result.output
+    assert "maximum pending assignments" in result.output
+    assert "coordinator decisions" in result.output
     assert "concurrent agents" in result.output
     assert result.output.count("32") >= 2
     assert "total research-subagent limit" not in result.output
+    assert not (tmp_path / ".ascend").exists()
+
+
+def test_cli_resolves_continuous_decision_limit_and_rejects_legacy_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    problem = make_problem(tmp_path)
+
+    current = CliRunner().invoke(
+        app,
+        [
+            "run",
+            str(problem),
+            "--max-coordinator-decisions",
+            "192",
+            "--dry-run",
+        ],
+    )
+    legacy = CliRunner().invoke(
+        app,
+        ["run", str(problem), "--max-rounds", "2", "--dry-run"],
+    )
+    conflict = CliRunner().invoke(
+        app,
+        [
+            "run",
+            str(problem),
+            "--max-coordinator-decisions",
+            "192",
+            "--max-rounds",
+            "2",
+            "--dry-run",
+        ],
+    )
+
+    assert current.exit_code == 0, current.output
+    assert "192" in current.output
+    assert legacy.exit_code == 0, legacy.output
+    assert "64" in legacy.output
+    assert conflict.exit_code == 2
+    assert "cannot be combined" in conflict.output
     assert not (tmp_path / ".ascend").exists()
 
 
@@ -1735,12 +1952,70 @@ def test_global_no_web_policy_reaches_every_model_stage_and_source_resolver(
 
     assert all(
         not runner._model_settings(category).web_search
-        for category in ("prompt", "research", "audit", "manuscript")
+        for category in (
+            "prompt",
+            "research_coordinator",
+            "research_worker",
+            "audit",
+            "manuscript",
+        )
     )
     assert isinstance(
         runner._source_verifier(tmp_path),
         WebDisabledSourceVerifier,
     )
+
+
+def test_research_coordinator_and_worker_use_distinct_default_efforts(
+    tmp_path: Path,
+) -> None:
+    runner = WorkflowRunner(
+        AppConfig(project_root=tmp_path),
+        WorkflowDependencies(
+            model_client=ResearchWorkflowModel(accepted=False),  # type: ignore[arg-type]
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+        ),
+    )
+
+    coordinator = runner._model_settings("research_coordinator")
+    worker = runner._model_settings("research_worker")
+
+    assert coordinator.model == "gpt-5.6-sol"
+    assert coordinator.reasoning_mode == "pro"
+    assert coordinator.reasoning_effort == "max"
+    assert worker.model == "gpt-5.6-sol"
+    assert worker.reasoning_mode == "pro"
+    assert worker.reasoning_effort == "xhigh"
+
+
+def test_codex_model_is_pinned_into_every_durable_model_request(tmp_path: Path) -> None:
+    runner = WorkflowRunner(
+        AppConfig(
+            project_root=tmp_path,
+            codex=CodexSettings(model="gpt-5.6-pinned"),
+        ),
+        WorkflowDependencies(
+            model_client=ResearchWorkflowModel(accepted=False),  # type: ignore[arg-type]
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+        ),
+    )
+
+    settings = {
+        category: runner._model_settings(category)
+        for category in (
+            "prompt",
+            "research_coordinator",
+            "research_worker",
+            "audit",
+            "manuscript",
+        )
+    }
+
+    assert {value.model for value in settings.values()} == {"gpt-5.6-pinned"}
+    assert settings["research_coordinator"].reasoning_effort == "max"
+    assert settings["research_worker"].reasoning_effort == "xhigh"
 
 
 def test_cli_progress_uses_ascension_terminal_format() -> None:

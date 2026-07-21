@@ -29,6 +29,10 @@
           "title": "Repair"
         },
         "severity": {
+          "enum": [
+            "blocking",
+            "advisory"
+          ],
           "title": "Severity",
           "type": "string"
         }

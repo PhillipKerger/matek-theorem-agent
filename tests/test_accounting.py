@@ -23,6 +23,7 @@ from ascend_math_agent.openai_client import (
     UsageMetadata,
     normalized_model_request,
 )
+from ascend_math_agent.stages.research import _ResearchBudgetExhausted, _TrackedModelClient
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -256,6 +257,234 @@ async def test_replay_backfills_usage_if_crash_happened_after_response_checkpoin
     assert budget.snapshot().cost_usd == 0.1
     usage = load_usage_journal_strict(run_root / "logs" / "usage.jsonl")
     assert [item.response_id for item in usage] == ["resp_crash_boundary"]
+
+
+async def test_research_resume_repairs_missing_response_mapping_at_full_call_cap(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    namespace = "api-generation-0"
+    request = ModelRequest("coordinate", "durable mailbox", ModelSettings())
+    first_delegate = FakeClient()
+    first_budget = BudgetTracker(Limits(maximum_cost_usd=1.0), maximum_calls=1)
+    first = AccountingModelClient(
+        first_delegate,
+        stage="research",
+        budget=first_budget,
+        logger=RunLogger(run_root, model_cache_namespace=namespace),
+    )
+    request_key = first.request_cache_key(request, Answer)
+
+    await first.generate_structured(request, Answer)
+
+    # Simulate a crash after the accounting cache and usage journal became durable,
+    # but before the research scheduler saved the request-to-response mapping.
+    recovered_usage = load_usage_journal_strict(run_root / "logs" / "usage.jsonl")
+    resumed_budget = BudgetTracker(
+        Limits(maximum_cost_usd=1.0),
+        recovered_usage,
+        maximum_calls=1,
+    )
+    resumed_delegate = FakeClient()
+    resumed_accounting = AccountingModelClient(
+        resumed_delegate,
+        stage="research",
+        budget=resumed_budget,
+        logger=RunLogger(run_root, model_cache_namespace=namespace),
+    )
+    scheduler = _TrackedModelClient(
+        resumed_accounting,
+        1,
+        calls=1,
+        call_keys=[request_key],
+        response_ids=[],
+        response_ids_by_call_key={},
+    )
+
+    replayed = await scheduler.generate(
+        instructions=request.instructions,
+        input_text=request.input_text,
+        settings=request.settings,
+        output_type=Answer,
+    )
+
+    assert replayed.response_id == "resp_fixture"
+    assert resumed_delegate.calls == 0
+    assert scheduler.calls == 1
+    assert scheduler.response_ids == ["resp_fixture"]
+    assert scheduler.response_ids_by_call_key == {request_key: "resp_fixture"}
+    assert resumed_budget.snapshot().calls == 1
+    assert len((run_root / "logs" / "usage.jsonl").read_text().splitlines()) == 1
+
+
+async def test_cached_response_backfill_consumes_one_call_without_transferable_capacity(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    logger = RunLogger(run_root, model_cache_namespace="api-generation-0")
+    request = ModelRequest("coordinate", "cached request", ModelSettings())
+    identity = logger.model_calls.identity(
+        normalized_model_request(
+            request,
+            Answer,
+            stage="research",
+            cache_namespace="api-generation-0",
+        )
+    )
+    logger.model_calls.persist(
+        identity,
+        stage="research",
+        response_id="resp_cache_without_usage",
+        status="completed",
+        usage=UsageRecord(
+            response_id="resp_cache_without_usage",
+            stage="research",
+            model="gpt-5.6-sol",
+            input_tokens=12,
+            output_tokens=3,
+            cost_usd=0.1,
+        ),
+        tool_metadata=[],
+        parsed=Answer(value="recovered"),
+    )
+    delegate = FakeClient()
+    budget = BudgetTracker(Limits(maximum_cost_usd=1.0), maximum_calls=1)
+    client = AccountingModelClient(
+        delegate,
+        stage="research",
+        budget=budget,
+        logger=logger,
+    )
+
+    first = await client.generate_structured(request, Answer)
+    second = await client.generate_structured(request, Answer)
+
+    assert first == second
+    assert delegate.calls == 0
+    assert budget.snapshot().calls == 1
+    assert budget.remaining().calls == 0
+    assert len((run_root / "logs" / "usage.jsonl").read_text().splitlines()) == 1
+    with pytest.raises(BudgetExceeded) as raised:
+        await client.generate_structured(
+            ModelRequest("coordinate", "different uncached request", ModelSettings()),
+            Answer,
+        )
+    assert raised.value.dimension == "calls"
+    assert delegate.calls == 0
+    assert budget.snapshot().calls == 1
+
+
+async def test_fresh_research_scheduler_gets_request_specific_credit_for_accounted_cache_hit(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    namespace = "api-generation-0"
+    request = ModelRequest("coordinate", "replay me", ModelSettings())
+    initial_budget = BudgetTracker(Limits(maximum_cost_usd=1.0), maximum_calls=1)
+    await AccountingModelClient(
+        FakeClient(),
+        stage="research",
+        budget=initial_budget,
+        logger=RunLogger(run_root, model_cache_namespace=namespace),
+    ).generate_structured(request, Answer)
+
+    recovered_usage = load_usage_journal_strict(run_root / "logs" / "usage.jsonl")
+    assert len(recovered_usage) == 1
+    recovered_budget = BudgetTracker(
+        Limits(maximum_cost_usd=1.0),
+        recovered_usage,
+        maximum_calls=1,
+    )
+    assert recovered_budget.remaining().calls == 0
+    delegate = FakeClient()
+    accounting = AccountingModelClient(
+        delegate,
+        stage="research",
+        budget=recovered_budget,
+        logger=RunLogger(run_root, model_cache_namespace=namespace),
+    )
+    scheduler = _TrackedModelClient(accounting, 0)
+
+    replayed = await scheduler.generate(
+        instructions=request.instructions,
+        input_text=request.input_text,
+        settings=request.settings,
+        output_type=Answer,
+    )
+
+    replayed_key = accounting.request_cache_key(request, Answer)
+    assert replayed.response_id == "resp_fixture"
+    assert delegate.calls == 0
+    assert scheduler.calls == 1
+    assert scheduler.maximum_calls == 1
+    assert scheduler.response_ids_by_call_key == {replayed_key: "resp_fixture"}
+    assert len((run_root / "logs" / "usage.jsonl").read_text().splitlines()) == 1
+
+    with pytest.raises(_ResearchBudgetExhausted):
+        await scheduler.generate(
+            instructions="coordinate",
+            input_text="uncached and therefore not credited",
+            settings=ModelSettings(),
+            output_type=Answer,
+        )
+    assert delegate.calls == 0
+    assert recovered_budget.snapshot().calls == 1
+
+
+async def test_accounted_replay_preserves_paid_headroom_but_obeys_hard_logical_cap(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    namespace = "api-generation-0"
+    request = ModelRequest("coordinate", "cached", ModelSettings())
+    initial_budget = BudgetTracker(Limits(maximum_cost_usd=1.0), maximum_calls=3)
+    await AccountingModelClient(
+        FakeClient(),
+        stage="research",
+        budget=initial_budget,
+        logger=RunLogger(run_root, model_cache_namespace=namespace),
+    ).generate_structured(request, Answer)
+    recovered_budget = BudgetTracker(
+        Limits(maximum_cost_usd=1.0),
+        load_usage_journal_strict(run_root / "logs" / "usage.jsonl"),
+        maximum_calls=3,
+    )
+    accounting = AccountingModelClient(
+        FakeClient(),
+        stage="research",
+        budget=recovered_budget,
+        logger=RunLogger(run_root, model_cache_namespace=namespace),
+    )
+    scheduler = _TrackedModelClient(accounting, 2, hard_maximum_calls=3)
+
+    await scheduler.generate(
+        instructions=request.instructions,
+        input_text=request.input_text,
+        settings=request.settings,
+        output_type=Answer,
+    )
+
+    assert scheduler.calls == 1
+    assert scheduler.can_admit(paid_calls=2, logical_calls=2)
+    assert not scheduler.can_admit(paid_calls=2, logical_calls=3)
+    scheduler.register_request(
+        instructions="new",
+        input_text="one",
+        settings=ModelSettings(),
+        output_type=Answer,
+    )
+    scheduler.reserve_call_key("f" * 64)
+    with pytest.raises(_ResearchBudgetExhausted):
+        scheduler.register_request(
+            instructions="new",
+            input_text="two",
+            settings=ModelSettings(),
+            output_type=Answer,
+        )
 
 
 async def test_disabling_replay_in_used_namespace_fails_before_another_paid_call(

@@ -18,10 +18,17 @@ from ascend_math_agent.application import (
 )
 from ascend_math_agent.budget import BudgetExceeded, BudgetTracker
 from ascend_math_agent.cli import app
-from ascend_math_agent.config import AppConfig, BackendSettings, Limits, ModelSettings
+from ascend_math_agent.config import (
+    AppConfig,
+    BackendSettings,
+    Limits,
+    ModelSettings,
+    config_as_toml,
+    load_config,
+)
 from ascend_math_agent.intake import ingest_problem
 from ascend_math_agent.logging import RunLogger
-from ascend_math_agent.models import new_run_state
+from ascend_math_agent.models import StageName, StageStatus, new_run_state
 from ascend_math_agent.openai_client import ModelRequest, ModelResult
 from ascend_math_agent.reporting import build_final_report, write_final_report
 from ascend_math_agent.state import StateStore
@@ -242,6 +249,246 @@ async def test_explicit_resume_backend_migration_records_provenance_and_new_cach
         == "codex"
     )
     assert build_final_report(persisted).backend_history == persisted.metadata["backend_history"]
+
+
+@pytest.mark.asyncio
+async def test_backend_migration_archives_incomplete_research_scheduler_and_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    intake = ingest_problem(
+        problem_file=_problem(project),
+        project_root=project,
+        config=AppConfig(
+            project_root=project,
+            backend=BackendSettings(provider="api"),
+        ),
+        invocation={},
+        run_id="20260719T120000Z-research-migration-abcdef",
+        snapshot={},
+    )
+    state = StateStore(intake.run_root).load()
+    state.stages[StageName.PROMPT_COMPILATION].status = StageStatus.SUCCEEDED
+    state.stages[StageName.RESEARCH].status = StageStatus.RUNNING
+    StateStore(intake.run_root).save(state)
+    scheduler_bytes = b'{"schema_version":2,"model_call_keys":["old-api-request"]}\n'
+    evidence_bytes = b'{"assignment_id":"route-1","proof_content":"durable evidence"}\n'
+    scheduler_path = intake.run_root / "research" / "coordinator" / "state.json"
+    evidence_path = intake.run_root / "research" / "workers" / "route-1.json"
+    scheduler_path.parent.mkdir(parents=True)
+    evidence_path.parent.mkdir(parents=True)
+    scheduler_path.write_bytes(scheduler_bytes)
+    evidence_path.write_bytes(evidence_bytes)
+    runner = WorkflowRunner(AppConfig(project_root=project), _dependencies())
+
+    async def stop_before_work(state: Any, options: Any) -> str:
+        del state, options
+        return "stopped"
+
+    monkeypatch.setattr(runner, "_execute", stop_before_work)
+
+    await runner.resume(
+        project,
+        run_id=intake.state.run_id,
+        config_overrides={"backend": "codex"},
+    )
+
+    persisted = StateStore(intake.run_root).load()
+    history = persisted.metadata["research_generation_history"]
+    assert len(history) == 1
+    archived = intake.run_root / history[0]["artifact"]
+    assert (archived / "coordinator" / "state.json").read_bytes() == scheduler_bytes
+    assert (archived / "workers" / "route-1.json").read_bytes() == evidence_bytes
+    assert not (intake.run_root / "research").exists()
+    assert persisted.stages[StageName.RESEARCH].status is StageStatus.PENDING
+    assert persisted.metadata["model_cache_generation"] == 1
+    assert _model_cache_namespace(persisted) == "codex-generation-1"
+
+
+@pytest.mark.asyncio
+async def test_backend_migration_recovers_after_config_write_before_final_state_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    intake = ingest_problem(
+        problem_file=_problem(project),
+        project_root=project,
+        config=AppConfig(
+            project_root=project,
+            backend=BackendSettings(provider="api"),
+        ),
+        invocation={},
+        run_id="20260719T120000Z-migration-crash-abcdef",
+        snapshot={},
+    )
+    store = StateStore(intake.run_root)
+    state = store.load()
+    state.stages[StageName.PROMPT_COMPILATION].status = StageStatus.SUCCEEDED
+    state.stages[StageName.RESEARCH].status = StageStatus.SUCCEEDED
+    store.save(state)
+    runner = WorkflowRunner(AppConfig(project_root=project), _dependencies())
+
+    async def stop_before_work(state: Any, options: Any) -> str:
+        del state, options
+        return "stopped"
+
+    monkeypatch.setattr(runner, "_execute", stop_before_work)
+    original_save = StateStore.save
+    injected = False
+
+    def crash_before_final_save(self: StateStore, candidate: Any) -> None:
+        nonlocal injected
+        effective_path = self.run_root / "config" / "effective_config.toml"
+        if (
+            not injected
+            and "pending_backend_migration" not in candidate.metadata
+            and candidate.metadata.get("backend", {}).get("provider") == "codex"
+            and effective_path.is_file()
+            and 'provider = "codex"' in effective_path.read_text(encoding="utf-8")
+        ):
+            injected = True
+            raise RuntimeError("simulated crash before final migration state save")
+        original_save(self, candidate)
+
+    monkeypatch.setattr(StateStore, "save", crash_before_final_save)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await runner.resume(
+            project,
+            run_id=intake.state.run_id,
+            config_overrides={"backend": "codex"},
+        )
+    assert injected
+    interrupted = StateStore(intake.run_root).load()
+    assert interrupted.metadata["pending_backend_migration"]["to"] == "codex"
+    assert interrupted.metadata["backend"]["provider"] == "codex"
+
+    monkeypatch.setattr(StateStore, "save", original_save)
+    resumed_runner = WorkflowRunner(AppConfig(project_root=project), _dependencies())
+    monkeypatch.setattr(resumed_runner, "_execute", stop_before_work)
+
+    result = await resumed_runner.resume(project, run_id=intake.state.run_id)
+
+    assert result == "stopped"
+    persisted = StateStore(intake.run_root).load()
+    assert "pending_backend_migration" not in persisted.metadata
+    assert persisted.metadata["backend"]["provider"] == "codex"
+    assert persisted.metadata["model_cache_generation"] == 1
+    assert len(persisted.metadata["backend_history"]) == 1
+    assert (
+        load_config(
+            intake.run_root / "config" / "effective_config.toml",
+            project_root=project,
+            env={},
+        ).backend.provider
+        == "codex"
+    )
+
+
+def test_cli_resume_constructs_target_provider_during_pending_backend_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    intake = ingest_problem(
+        problem_file=_problem(project),
+        project_root=project,
+        config=AppConfig(
+            project_root=project,
+            backend=BackendSettings(provider="api"),
+        ),
+        invocation={},
+        run_id="20260719T120000Z-pending-cli-migration-abcdef",
+        snapshot={},
+    )
+    state = StateStore(intake.run_root).load()
+    target = AppConfig(
+        project_root=project,
+        backend=BackendSettings(provider="codex"),
+    )
+    state.metadata["pending_backend_migration"] = {
+        "from": "api",
+        "to": "codex",
+        "changed_at": "2026-07-19T12:00:00+00:00",
+        "target_cache_generation": 1,
+        "target_config_toml": config_as_toml(target),
+    }
+    StateStore(intake.run_root).save(state)
+    observed: list[str] = []
+
+    class CapturingRunner:
+        async def resume(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise RuntimeError("stop after runner construction")
+
+    def capture_runner(config: AppConfig) -> CapturingRunner:
+        observed.append(config.backend.provider)
+        return CapturingRunner()
+
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli_module, "_live_runner", capture_runner)
+
+    invocation = CliRunner().invoke(app, ["resume", intake.state.run_id])
+
+    assert invocation.exit_code == 1
+    assert observed == ["codex"]
+
+
+@pytest.mark.parametrize("move_completed", [False, True])
+def test_pending_research_archive_recovers_before_or_after_directory_move(
+    tmp_path: Path,
+    move_completed: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    intake = ingest_problem(
+        problem_file=_problem(project),
+        project_root=project,
+        config=AppConfig(project_root=project),
+        invocation={},
+        run_id="20260719T120000Z-archive-recovery-abcdef",
+        snapshot={},
+    )
+    store = StateStore(intake.run_root)
+    state = store.load()
+    evidence = intake.run_root / "research" / "coordinator" / "state.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text('{"durable":"evidence"}\n', encoding="utf-8")
+    target_relative = "research-history/checkpoint-0007"
+    target = intake.run_root / target_relative
+    target.parent.mkdir(parents=True)
+    state.metadata["pending_research_archive"] = {
+        "source": "research",
+        "target": target_relative,
+        "reason": "simulated crash recovery",
+    }
+    store.save(state)
+    if move_completed:
+        (intake.run_root / "research").replace(target)
+
+    recovered = store.load()
+    WorkflowRunner._recover_research_archive(recovered, store)
+
+    persisted = store.load()
+    assert not (intake.run_root / "research").exists()
+    assert (target / "coordinator" / "state.json").read_text(encoding="utf-8") == (
+        '{"durable":"evidence"}\n'
+    )
+    assert persisted.metadata["research_generation_history"] == [
+        {"artifact": target_relative, "reason": "simulated crash recovery"}
+    ]
+    assert "pending_research_archive" not in persisted.metadata
+
+    # Recovery is idempotent once the durable intent has been cleared.
+    WorkflowRunner._recover_research_archive(persisted, store)
+    assert store.load().metadata["research_generation_history"] == [
+        {"artifact": target_relative, "reason": "simulated crash recovery"}
+    ]
 
 
 def test_model_cache_namespace_is_provider_scoped_but_legacy_runs_remain_readable(

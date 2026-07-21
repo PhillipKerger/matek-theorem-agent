@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
@@ -74,6 +74,59 @@ class AccountingModelClient:
             provider=self._provider,
             role=role.strip(),
         )
+
+    def request_cache_key(
+        self,
+        request: ModelRequest,
+        output_type: type[BaseModel],
+    ) -> str:
+        """Return the exact durable replay identity used by this decorator."""
+
+        return self._logger.model_calls.identity(
+            normalized_model_request(
+                request,
+                output_type,
+                stage=self._stage,
+                cache_namespace=self._cache_namespace,
+            )
+        ).request_key
+
+    def accounted_request_keys(self, request_keys: Collection[str]) -> dict[str, str]:
+        """Return current-scope checkpoints already present in run-wide accounting."""
+
+        recovered: dict[str, str] = {}
+        for request_key in request_keys:
+            record = self._logger.model_calls.load_by_request_key(
+                request_key,
+                expected_stage=self._stage,
+                expected_cache_namespace=self._cache_namespace,
+            )
+            if record is not None and self._budget.has_response(record.response_id):
+                recovered[request_key] = record.response_id
+        return recovered
+
+    def is_accounted_request(
+        self,
+        request: ModelRequest,
+        output_type: type[BaseModel],
+    ) -> bool:
+        """Whether this exact replay is paid already and consumes no remaining call slot."""
+
+        identity = self._logger.model_calls.identity(
+            normalized_model_request(
+                request,
+                output_type,
+                stage=self._stage,
+                cache_namespace=self._cache_namespace,
+            )
+        )
+        record = self._logger.model_calls.load(identity)
+        return record is not None and self._budget.has_response(record.response_id)
+
+    def remaining_model_calls(self) -> int | None:
+        """Return the current run-wide call remainder, including live reservations."""
+
+        return self._budget.remaining().calls
 
     async def generate_structured(
         self,

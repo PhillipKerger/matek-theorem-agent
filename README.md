@@ -14,8 +14,10 @@ validates a LaTeX manuscript, and attempts Lean verification of the accepted mai
 | --- | --- |
 | Model access | Official Codex CLI with ChatGPT sign-in; no OpenAI API key required |
 | Run outputs | `.ascend/runs/<run-id>/` inside your project |
-| Research breadth | A dedicated research orchestrator assigns 16 initial workers and may assign up to 32 in every later round; there is no cumulative worker-count cap |
+| Persistent memory | Typed Markdown knowledge graph in `.ascend/knowledge/`, shared across runs |
+| Research breadth | A continuous logical coordinator starts 16 diverse workers, then refills a live pool up to 32 active workers; there is no cumulative worker-count cap |
 | Parallelism | Configurable; the default Codex run admits up to 32 web-enabled research agents at once |
+| Research roles | GPT 5.6 Sol with max coordinator effort and independent xhigh workers; the API adapter also requests pro mode |
 | Write boundary | `.ascend/` only, unless `--allow-project-edits` is explicitly supplied |
 | Verification | Independent source checks, LaTeX compilation, and deterministic Lean checks |
 
@@ -105,42 +107,55 @@ ascend run problem.md --dry-run
 
 ## Choosing the research strength and number of agents
 
-The most important research settings are configurable in `ascend.toml`. ASCEND does not use one
-fixed agent count: by default it starts with sixteen assignments spanning at least four materially
-different approach families, then may launch targeted agents in later rounds in response to
-promising lemmas, counterexamples, and audit findings. The number of agents that run
-*simultaneously* is separate from the number assigned in one round. ASCEND imposes no dedicated
-cumulative research-worker count limit across rounds; general round, model-call, cost, token, and
-optional time budgets still apply.
+The most important research settings are configurable in `ascend.toml`. ASCEND does not use fixed
+rounds or a wait-for-all batch. By default its logical coordinator starts sixteen independent
+assignments spanning at least four materially different approach families. As results arrive, it
+can immediately redirect work and refill or expand the live pool up to 32 active workers. ASCEND
+imposes no cumulative research-worker count limit; open-work, concurrency, coordinator-
+decision, model-call, cost, token, and optional time budgets remain independent.
+
+This is the closest reproducible analogue to giving the main research prompt to a GPT 5.6 Sol
+Ultra research session. “Ultra” describes product/session behavior, not a model ID or API
+reasoning setting. ASCEND implements that behavior explicitly: one durable GPT 5.6 Sol logical
+coordinator at max effort manages fresh GPT 5.6 Sol xhigh workers. The Responses API adapter also
+requests `reasoning.mode = "pro"`; the default Codex path uses Codex CLI's model and
+reasoning-effort controls, which do not expose that Responses API field as a separate ASCEND
+setting. The coordinator is restored from ASCEND's canonical on-disk scheduler checkpoint, so it
+does not depend on hidden hosted multi-agent state or a surviving provider conversation.
 
 For the default Codex backend, this is a useful starting configuration:
 
 ```toml
 [codex]
-model = ""                    # empty: use the current Codex default model
-research_effort = "xhigh"     # prompt compiler, research orchestrator, and research workers
-audit_effort = "xhigh"        # independent proof auditors and final judge
+model = "gpt-5.6-sol"
+research_coordinator_effort = "max"
+research_worker_effort = "xhigh"
+audit_effort = "xhigh"        # independent proof auditors
 max_parallel_agents = 32      # backend-wide concurrent model-call ceiling
 max_parallel_web_agents = 32  # concurrent calls that have web search enabled
 
 [codex.limits]
-max_research_rounds = 8       # second ceiling on adaptive research rounds
+max_research_coordinator_decisions = 256 # second coordinator-decision ceiling
 # max_agent_calls = 512       # optional; no call-count ceiling is imposed by default
 # max_codex_threads = 512     # optional second global call-count ceiling
 
 [research]
 minimum_initial_agents = 16   # initial assignments; configurable down to the safety floor of 4
 maximum_concurrent_agents = 32 # research-worker concurrency ceiling
-maximum_assignments_per_round = 32 # research-orchestrator ceiling for each round plan
-maximum_rounds = 8            # adaptive research-round ceiling
+maximum_pending_assignments = 32 # total open (queued plus running) assignment ceiling
+maximum_coordinator_decisions = 256 # event-indexed coordinator-decision ceiling
 ```
 
 Reasoning effort accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`, subject
-to what the selected Codex model and account support. `xhigh` is the default for Codex research
-and audits. The direct API backend instead configures research and audit level/model under
-`[api.models.research]` and `[api.models.audit]`, and uses `api.max_parallel_agents`; its usage is
-bounded by `api.limits.maximum_cost_usd`. Codex has no call-count ceiling by default, but users
-may set `codex.limits.max_agent_calls` or `codex.limits.max_codex_threads` explicitly.
+to what the selected Codex model and account support. `max` is the default for coordination and
+the final research judgment; `xhigh` is the default for workers and independent audits. These are
+Codex reasoning-effort values, not a separate Codex `pro` mode. The direct API backend additionally
+defaults `reasoning.mode = "pro"` and configures roles separately under
+`[api.models.research_coordinator]`, `[api.models.research_worker]`, and `[api.models.audit]`; it
+uses `api.max_parallel_agents`, and its usage is bounded by
+`api.limits.maximum_cost_usd`. The final research judge uses the coordinator role settings. Codex
+has no global call-count ceiling by default, but users may set
+`codex.limits.max_agent_calls` or `codex.limits.max_codex_threads` explicitly.
 
 The effective research concurrency is the lowest applicable ceiling. With the defaults and web
 search enabled, that is `min(32, 32, 32) = 32` simultaneous research workers. Raising only
@@ -153,24 +168,30 @@ These controls have different expected effects:
 
 | Setting | Expected effect | Main tradeoff |
 | --- | --- | --- |
-| `minimum_initial_agents` | More independent starting approaches and better route diversity | More model calls and allowance usage in the first round; the default is 16 and the safety floor is 4 |
-| `maximum_assignments_per_round` | Allows the research orchestrator to propose more targeted workers in any one round | Raises a ceiling rather than forcing every round to use that many agents; default 32 |
-| `maximum_rounds` | More opportunities to repair gaps and pursue audit-directed follow-ups | Potentially much more elapsed time and total usage |
+| `minimum_initial_agents` | More independent starting approaches and better route diversity | More model calls and allowance usage at bootstrap; the default is 16 and the safety floor is 4 |
+| `maximum_pending_assignments` | Allows a larger total open set of queued plus running assignments | A large open set may become stale as new evidence arrives; default 32 |
+| `maximum_coordinator_decisions` | Allows more completion- and audit-driven redirects/refills | Potentially much more elapsed time and total usage; default 256 |
 | `maximum_concurrent_agents` | Allows up to 32 research workers to run simultaneously by default when backend limits permit | Does not increase research breadth by itself; high concurrency can encounter provider rate limits |
-| `research_effort` | Gives compilation, coordination, and proof-search calls a larger reasoning effort | Usually slower and more allowance-intensive; stronger results are not guaranteed |
-| `audit_effort` | Gives fresh proof audits and the final judge a larger reasoning effort | More verification time and usage, but reducing it can make subtle gaps easier to miss |
+| `research_coordinator_effort` | Gives global synthesis, prioritization, repair planning, and the final research judgment more reasoning effort | `max` can be slower and more allowance-intensive; stronger results are not guaranteed |
+| `research_worker_effort` | Gives each independent proof-search call more reasoning effort | Higher effort is slower and more allowance-intensive; default `xhigh` |
+| `audit_effort` | Gives fresh independent proof audits a larger reasoning effort | More verification time and usage, but reducing it can make subtle gaps easier to miss |
 | `model` | Selects the Codex model used for model-driven stages | Capability, speed, availability, and allowance consumption depend on the selected model/account |
 | `max_agent_calls` | Optional hard cap on model calls across research and the rest of the workflow; unset by default | A low value can stop a promising run before later audits, manuscript work, or Lean work |
 
 For a one-off run, the CLI exposes the two most common scheduling controls:
 
 ```bash
-# At most 32 research workers active at once, for at most 6 adaptive rounds
-ascend run problem.md --max-agents 32 --max-rounds 6
+# At most 32 research workers active at once and 192 coordinator decisions
+ascend run problem.md --max-agents 32 --max-coordinator-decisions 192
 
 # Inspect the resolved ceilings, model, and effort without starting any agents
-ascend run problem.md --max-agents 32 --max-rounds 6 --dry-run
+ascend run problem.md --max-agents 32 --max-coordinator-decisions 192 --dry-run
 ```
+
+The old `--max-rounds` flag and `maximum_rounds`/`maximum_assignments_per_round` configuration
+keys are deprecated compatibility inputs. ASCEND translates them into coordinator-decision and
+open-assignment budgets for existing scripts; they never restore fixed rounds or a batch
+barrier. New configurations should use the names above.
 
 Despite its short name, `--max-agents` sets the maximum *concurrent* research workers; it does
 not set a total worker count. Change `minimum_initial_agents`, model/effort levels, backend
@@ -182,47 +203,71 @@ independent audits and final acceptance gate.
 
 ASCEND has two orchestration layers. The outer `WorkflowRunner` is deterministic application
 code: it moves between prompt compilation, research, manuscript, Lean, and reporting. Inside the
-research stage, a separate model-driven **research orchestrator** manages mathematical search.
-The outer workflow does not itself invent worker routes.
+research stage, a separate model-driven **logical research coordinator** continuously manages
+mathematical search through durable application state. The outer workflow does not itself invent
+worker routes.
 
 The prompt flow is:
 
 1. The prompt compiler turns `problem.md` and the preserved framework into the complete compiled
    research prompt (the “big prompt”) and an exact machine-readable claim contract.
-2. The dedicated research orchestrator receives that complete prompt, claim contract, and the
-   per-round assignment ceiling, then returns a structured plan of precise, materially different
-   assignments.
-3. Every concurrent research subagent receives the complete big prompt, the exact claim contract,
-   and one assignment containing its route, inputs, expected output, and stopping condition. The
-   assignment narrows the route but cannot change the target. Workers do not see or coordinate
-   with concurrent workers.
-4. After a round, ASCEND writes `research/continuity.json` and
-   `research/rounds/<round>/continuity.json`. These snapshots explicitly separate promising
-   routes, partial results, ruled-out
-   directions and counterexamples, blocked routes with exact gaps, dependencies, prior research
-   directives, and audit repair obligations.
-5. Every later research-orchestrator call again receives the complete big prompt and claim
-   contract, plus that continuity state, the approach registry, and the full visible worker
-   reports. This provider-independent handoff preserves mathematical continuity even when the
-   backend uses a fresh model context. A ruled-out route should not be restarted without new
-   information that changes its status.
+2. The GPT 5.6 Sol max-effort coordinator receives that prompt unchanged, the claim contract, and
+   the scheduler constraints. The API adapter also requests pro mode. Its first decision creates
+   sixteen precise, materially different assignments by default.
+3. Every independent GPT 5.6 Sol xhigh worker receives the complete big prompt, the exact
+   claim contract, and one assignment containing its route, inputs, expected output, and stopping
+   condition, plus a bounded graph slice containing its stable task/target IDs and relevant prior
+   dependencies, proofs, counterexamples, sources, and audits. The assignment narrows the route
+   but cannot change the target. Workers do not see or coordinate with concurrent workers and
+   return structured graph patches instead of editing the vault.
+4. When any worker finishes, ASCEND saves its complete raw report and associated
+   `research/source-verification/<assignment-id>.json` first, checkpoints the transition with its
+   pending-event write-ahead record, creates a sequenced immutable event such as
+   `research/events/00000001.json`, clears the pending record, and refreshes the derived
+   `research/coordinator/mailbox.json`. It does not wait for all other workers.
+5. The coordinator consumes newly useful events together with the unchanged big prompt and claim
+   contract, assignment lifecycle state, approach registry, audit obligations, and complete raw
+   reports. It can immediately redirect, retire, or add assignments, and the scheduler refills
+   available live-pool slots.
+6. `research/continuity.json` remains a convenient index of promising, partial, ruled-out, and
+   blocked routes, exact gaps, dependencies, prior directives, and audit repairs. The canonical
+   scheduler checkpoint, immutable event evidence, and full reports remain available; the index
+   never compresses them away.
+
+The coordinator is “continuous” as a logical actor, not one never-ending Codex/API request. Each
+activation may use a fresh provider context. `research/coordinator/state.json` is the canonical
+atomic scheduler checkpoint; its pending-event write-ahead field makes interrupted event
+publication finishable on resume. Immutable event/decision files and hashed raw reports validate
+that checkpoint. `research/coordinator/mailbox.json`, assignment files, the registry, and the
+continuity index are materialized views. ASCEND does not claim it can reconstruct a deleted or
+invalid canonical scheduler checkpoint from evidence alone.
 
 `--max-agents N` controls how many research workers may run concurrently. The initial portfolio
-contains 16 assignments by default; every round may contain up to 32 assignments, and all 32 may
-run concurrently with the default Codex settings, including when web search is enabled. There is
-no cumulative research-worker count cap across rounds. Research-orchestrator, worker,
+contains 16 assignments by default; the coordinator may refill or expand the live pool to 32
+active workers with the default Codex settings, including when web search is enabled. The default
+`maximum_pending_assignments = 32` caps the total open set (queued plus running), so 32 active
+workers leave no additional queued capacity. There is no separate cumulative research-worker
+count cap.
+Research-coordinator, worker,
 candidate-packager, auditor, and final-judge calls use role-isolated execution contexts; Codex
 traces record those roles explicitly. Each worker starts in a fresh context.
 
-If a worker reports a complete proof, ASCEND stops admitting more workers from that round,
-cancels the unfinished active window, packages the triggering proof, and runs every mandatory
-independent audit plus the final judge immediately. If the gate passes, queued work is never
-launched and the workflow advances without waiting for the rest of the research portfolio. If
-the gate fails, its exact repair obligations are preserved and interrupted or queued assignments
-resume. The result records `research_subagents_assigned` (all validated plan assignments)
-separately from `research_subagents_used` (worker contexts actually launched); these are
-telemetry, not cumulative limits. A worker's self-declared success therefore changes scheduling
-but never verifies its own proof.
+If a worker reports a complete proof, ASCEND pauses admission of new workers and packages the
+triggering proof immediately; it does not wait for unrelated active workers. A package that still
+declares unresolved proof steps fails closed before independent judging. Every structurally
+complete package runs all mandatory independent audits plus the final judge. Reports that finish
+during this work are saved in the mailbox. If the gate passes, queued work is never launched and
+the workflow advances. If the gate fails, the complete available audit reports and exact repair
+obligations become high-priority events, the coordinator reacts immediately, and admission
+resumes/refills. The result records
+`research_subagents_assigned` separately from `research_subagents_used`; these are telemetry, not
+cumulative limits. A worker's self-declared success therefore changes scheduling but never
+verifies its own proof.
+
+The proof package must explicitly say whether the result is quantitative or algorithmic. The
+foundational auditor checks that classification independently and blocks a false negative; an
+applicable complexity audit therefore cannot be skipped merely because the packager mislabeled the
+candidate.
 
 ## Writing `problem.md`
 
@@ -251,7 +296,8 @@ recognizable while separate problems and repeated attempts cannot overwrite one 
 .ascend/runs/<run-id>/
 ├── input/          # preserved problem and resolved invocation/configuration
 ├── prompts/        # compiled research prompt or clarification request
-├── research/       # round plans, worker results, candidates, and audits
+├── research/       # coordinator state/events, full worker reports, candidates, and audits
+├── research-history/ # prior research trees archived by a forced generation/provider migration
 ├── manuscript/     # paper.tex, references.bib, paper.pdf, and build log
 ├── lean/           # challenge.lean, Main.lean, iterations, and diagnostics
 ├── report/         # REPORT.md, report.json, and verification certificate
@@ -259,16 +305,60 @@ recognizable while separate problems and repeated attempts cannot overwrite one 
 └── state.json      # resumable workflow checkpoint
 ```
 
+The persistent problem memory is deliberately outside every run but still inside ASCEND's safe
+write boundary:
+
+```text
+.ascend/
+├── knowledge/              # Obsidian-compatible Markdown source of truth and dashboards
+├── graph-schema.json       # typed node/edge and patch schema
+├── graph-index.sqlite      # disposable, rebuildable query index
+├── graph-state.json        # revision, hashes, ownership, and operation journal
+├── snapshots/              # immutable revision snapshots used by diff/conflict detection
+└── locks/graph.lock        # cross-process graph serialization
+```
+
 Use `ascend status` for the latest run or `ascend status <run-id>` for a specific run. By
 default, ASCEND writes only beneath `.ascend/`; editing project source requires the explicit
 `--allow-project-edits` option.
+
+### Persistent knowledge graph and Obsidian
+
+Every run loads and validates the graph for its source problem, creates a distinct run node, and
+extends the same stable problem node used by earlier runs. Claims, proofs, audits,
+counterexamples, formalizations, sources, tasks, and artifacts remain separate typed notes with
+immutable IDs. The Markdown notes and flat YAML frontmatter are authoritative; SQLite is only a
+rebuildable index, and ASCEND works normally when Obsidian is not installed.
+
+Open `.ascend/knowledge/` as an Obsidian vault to use `Home.md`, backlinks, typed properties,
+dashboard notes, and the four curated canvases. Human prose outside `ASCEND:GENERATED` markers and
+note filenames may be edited. Changing an exact claim statement increments its version and marks
+dependent proofs/formalizations stale; changing an audited proof requires re-audit. Fields named
+`ascend_*` and other typed frontmatter are machine-owned. Conflicting edits fail validation rather
+than being overwritten.
+
+Useful offline commands include:
+
+```bash
+ascend graph status
+ascend graph frontier
+ascend graph validate
+ascend graph show CLM-...
+ascend graph dependencies CLM-...
+ascend graph downstream CLM-...
+ascend graph tombstone CLM-... --reason "Superseded by the corrected statement"
+ascend graph diff REVISION_A REVISION_B
+ascend graph export --format mermaid
+ascend graph rebuild-index
+ascend graph open
+```
 
 ## How the workflow works
 
 1. **Problem compilation:** identifies the exact target, success criterion, definitions, and
    relevant existing literature.
-2. **Research:** sends diverse approaches to parallel workers and adapts later rounds to current
-   candidates, failed approaches, and open audit findings.
+2. **Research:** starts a diverse parallel portfolio, then adapts the live pool on completion and
+   audit events without waiting for fixed rounds.
 3. **Adversarial review:** checks proof steps, novelty claims, assumptions, and source metadata
    before accepting a candidate.
 4. **Manuscript:** writes the paper only after research acceptance, verifies the bibliography,
@@ -384,10 +474,13 @@ run and returns an actionable error; it cannot unexpectedly create Platform API 
 | `ascend resume [RUN_ID] [options]` | Continue a checkpointed run |
 | `ascend report [RUN_ID] [--rewrite]` | Regenerate the deterministic report, optionally rewriting prose |
 | `ascend verify [RUN_ID]` | Re-run integrity, bibliography, LaTeX, and Lean checks without a model |
+| `ascend graph COMMAND` | Validate, query, diff, export, rebuild, or open persistent graph memory |
 
-Important `run` options include `--backend codex|api`, `--max-agents`, `--max-rounds`,
-`--time-limit-minutes`, `--no-web-search`, `--no-lean`, `--research-only`, `--dry-run`,
-`--sandbox native|docker`, and `--allow-project-edits`.
+Important `run` options include `--backend codex|api`, `--max-agents`,
+`--max-coordinator-decisions`, `--time-limit-minutes`, `--no-web-search`, `--no-lean`,
+`--research-only`, `--dry-run`, `--sandbox native|docker`, and `--allow-project-edits`.
+Deprecated `--max-rounds` is accepted only to migrate existing scripts to a decision budget; it
+does not select round-based execution.
 
 Ordinary `ascend doctor` sends no model prompt. `--deep` explicitly opts into one minimal live
 Codex structured-output probe and may consume Codex allowance. `--online` separately probes the
@@ -430,19 +523,24 @@ allow_automatic_fallback = false
 
 [codex]
 executable = "codex"
-model = "" # empty means the user's/current Codex default
-research_effort = "xhigh"
+model = "gpt-5.6-sol"
+research_coordinator_effort = "max"
+research_worker_effort = "xhigh"
 audit_effort = "xhigh"
 manuscript_effort = "high"
 formalization_effort = "xhigh"
 max_parallel_agents = 32
 max_parallel_web_agents = 32
 persist_sessions = true
+
+[graph]
+maximum_context_nodes = 40
+maximum_context_characters = 60000
 ```
 
 See [Choosing the research strength and number of agents](#choosing-the-research-strength-and-number-of-agents)
-for the research portfolio, concurrency, round, effort, model, and usage-limit controls and how
-their ceilings interact.
+for the research portfolio, live-pool, open-work, coordinator-decision, effort, model, and
+usage-limit controls and how their ceilings interact.
 
 Backend selection precedence is an explicit `--backend` flag, `ASCEND_BACKEND`, project
 configuration, and finally the built-in `codex` default. Accepted values are `codex` and `api`.
@@ -518,9 +616,9 @@ The image must already contain the configured LaTeX compiler, Lean/Lake toolchai
 - **Unsupported Codex CLI:** ASCEND checks the exact noninteractive, JSONL, schema, sandbox,
   search, model, configuration, and session capabilities it uses. Update Codex using an official
   installation method; a version string alone is not sufficient.
-- **Model unavailable or reasoning effort rejected:** remove the `codex.model` override to use
-  the account's current default, or choose a model and effort available to the workspace, then
-  resume the checkpointed run.
+- **Model unavailable or reasoning effort rejected:** choose an explicit model and effort
+  available to the workspace, then resume the checkpointed run. ASCEND does not inherit a
+  mutable Codex model default because the executed model is part of durable request identity.
 - **Rate, allowance, or credit limit reached:** completed artifacts remain saved. Wait until
   access is available and run `ascend resume RUN_ID`; ASCEND will not switch to API billing.
 - **Run time limit reached:** completed calls and artifacts remain checkpointed. Increase the
