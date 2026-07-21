@@ -1335,6 +1335,12 @@ class WorkflowRunner:
                                 self.config.api.max_parallel_agents,
                             )
                         ),
+                        maximum_research_subagents=(
+                            self.config.research.maximum_research_subagents
+                        ),
+                        maximum_assignments_per_round=(
+                            self.config.research.maximum_assignments_per_round
+                        ),
                         maximum_rounds=(
                             min(
                                 self.config.research.maximum_rounds,
@@ -1372,9 +1378,21 @@ class WorkflowRunner:
             ResearchOutcome.BUDGET_EXHAUSTED: ScientificStatus.RESEARCH_PARTIAL,
         }[result.outcome]
         state.scientific_status = status
+        configuration_summary = state.metadata.get("configuration_summary", {})
+        if not isinstance(configuration_summary, dict):
+            raise StateCorruptionError("configuration_summary must be an object")
+        configuration_summary.update(
+            {
+                "research_subagents_assigned": result.research_subagents_assigned,
+                "research_subagents_used": result.research_subagents_used,
+            }
+        )
         state.metadata.update(
             {
                 "research_status": status.value,
+                "research_subagents_assigned": result.research_subagents_assigned,
+                "research_subagents_used": result.research_subagents_used,
+                "configuration_summary": configuration_summary,
                 "strongest_result": result.strongest_result,
                 "unresolved_obligations": result.unresolved_obligations,
             }

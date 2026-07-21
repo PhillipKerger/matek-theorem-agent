@@ -42,12 +42,18 @@ condition. The longer framework then expands each item into ASCEND's auditable p
 
 ## Stage 2 — Adaptive research
 
+Research is a nested orchestration boundary. The deterministic outer workflow hands the complete
+compiled research prompt and exact claim contract to a dedicated model-driven research
+orchestrator. That orchestrator proposes structured assignments; ASCEND launches and accounts for
+the worker calls. The total number of logical workers across all rounds is bounded by
+`research.maximum_research_subagents`, separately from per-round and concurrency ceilings.
+
 ### Initial round
 
-A coordinator creates at least four materially distinct assignments. Suggested roles are not
-fixed quotas; examples include direct proof, alternative structural formulation, hostile
-counterexample search, literature/known-theorem mapping, computation, and formalization-aware
-lemma decomposition.
+A coordinator creates eight initial assignments by default, spanning at least four materially
+distinct approach families. Suggested roles are not fixed quotas; examples include direct proof,
+alternative structural formulation, hostile counterexample search, literature/known-theorem
+mapping, computation, and formalization-aware lemma decomposition.
 
 If the compiler found that existing literature resolves the target, the portfolio emphasizes
 independent source verification, hypothesis matching, proof reconstruction, and formalization.
@@ -55,7 +61,11 @@ Known results must remain labeled as known rather than novel.
 
 ### Later rounds
 
-The coordinator receives only visible worker reports and the current registry. It returns:
+Every fresh research-orchestrator context receives the complete compiled prompt and claim
+contract again. It also receives the current registry, every visible worker report, audit repair
+obligations, and a durable `research/continuity.json` handoff that explicitly classifies promising
+routes, partial results, refuted directions and counterexamples, blocked routes and exact
+gaps, dependencies, and prior directives. It returns:
 
 - new assignments;
 - workers to retire or redirect;

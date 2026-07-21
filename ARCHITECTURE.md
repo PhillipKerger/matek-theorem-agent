@@ -128,11 +128,19 @@ decision.
 
 The application-managed coordinator loop is provider-independent:
 
-1. The coordinator creates a diverse `ResearchRoundPlan` with independent assignments.
+1. A dedicated research orchestrator, distinct from the outer workflow runner, receives the
+   complete compiled prompt and exact claim contract and creates a diverse `ResearchRoundPlan`.
 2. Workers run concurrently under backend-specific semaphores.
-3. The coordinator ingests visible reports and updates the `ApproachRegistry`.
+3. ASCEND updates the `ApproachRegistry` and a durable cross-round `ResearchContinuityState` that
+   separates promising, partial, refuted, and blocked routes with their mathematical evidence.
 4. It chooses focused follow-up work, candidate packaging, or a budget-aware stop.
 5. Fresh independent audits and the final judge gate any candidate.
+
+Every later orchestrator call receives the original compiled prompt and claim contract, the
+continuity state, the registry, all visible reports, and audit obligations. This explicit handoff
+preserves continuity across providers and process restarts without relying on hidden model memory.
+`research.maximum_research_subagents` is a hard logical-worker ceiling across rounds; per-round
+assignment and concurrent-call ceilings remain separate controls.
 
 The compiled problem carries a prior-literature classification. Exact known solutions remain
 eligible for source verification, proof reconstruction, exposition, and formalization, but must

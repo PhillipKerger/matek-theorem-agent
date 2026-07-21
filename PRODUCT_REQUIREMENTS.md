@@ -62,13 +62,22 @@ formalization, and generates a reproducible final report.
 
 ### FR-3 Adaptive research
 
-- Start with a coordinator-generated diverse portfolio of at least four materially different
-  approaches unless the configured budget is lower.
+- Start with a coordinator-generated portfolio of eight research assignments by default,
+  spanning at least four materially different approaches unless the configured budget is lower.
 - Keep initial workers independent; do not reveal the favored route to all workers.
+- Run research under a dedicated model-driven research orchestrator that receives the complete
+  compiled prompt and exact claim contract on every round, separately from the deterministic
+  outer workflow orchestrator.
 - Store every worker assignment and result.
 - Maintain an approach registry containing mechanism, result, assumptions, bottleneck,
   counterexamples, dependencies, and status.
 - Support multiple rounds within cost, token, wall-clock, and agent limits.
+- Expose a total research-subagent limit across all rounds, distinct from per-round assignment
+  and concurrency ceilings.
+- Persist an explicit cross-round continuity handoff separating promising routes, partial
+  results, ruled-out directions and counterexamples, blocked routes and exact gaps, dependencies,
+  prior directives, and audit repair obligations. Supply it and the visible underlying reports
+  to every later research-orchestrator call.
 - Launch targeted counterexample and lemma-audit tasks when promising claims arise.
 - Produce a candidate proof package when the coordinator recommends it or a worker explicitly
   reports a full proof of the exact success criterion.

@@ -74,6 +74,23 @@ class SlowClient:
         raise AssertionError("slow fixture should have been cancelled")
 
 
+class RoleAwareClient(FakeClient):
+    def __init__(self, observed_roles: list[str | None] | None = None) -> None:
+        super().__init__()
+        self.observed_roles = observed_roles if observed_roles is not None else []
+
+    def for_stage(
+        self,
+        stage: str,
+        *,
+        run_root: Path,
+        role: str | None = None,
+    ) -> RoleAwareClient:
+        del stage, run_root
+        self.observed_roles.append(role)
+        return self
+
+
 async def test_accounting_decorator_logs_and_aggregates(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     (run_root / "logs").mkdir(parents=True)
@@ -94,6 +111,25 @@ async def test_accounting_decorator_logs_and_aggregates(tmp_path: Path) -> None:
     usage = json.loads((run_root / "logs" / "usage.jsonl").read_text().splitlines()[0])
     assert usage["usage"]["response_id"] == "resp_fixture"
     assert usage["usage"]["reasoning_tokens"] == 3
+
+
+async def test_accounting_decorator_creates_explicit_model_role_contexts(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    delegate = RoleAwareClient()
+    client = AccountingModelClient(
+        delegate,
+        stage="research",
+        budget=BudgetTracker(Limits(maximum_cost_usd=1.0)),
+        logger=RunLogger(run_root),
+    )
+
+    orchestrator = client.for_role("research-orchestrator")
+    await orchestrator.generate_structured(ModelRequest("plan", "problem", ModelSettings()), Answer)
+
+    assert delegate.observed_roles == [None, "research-orchestrator"]
 
 
 async def test_run_wall_clock_cancels_an_in_flight_model_call(tmp_path: Path) -> None:

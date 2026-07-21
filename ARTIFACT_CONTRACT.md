@@ -21,7 +21,9 @@ Every run must follow this layout:
 │   └── source_ledger.json
 ├── research/
 │   ├── registry.json
+│   ├── continuity.json
 │   ├── rounds/<round-id>/plan.json
+│   ├── rounds/<round-id>/continuity.json
 │   ├── rounds/<round-id>/workers/*.json
 │   ├── candidate/
 │   │   ├── proof.md

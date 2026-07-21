@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,7 +38,12 @@ from ascend_math_agent.intake import ingest_problem
 from ascend_math_agent.models import ScientificStatus, StageName, StageStatus
 from ascend_math_agent.openai_client import ModelRequest, ModelResult
 from ascend_math_agent.progress import Ascension
-from ascend_math_agent.source_provenance import WebDisabledSourceVerifier
+from ascend_math_agent.source_provenance import (
+    SourceVerificationRecord,
+    SourceVerificationReport,
+    SourceVerificationStatus,
+    WebDisabledSourceVerifier,
+)
 from ascend_math_agent.stages.common import sha256_json, sha256_text
 from ascend_math_agent.stages.compile_prompt import (
     CompiledProblem,
@@ -466,6 +472,28 @@ class ForbiddenCodex:
         raise AssertionError(f"unexpected Codex execution in {request.cwd}")
 
 
+class AlwaysVerifiedIdentifierVerifier:
+    """Deterministic source verifier for offline workflow fixtures."""
+
+    async def verify(
+        self,
+        identifiers: Collection[str],
+        *,
+        expected_title: str | None = None,
+    ) -> SourceVerificationReport:
+        del expected_title
+        return SourceVerificationReport(
+            records=[
+                SourceVerificationRecord(
+                    identifier=identifier,
+                    status=SourceVerificationStatus.VERIFIED,
+                    detail="verified by offline fixture",
+                )
+                for identifier in identifiers
+            ]
+        )
+
+
 class FullWorkflowModel(ResearchWorkflowModel):
     """Drive the complete two-round acceptance scenario through every real stage."""
 
@@ -670,6 +698,7 @@ def workflow_runner(
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
     return runner, model, backend, codex
@@ -792,6 +821,7 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
             model_client=model,  # type: ignore[arg-type]
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
     monkeypatch.chdir(project)
@@ -838,6 +868,7 @@ async def test_run_wide_deadline_interrupts_the_active_stage_and_writes_report(
             model_client=model,  # type: ignore[arg-type]
             execution_backend=ForbiddenBackend(),
             codex_client=ForbiddenCodex(),
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
 
@@ -874,6 +905,7 @@ def placeholder_recovery_runner(
             model_client=model,  # type: ignore[arg-type]
             execution_backend=ForbiddenBackend(),
             codex_client=ForbiddenCodex(),
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
 
@@ -994,6 +1026,7 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
             progress=lambda ascension, message: updates.append((ascension, message)),
         ),
     )
@@ -1109,6 +1142,7 @@ def full_runner_with_consent(
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
             lean_consent=consent,
         ),
     )
@@ -1235,6 +1269,7 @@ async def test_cancellation_checkpoints_interrupted_stage_and_resume_completes(
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
 
@@ -1285,6 +1320,7 @@ async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifac
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
 
@@ -1512,6 +1548,7 @@ async def test_workflow_emits_sparse_progress_from_intake_to_prompt(tmp_path: Pa
             model_client=InterruptAtCandidateModel(),
             execution_backend=ForbiddenBackend(),
             codex_client=ForbiddenCodex(),
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
             progress=lambda ascension, message: updates.append((ascension, message)),
         ),
     )
@@ -1563,6 +1600,7 @@ async def test_resume_failed_bibliography_corrects_persisted_draft_without_resta
             model_client=model,
             execution_backend=backend,
             codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
     initial = await runner.run_new(
@@ -1658,6 +1696,25 @@ def test_cli_time_limit_is_resolved_without_starting_a_run(
     assert not (tmp_path / ".ascend").exists()
 
 
+def test_cli_total_research_subagent_limit_is_resolved_in_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    problem = make_problem(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        ["run", str(problem), "--max-research-subagents", "32", "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "total research-subagent limit" in result.output
+    assert "32" in result.output
+    assert not (tmp_path / ".ascend").exists()
+
+
 def test_global_no_web_policy_reaches_every_model_stage_and_source_resolver(
     tmp_path: Path,
 ) -> None:
@@ -1668,6 +1725,7 @@ def test_global_no_web_policy_reaches_every_model_stage_and_source_resolver(
             model_client=ResearchWorkflowModel(accepted=False),  # type: ignore[arg-type]
             execution_backend=ForbiddenBackend(),
             codex_client=ForbiddenCodex(),
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
         ),
     )
 

@@ -622,7 +622,17 @@ class SuccessfulResearchClient:
                         expected_output="A formal proof or exact obstruction",
                     )
                     for index, family in enumerate(
-                        ("direct", "structural", "counterexample", "literature"), start=1
+                        (
+                            "direct",
+                            "structural",
+                            "counterexample",
+                            "literature",
+                            "probabilistic",
+                            "computational",
+                            "inductive",
+                            "algebraic",
+                        ),
+                        start=1,
                     )
                 ],
                 rationale="Independent mechanisms",
@@ -691,6 +701,109 @@ class OfflineIdentifierVerifier:
         return SourceVerificationReport(records=records)
 
 
+class ContinuityResearchClient(SuccessfulResearchClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.coordinator_payloads: list[dict[str, Any]] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        if output_type is ResearchRoundPlan:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            self.coordinator_payloads.append(payload)
+            round_id = len(self.coordinator_payloads)
+            if round_id == 1:
+                families = ("direct", "structural", "counterexample", "literature")
+                assignments = [
+                    ResearchAssignment(
+                        id=f"route-{index}",
+                        approach_family=family,
+                        task=f"Investigate {family}",
+                        expected_output="formal content or an exact obstruction",
+                    )
+                    for index, family in enumerate(families, start=1)
+                ]
+            else:
+                assignments = [
+                    ResearchAssignment(
+                        id="continuity-synthesis",
+                        approach_family="continuity synthesis",
+                        task="Combine the surviving lemma and discharge the exact open gap",
+                        expected_output="a complete proof",
+                    )
+                ]
+            return ModelResult(
+                parsed=ResearchRoundPlan(
+                    round_id=round_id,
+                    assignments=assignments,
+                    rationale="Use the durable cross-round mathematical handoff.",
+                    candidate_packaging_recommended=False,
+                ),
+                response_id=f"continuity-plan-{round_id}",
+            )
+        if output_type is ResearchWorkerReport:
+            self.calls += 1
+            assignment = json.loads(request.input_text)["assignment"]
+            assignment_id = assignment["id"]
+            if assignment_id == "route-1":
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=["Lemma A establishes the finite reduction."],
+                    proof_content="Proof of Lemma A.",
+                    exact_gap="Prove the reduced boundary case.",
+                    sources=[],
+                    dependencies=["Boundary lemma B"],
+                    mechanism=assignment["task"],
+                )
+            elif assignment_id == "route-2":
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.REFUTED,
+                    formal_results=[],
+                    proof_content="The proposed strengthening fails.",
+                    exact_gap=None,
+                    sources=[],
+                    counterexamples=["A size-three object refutes the strengthening."],
+                    mechanism=assignment["task"],
+                )
+            elif assignment_id == "route-3":
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.BLOCKED,
+                    formal_results=[],
+                    proof_content="Reduction attempted.",
+                    exact_gap="Missing compactness lemma.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            elif assignment_id == "route-4":
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=["Lemma B proves the required boundary case."],
+                    proof_content="Proof of Lemma B.",
+                    exact_gap="Combine Lemmas A and B.",
+                    sources=[],
+                    dependencies=["Lemma A"],
+                    mechanism=assignment["task"],
+                )
+            else:
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.CANDIDATE_COMPLETE,
+                    formal_results=["The target follows from Lemmas A and B."],
+                    proof_content="Complete proof combining Lemmas A and B.",
+                    exact_gap=None,
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            return ModelResult(parsed=report, response_id=f"continuity-worker-{self.calls}")
+        return await super().generate_structured(request, output_type)
+
+
 def candidate_package() -> CandidateProofPackage:
     return CandidateProofPackage(
         exact_theorem="For every n, P n.",
@@ -711,6 +824,87 @@ def passing_audit() -> AuditVerdict:
         unresolved_obligations=[],
         target_matches=True,
     )
+
+
+def test_research_workflow_defaults_double_portfolio_and_capacity() -> None:
+    settings = ResearchWorkflowSettings()
+
+    assert settings.minimum_initial_assignments == 8
+    assert settings.maximum_concurrent_agents == 16
+    assert settings.maximum_research_subagents == 24
+    assert settings.maximum_assignments_per_round == 24
+
+
+@pytest.mark.asyncio
+async def test_research_orchestrator_receives_full_cross_round_continuity(
+    tmp_path: Path,
+) -> None:
+    client = ContinuityResearchClient()
+    compiled = compiled_problem()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled,
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_research_subagents=5,
+            maximum_assignments_per_round=4,
+            maximum_rounds=2,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.ACCEPTED
+    assert result.research_subagents_used == 5
+    assert len(client.coordinator_payloads) == 2
+    later = client.coordinator_payloads[1]
+    assert later["compiled_prompt"] == compiled.compiled_prompt
+    assert later["claim_contract"] == compiled.claim_contract.as_dict()
+    assert later["remaining_research_subagents"] == 1
+    assert later["maximum_assignments"] == 1
+    continuity = later["research_continuity"]
+    assert {route["assignment_id"] for route in continuity["promising_routes"]} == {
+        "route-1",
+        "route-4",
+    }
+    assert continuity["partial_results"]
+    assert continuity["ruled_out_directions"][0]["assignment_id"] == "route-2"
+    assert continuity["blocked_routes"][0]["assignment_id"] == "route-3"
+    assert "A size-three object refutes the strengthening." in continuity["counterexamples"]
+    assert "Boundary lemma B" in continuity["dependencies"]
+    assert "Prove the reduced boundary case." in continuity["open_gaps"]
+    assert (tmp_path / "continuity.json").is_file()
+    assert (tmp_path / "rounds" / "1" / "continuity.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_total_research_subagent_limit_stops_before_another_round(
+    tmp_path: Path,
+) -> None:
+    client = ContinuityResearchClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=2,
+            maximum_research_subagents=4,
+            maximum_assignments_per_round=4,
+            maximum_rounds=3,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert result.research_subagents_used == 4
+    assert len(client.coordinator_payloads) == 1
+    assert result.continuity is not None
+    assert set(result.continuity.completed_assignment_ids) == {
+        "route-1",
+        "route-2",
+        "route-3",
+        "route-4",
+    }
 
 
 @pytest.mark.asyncio
@@ -876,7 +1070,17 @@ class RepairResearchClient(SuccessfulResearchClient):
                         expected_output="formal content",
                     )
                     for index, family in enumerate(
-                        ("direct", "structural", "counterexample", "literature"), start=1
+                        (
+                            "direct",
+                            "structural",
+                            "counterexample",
+                            "literature",
+                            "probabilistic",
+                            "computational",
+                            "inductive",
+                            "algebraic",
+                        ),
+                        start=1,
                     )
                 ]
             else:

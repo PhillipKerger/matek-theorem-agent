@@ -35,10 +35,15 @@ class AccountingModelClient:
         replay_completed: bool = True,
         cache_namespace: str | None = None,
         provider: Literal["codex", "api"] | None = None,
+        role: str | None = None,
     ) -> None:
+        self._source_delegate = delegate
         stage_factory = getattr(delegate, "for_stage", None)
         self._delegate = (
-            cast(ModelClient, stage_factory(stage, run_root=logger.run_root))
+            cast(
+                ModelClient,
+                stage_factory(stage, run_root=logger.run_root, role=role),
+            )
             if callable(stage_factory)
             else delegate
         )
@@ -47,11 +52,28 @@ class AccountingModelClient:
         self._budget = budget
         self._logger = logger
         self._replay_completed = replay_completed
+        self._role = role
         resolved_namespace = cache_namespace or logger.model_cache_namespace
         if not resolved_namespace.strip():
             raise ValueError("model cache namespace must not be blank")
         self._cache_namespace = resolved_namespace.strip()
         self._request_locks: dict[str, asyncio.Lock] = {}
+
+    def for_role(self, role: str) -> AccountingModelClient:
+        """Create a role-isolated model context sharing accounting and call journals."""
+
+        if not role.strip():
+            raise ValueError("model role must not be blank")
+        return type(self)(
+            self._source_delegate,
+            stage=self._stage,
+            budget=self._budget,
+            logger=self._logger,
+            replay_completed=self._replay_completed,
+            cache_namespace=self._cache_namespace,
+            provider=self._provider,
+            role=role.strip(),
+        )
 
     async def generate_structured(
         self,

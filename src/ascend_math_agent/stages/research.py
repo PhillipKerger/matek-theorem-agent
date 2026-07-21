@@ -172,6 +172,45 @@ class ApproachRegistry(BaseModel):
         existing.assignment_ids = list(dict.fromkeys([*existing.assignment_ids, assignment.id]))
 
 
+class ResearchContinuityRoute(BaseModel):
+    """One evidence-bearing route in the cross-round research handoff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    round_id: int
+    assignment_id: str
+    approach_family: str
+    status: WorkerStatus
+    mechanism: str
+    formal_results: list[str]
+    proof_content: str
+    exact_gap: str | None
+    assumptions: list[str]
+    counterexamples: list[str]
+    dependencies: list[str]
+
+
+class ResearchContinuityState(BaseModel):
+    """Durable, provider-independent mathematical handoff between coordinator rounds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    after_round: int
+    promising_routes: list[ResearchContinuityRoute]
+    partial_results: list[ResearchContinuityRoute]
+    ruled_out_directions: list[ResearchContinuityRoute]
+    blocked_routes: list[ResearchContinuityRoute]
+    open_gaps: list[str]
+    counterexamples: list[str]
+    dependencies: list[str]
+    audit_repair_obligations: list[str]
+    claims_requiring_counterexample_search: list[str]
+    lemmas_requiring_proof_completion: list[str]
+    retired_assignment_ids: list[str]
+    redirected_assignment_ids: list[str]
+    completed_assignment_ids: list[str]
+
+
 class LemmaDependency(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -293,12 +332,25 @@ class ResearchAcceptanceGate(BaseModel):
 
 
 class ResearchWorkflowSettings(BaseModel):
-    minimum_initial_assignments: int = Field(default=4, ge=4)
-    maximum_concurrent_agents: int = Field(default=8, ge=1)
+    minimum_initial_assignments: int = Field(default=8, ge=4)
+    maximum_concurrent_agents: int = Field(default=16, ge=1)
     maximum_rounds: int = Field(default=8, ge=1)
-    maximum_assignments_per_round: int = Field(default=12, ge=1)
+    maximum_research_subagents: int = Field(default=24, ge=4)
+    maximum_assignments_per_round: int = Field(default=24, ge=1)
     maximum_model_calls: int | None = Field(default=None, ge=1)
     run_complexity_audit: bool | None = None
+
+    @model_validator(mode="after")
+    def subagent_limits_cover_initial_portfolio(self) -> ResearchWorkflowSettings:
+        if self.maximum_research_subagents < self.minimum_initial_assignments:
+            raise ValueError(
+                "maximum_research_subagents cannot be less than minimum_initial_assignments"
+            )
+        if self.maximum_assignments_per_round < self.minimum_initial_assignments:
+            raise ValueError(
+                "maximum_assignments_per_round cannot be less than minimum_initial_assignments"
+            )
+        return self
 
 
 class ResearchResult(BaseModel):
@@ -312,6 +364,9 @@ class ResearchResult(BaseModel):
     unresolved_obligations: list[str] = Field(default_factory=list)
     strongest_result: str = ""
     repair_rounds: int = 0
+    research_subagents_assigned: int = 0
+    research_subagents_used: int = 0
+    continuity: ResearchContinuityState | None = None
     acceptance_gate: ResearchAcceptanceGate | None = None
     artifacts: ArtifactManifest = Field(default_factory=ArtifactManifest)
     calls: CallManifest
@@ -345,12 +400,14 @@ class _TrackedModelClient:
         input_text: str,
         settings: ModelSettings,
         output_type: type[TModel],
+        client: ModelClient | None = None,
     ) -> ModelResult[TModel]:
         if not self.can_call():
             raise _ResearchBudgetExhausted
         # Increment before yielding so concurrent audit/worker calls cannot oversubscribe.
         self.calls += 1
-        result = await self.client.generate_structured(
+        selected_client = client or self.client
+        result = await selected_client.generate_structured(
             ModelRequest(
                 instructions=instructions,
                 input_text=input_text,
@@ -364,6 +421,11 @@ class _TrackedModelClient:
 
 class _ResearchBudgetExhausted(Exception):
     pass
+
+
+def _client_for_role(client: ModelClient, role: str) -> ModelClient:
+    role_factory = getattr(client, "for_role", None)
+    return role_factory(role) if callable(role_factory) else client
 
 
 def _read_prompt(path: Path | None, resource_name: str) -> str:
@@ -464,6 +526,11 @@ async def run_adaptive_research(
     }
 
     tracker = _TrackedModelClient(client, settings.maximum_model_calls)
+    coordinator_client = _client_for_role(client, "research-orchestrator")
+    worker_client = _client_for_role(client, "research-worker")
+    packager_client = _client_for_role(client, "candidate-packager")
+    auditor_client = _client_for_role(client, "research-auditor")
+    judge_client = _client_for_role(client, "research-final-judge")
     registry = ApproachRegistry()
     all_rounds: list[ResearchRoundPlan] = []
     all_reports: list[ResearchWorkerReport] = []
@@ -473,7 +540,108 @@ async def run_adaptive_research(
     final_judge_response_id = ""
     repair_obligations: list[str] = []
     repair_rounds = 0
+    research_subagents_assigned = 0
+    research_subagents_used = 0
+    launched_assignment_ids: set[str] = set()
+    assignment_index: dict[str, tuple[int, ResearchAssignment]] = {}
+    latest_continuity: ResearchContinuityState | None = None
     artifact_paths: dict[str, Path] = {}
+
+    def build_continuity(after_round: int) -> ResearchContinuityState:
+        routes: list[ResearchContinuityRoute] = []
+        for report in all_reports:
+            indexed = assignment_index.get(report.assignment_id)
+            if indexed is None:
+                raise StageValidationError(
+                    f"Cannot build research continuity for unknown assignment "
+                    f"{report.assignment_id!r}."
+                )
+            assigned_round, assignment = indexed
+            routes.append(
+                ResearchContinuityRoute(
+                    round_id=assigned_round,
+                    assignment_id=report.assignment_id,
+                    approach_family=assignment.approach_family,
+                    status=report.status,
+                    mechanism=report.mechanism or assignment.task,
+                    formal_results=report.formal_results,
+                    proof_content=report.proof_content,
+                    exact_gap=report.exact_gap,
+                    assumptions=report.assumptions,
+                    counterexamples=report.counterexamples,
+                    dependencies=report.dependencies,
+                )
+            )
+        return ResearchContinuityState(
+            after_round=after_round,
+            promising_routes=[
+                route
+                for route in routes
+                if route.status in {WorkerStatus.PROGRESS, WorkerStatus.CANDIDATE_COMPLETE}
+            ],
+            partial_results=[route for route in routes if route.formal_results],
+            ruled_out_directions=[
+                route for route in routes if route.status == WorkerStatus.REFUTED
+            ],
+            blocked_routes=[route for route in routes if route.status == WorkerStatus.BLOCKED],
+            open_gaps=list(
+                dict.fromkeys(
+                    [
+                        *(route.exact_gap for route in routes if route.exact_gap),
+                        *repair_obligations,
+                    ]
+                )
+            ),
+            counterexamples=list(
+                dict.fromkeys(
+                    counterexample for route in routes for counterexample in route.counterexamples
+                )
+            ),
+            dependencies=list(
+                dict.fromkeys(dependency for route in routes for dependency in route.dependencies)
+            ),
+            audit_repair_obligations=list(dict.fromkeys(repair_obligations)),
+            claims_requiring_counterexample_search=list(
+                dict.fromkeys(
+                    claim
+                    for plan in all_rounds
+                    for claim in plan.claims_requiring_counterexample_search
+                )
+            ),
+            lemmas_requiring_proof_completion=list(
+                dict.fromkeys(
+                    lemma for plan in all_rounds for lemma in plan.lemmas_requiring_proof_completion
+                )
+            ),
+            retired_assignment_ids=list(
+                dict.fromkeys(
+                    assignment_id
+                    for plan in all_rounds
+                    for assignment_id in plan.retire_assignment_ids
+                )
+            ),
+            redirected_assignment_ids=list(
+                dict.fromkeys(
+                    assignment_id
+                    for plan in all_rounds
+                    for assignment_id in plan.redirect_assignment_ids
+                )
+            ),
+            completed_assignment_ids=[route.assignment_id for route in routes],
+        )
+
+    def persist_continuity(after_round: int) -> ResearchContinuityState:
+        nonlocal latest_continuity
+        latest_continuity = build_continuity(after_round)
+        artifact_paths["continuity"] = atomic_write_json(
+            destination / "continuity.json", latest_continuity
+        )
+        if after_round > 0:
+            artifact_paths[f"round_{after_round}_continuity"] = atomic_write_json(
+                rounds_dir / str(after_round) / "continuity.json",
+                latest_continuity,
+            )
+        return latest_continuity
 
     async def finish(
         outcome: ResearchOutcome,
@@ -483,6 +651,8 @@ async def run_adaptive_research(
         acceptance_gate: ResearchAcceptanceGate | None = None,
     ) -> ResearchResult:
         artifact_paths["registry"] = atomic_write_json(destination / "registry.json", registry)
+        final_round = all_rounds[-1].round_id if all_rounds else 0
+        persist_continuity(final_round)
         result = ResearchResult(
             outcome=outcome,
             rounds=all_rounds,
@@ -494,6 +664,9 @@ async def run_adaptive_research(
             unresolved_obligations=list(dict.fromkeys(obligations or [])),
             strongest_result=strongest_result,
             repair_rounds=repair_rounds,
+            research_subagents_assigned=research_subagents_assigned,
+            research_subagents_used=research_subagents_used,
+            continuity=latest_continuity,
             acceptance_gate=acceptance_gate,
             artifacts=ArtifactManifest(),
             calls=CallManifest(
@@ -516,6 +689,18 @@ async def run_adaptive_research(
 
         progress(Ascension.PLAN_RESEARCH, f"Planning research round {round_number}.")
 
+        remaining_subagents = settings.maximum_research_subagents - research_subagents_assigned
+        if remaining_subagents <= 0:
+            return await finish(
+                ResearchOutcome.BUDGET_EXHAUSTED,
+                obligations=repair_obligations
+                or ["Configured research-subagent limit was exhausted without acceptance."],
+            )
+        maximum_round_assignments = min(
+            settings.maximum_assignments_per_round,
+            remaining_subagents,
+        )
+
         if round_number == 1:
             coordinator_input = json.dumps(
                 {
@@ -523,23 +708,31 @@ async def run_adaptive_research(
                     "claim_contract": compiled.claim_contract.as_dict(),
                     "round_id": round_number,
                     "minimum_materially_diverse_assignments": settings.minimum_initial_assignments,
-                    "maximum_assignments": settings.maximum_assignments_per_round,
+                    "maximum_assignments": maximum_round_assignments,
+                    "remaining_research_subagents": remaining_subagents,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
         else:
-            # Later planning is deliberately based on visible reports, registry and audit
+            # Every fresh coordinator context receives the governing prompt and claim contract.
+            # Later planning additionally uses only visible reports, registry state, and audit
             # obligations; no hidden worker scratchpads or confidence scores are supplied.
             coordinator_input = json.dumps(
                 {
+                    "compiled_prompt": compiled.compiled_prompt,
+                    "claim_contract": compiled.claim_contract.as_dict(),
                     "round_id": round_number,
                     "approach_registry": registry.model_dump(mode="json"),
+                    "research_continuity": (
+                        latest_continuity or build_continuity(round_number - 1)
+                    ).model_dump(mode="json"),
                     "visible_worker_reports": [
                         report.model_dump(mode="json") for report in all_reports
                     ],
                     "repair_obligations": repair_obligations,
-                    "maximum_assignments": settings.maximum_assignments_per_round,
+                    "maximum_assignments": maximum_round_assignments,
+                    "remaining_research_subagents": remaining_subagents,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -549,6 +742,7 @@ async def run_adaptive_research(
             input_text=coordinator_input,
             settings=coordinator_model,
             output_type=ResearchRoundPlan,
+            client=coordinator_client,
         )
 
         initial_capacity = settings.minimum_initial_assignments
@@ -568,9 +762,9 @@ async def run_adaptive_research(
             expected_round=round_number,
             minimum_assignments=minimum,
             maximum_assignments=(
-                min(settings.maximum_assignments_per_round, initial_capacity)
+                min(maximum_round_assignments, initial_capacity)
                 if round_number == 1 and budget_limited_initial
-                else settings.maximum_assignments_per_round
+                else maximum_round_assignments
             ),
             initial=round_number == 1,
         )
@@ -582,6 +776,13 @@ async def run_adaptive_research(
             plan = plan.model_copy(update={"assignments": plan.assignments[:initial_capacity]})
 
         all_rounds.append(plan)
+        research_subagents_assigned += len(plan.assignments)
+        for assignment in plan.assignments:
+            if assignment.id in assignment_index:
+                raise StageValidationError(
+                    f"Research assignment ID {assignment.id!r} was reused across rounds."
+                )
+            assignment_index[assignment.id] = (round_number, assignment)
         round_dir = ensure_stage_directory(rounds_dir / str(round_number))
         workers_dir = ensure_stage_directory(round_dir / "workers")
         artifact_paths[f"round_{round_number}_plan"] = atomic_write_json(
@@ -610,6 +811,10 @@ async def run_adaptive_research(
             worker_round: int = round_number,
             worker_output_dir: Path = workers_dir,
         ) -> ResearchWorkerReport:
+            nonlocal research_subagents_used
+            if assignment.id not in launched_assignment_ids:
+                launched_assignment_ids.add(assignment.id)
+                research_subagents_used += 1
             async with worker_semaphore:
                 worker_input = json.dumps(
                     {
@@ -626,6 +831,7 @@ async def run_adaptive_research(
                     input_text=worker_input,
                     settings=worker_model,
                     output_type=ResearchWorkerReport,
+                    client=worker_client,
                 )
                 if result.parsed.assignment_id != assignment.id:
                     raise StageValidationError(
@@ -706,6 +912,7 @@ async def run_adaptive_research(
                 input_text=package_input,
                 settings=worker_model,
                 output_type=CandidateProofPackage,
+                client=packager_client,
             )
             current_candidate = package_result.parsed
             imported_source_verification = await verify_source_ledger(
@@ -790,6 +997,7 @@ async def run_adaptive_research(
                         input_text=audit_input,
                         settings=auditor_model,
                         output_type=AuditVerdict,
+                        client=auditor_client,
                     )
                     return name, result.parsed
 
@@ -821,6 +1029,7 @@ async def run_adaptive_research(
                 input_text=judge_input,
                 settings=auditor_model,
                 output_type=FinalJudgeVerdict,
+                client=judge_client,
             )
             current_verdict = judge_result.parsed
             final_judge_response_id = judge_result.response_id
@@ -893,21 +1102,26 @@ async def run_adaptive_research(
             pending: set[asyncio.Task[ResearchWorkerReport]] = set()
 
             def launch_available(
-                *,
-                queue: list[ResearchAssignment] = queued_assignments,
-                active: set[asyncio.Task[ResearchWorkerReport]] = pending,
-                task_map: dict[
-                    asyncio.Task[ResearchWorkerReport], ResearchAssignment
-                ] = task_assignments,
-                maximum_concurrency: int = settings.maximum_concurrent_agents,
+                queue: list[ResearchAssignment],
+                active: set[asyncio.Task[ResearchWorkerReport]],
+                task_map: dict[asyncio.Task[ResearchWorkerReport], ResearchAssignment],
+                maximum_concurrency: int,
             ) -> None:
+                # ``asyncio.wait`` returns a new pending set on every pass. Read the
+                # current set passed by the caller rather than capturing the initial set
+                # as a default argument, or later active windows lose their assignments.
                 while queue and len(active) < maximum_concurrency:
                     assignment = queue.pop(0)
                     task = asyncio.create_task(run_worker(assignment))
                     task_map[task] = assignment
                     active.add(task)
 
-            launch_available()
+            launch_available(
+                queued_assignments,
+                pending,
+                task_assignments,
+                settings.maximum_concurrent_agents,
+            )
             completed_ids: set[str] = set()
             round_reports: list[ResearchWorkerReport] = []
             early_attempted = False
@@ -955,7 +1169,12 @@ async def run_adaptive_research(
                     or budget_limited_initial
                     or not tracker.can_call(6)
                 ):
-                    launch_available()
+                    launch_available(
+                        queued_assignments,
+                        pending,
+                        task_assignments,
+                        settings.maximum_concurrent_agents,
+                    )
                     continue
 
                 early_attempted = True
@@ -1027,13 +1246,14 @@ async def run_adaptive_research(
             await asyncio.gather(*live_tasks, return_exceptions=True)
             raise
         artifact_paths["registry"] = atomic_write_json(destination / "registry.json", registry)
+        persist_continuity(round_number)
 
         if budget_limited_initial:
             return await finish(
                 ResearchOutcome.BUDGET_EXHAUSTED,
                 obligations=[
-                    "Configured model-call budget could not support the required four-agent "
-                    "initial portfolio and downstream acceptance audits."
+                    "Configured model-call budget could not support the required initial "
+                    "portfolio and downstream acceptance audits."
                 ],
             )
         round_has_candidate = any(
@@ -1070,6 +1290,7 @@ async def run_adaptive_research(
             )
 
         repair_obligations = candidate_obligations
+        persist_continuity(round_number)
         if candidate_decision is None:
             budget_failure = any("budget" in item.casefold() for item in candidate_obligations)
             if budget_failure:
