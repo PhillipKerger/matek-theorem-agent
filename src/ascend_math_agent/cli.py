@@ -264,7 +264,9 @@ def _config_overrides(
     budget_usd: float | None = None,
     max_rounds: int | None = None,
     max_agents: int | None = None,
+    time_limit_minutes: int | None = None,
     no_lean: bool | None = None,
+    no_web_search: bool | None = None,
     sandbox: SandboxChoice | None = None,
     verbose: bool = False,
 ) -> dict[str, Any]:
@@ -273,10 +275,20 @@ def _config_overrides(
         "budget_usd": budget_usd,
         "max_rounds": max_rounds,
         "max_agents": max_agents,
+        "time_limit_minutes": time_limit_minutes,
         "no_lean": True if no_lean else None,
+        "no_web_search": True if no_web_search else None,
         "sandbox": sandbox.value if sandbox is not None else None,
         "logging": {"level": "DEBUG"} if verbose else None,
     }
+
+
+def _time_limit_display(config: AppConfig) -> str:
+    if config.backend.provider == "codex":
+        minutes = config.codex.limits.max_wall_clock_minutes
+        return "unlimited" if minutes is None else f"{minutes} minutes"
+    hours = config.limits.maximum_wall_clock_hours
+    return "unlimited" if hours is None else f"{hours * 60:g} minutes"
 
 
 def _show_migration_notice(config: AppConfig) -> None:
@@ -423,7 +435,18 @@ def run(
     budget_usd: float | None = typer.Option(None, "--budget-usd", min=0.0),
     max_rounds: int | None = typer.Option(None, "--max-rounds", min=1),
     max_agents: int | None = typer.Option(None, "--max-agents", min=1),
+    time_limit_minutes: int | None = typer.Option(
+        None,
+        "--time-limit-minutes",
+        min=1,
+        help="Limit total active run time across stages and resume attempts.",
+    ),
     no_lean: bool = typer.Option(False, "--no-lean"),
+    no_web_search: bool = typer.Option(
+        False,
+        "--no-web-search",
+        help="Disable live model search and ASCEND source-identifier HTTP lookups.",
+    ),
     research_only: bool = typer.Option(False, "--research-only"),
     sandbox: SandboxChoice | None = typer.Option(None, "--sandbox"),
     allow_project_edits: bool = typer.Option(False, "--allow-project-edits"),
@@ -440,7 +463,9 @@ def run(
             budget_usd=budget_usd,
             max_rounds=max_rounds,
             max_agents=max_agents,
+            time_limit_minutes=time_limit_minutes,
             no_lean=no_lean,
+            no_web_search=no_web_search,
             sandbox=sandbox,
             verbose=verbose,
         )
@@ -484,9 +509,12 @@ def run(
                     f"{config.models.prompt_compiler.reasoning_mode}/"
                     f"{config.models.prompt_compiler.reasoning_effort}"
                 ),
-                "web search": config.models.prompt_compiler.web_search,
+                "web search": (
+                    "enabled per stage" if config.web_search_enabled else "disabled globally"
+                ),
                 "research rounds": config.research.maximum_rounds,
                 "concurrent agents": config.research.maximum_concurrent_agents,
+                "total active time limit": _time_limit_display(config),
                 "usage limit": (
                     f"{config.codex.limits.max_agent_calls} Codex agent calls"
                     if config.backend.provider == "codex"
@@ -527,6 +555,8 @@ def run(
                         "budget_usd": budget_usd,
                         "max_rounds": max_rounds,
                         "max_agents": max_agents,
+                        "time_limit_minutes": time_limit_minutes,
+                        "no_web_search": no_web_search,
                         "sandbox": sandbox.value if sandbox else None,
                     },
                 ),
@@ -673,6 +703,17 @@ def resume(
     budget_usd: float | None = typer.Option(None, "--budget-usd", min=0.0),
     max_rounds: int | None = typer.Option(None, "--max-rounds", min=1),
     max_agents: int | None = typer.Option(None, "--max-agents", min=1),
+    time_limit_minutes: int | None = typer.Option(
+        None,
+        "--time-limit-minutes",
+        min=1,
+        help="Set the total active-time limit for this run, including prior attempts.",
+    ),
+    no_web_search: bool = typer.Option(
+        False,
+        "--no-web-search",
+        help="Disable web search for all remaining stages of this run.",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Confirm an explicit backend migration."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -697,6 +738,8 @@ def resume(
             budget_usd=budget_usd,
             max_rounds=max_rounds,
             max_agents=max_agents,
+            time_limit_minutes=time_limit_minutes,
+            no_web_search=no_web_search,
             verbose=verbose,
         )
         config = merge_config(frozen, overrides)

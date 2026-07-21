@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Research now audits the first worker claiming a complete proof immediately. Worker launch uses
+  a bounded active window, so routes that have not started consume no tokens when that proof
+  passes; failed early audits resume the remaining portfolio with their obligations preserved.
+- Added `--time-limit-minutes` to `run` and `resume` (plus
+  `ASCEND_TIME_LIMIT_MINUTES`) as one checkpointed active wall-clock allowance for the entire
+  workflow; the remaining allowance now cancels overlong in-flight model calls. The option is
+  disabled by default.
+- Added `--no-web-search` to `run` and `resume`, disabling live search across all model stages
+  and ASCEND's deterministic identifier HTTP resolver while preserving strict citation gates;
+  web search remains enabled by default.
 - Aligned generated prompts more visibly with the public Cycle Double Cover prompting pattern by
   requiring a compact, problem-specific research mandate before the expanded ASCEND protocol.
 - Added a standalone, compiled LaTeX methodology report covering orchestration, provenance,

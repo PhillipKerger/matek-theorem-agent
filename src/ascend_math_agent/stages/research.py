@@ -665,16 +665,367 @@ async def run_adaptive_research(
                 )
                 return parsed
 
+        async def evaluate_candidate(
+            *,
+            trigger_report: ResearchWorkerReport | None,
+            attempt_name: str,
+            candidate_semaphore: asyncio.Semaphore,
+        ) -> tuple[ResearchAcceptanceGate | None, list[str], FinalJudgeDecision | None]:
+            """Package and fully audit one visible candidate before more research."""
+
+            nonlocal current_candidate, current_audits, current_verdict, final_judge_response_id
+            if not tracker.can_call():
+                return None, ["Budget exhausted before candidate proof packaging."], None
+            progress(
+                Ascension.AUDIT_RESEARCH,
+                "Packaging the candidate solution for independent audits.",
+            )
+            visible_reports = [trigger_report] if trigger_report is not None else list(all_reports)
+            package_input = json.dumps(
+                {
+                    "claim_contract": compiled.claim_contract.as_dict(),
+                    "approach_registry": registry.model_dump(mode="json"),
+                    "visible_worker_reports": [
+                        report.model_dump(mode="json") for report in visible_reports
+                    ],
+                    "candidate_trigger_assignment_id": (
+                        trigger_report.assignment_id if trigger_report is not None else None
+                    ),
+                    "constraint": (
+                        "Package the triggering worker's claimed complete proof without "
+                        "substituting an unrelated route. Expose every unresolved step."
+                        if trigger_report is not None
+                        else "Package the strongest complete proof supported by all reports."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            package_result = await tracker.generate(
+                instructions=packager_prompt,
+                input_text=package_input,
+                settings=worker_model,
+                output_type=CandidateProofPackage,
+            )
+            current_candidate = package_result.parsed
+            imported_source_verification = await verify_source_ledger(
+                [theorem.as_source_entry() for theorem in current_candidate.imported_theorems],
+                provider_identifiers=tool_metadata_source_identifiers(package_result.tool_metadata),
+                verifier=source_verifier,
+            )
+            for theorem in current_candidate.imported_theorems:
+                theorem.verified = bool(
+                    set(theorem.identifiers).intersection(
+                        imported_source_verification.verified_identifiers
+                    )
+                )
+                if not theorem.verified:
+                    current_candidate.unresolved_items.append(
+                        f"Imported theorem {theorem.name!r} is not independently verified."
+                    )
+            current_candidate.unresolved_items = list(
+                dict.fromkeys(current_candidate.unresolved_items)
+            )
+            attempt_dir = ensure_stage_directory(candidate_dir / "attempts" / attempt_name)
+            artifact_paths[f"candidate_attempt_{attempt_name}"] = atomic_write_json(
+                attempt_dir / "package.json", current_candidate
+            )
+            artifact_paths[f"candidate_attempt_{attempt_name}_proof"] = atomic_write_text(
+                attempt_dir / "proof.md", current_candidate.full_proof
+            )
+            artifact_paths[f"candidate_attempt_{attempt_name}_source_verification"] = (
+                atomic_write_json(
+                    attempt_dir / "source_verification.json", imported_source_verification
+                )
+            )
+            artifact_paths["candidate_package"] = atomic_write_json(
+                candidate_dir / "package.json", current_candidate
+            )
+            artifact_paths["candidate_proof"] = atomic_write_text(
+                candidate_dir / "proof.md", current_candidate.full_proof
+            )
+            artifact_paths["candidate_dependency_graph"] = atomic_write_json(
+                candidate_dir / "dependency_graph.json",
+                [
+                    dependency.model_dump(mode="json")
+                    for dependency in current_candidate.lemma_dependency_graph
+                ],
+            )
+
+            current_audits = {}
+            current_verdict = None
+            final_judge_response_id = ""
+            if current_candidate.unresolved_items:
+                return None, list(current_candidate.unresolved_items), None
+
+            required_audits = list(audit_names)
+            run_complexity = (
+                settings.run_complexity_audit
+                if settings.run_complexity_audit is not None
+                else current_candidate.quantitative_or_algorithmic
+            )
+            if run_complexity:
+                required_audits.append("complexity")
+            calls_needed = len(required_audits) + 1
+            if not tracker.can_call(calls_needed):
+                return (
+                    None,
+                    ["Budget cannot fund all mandatory independent audits and final judge."],
+                    None,
+                )
+
+            audit_input = json.dumps(
+                {
+                    "claim_contract": compiled.claim_contract.as_dict(),
+                    "candidate_package": current_candidate.model_dump(mode="json"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+
+            async def run_audit(name: str) -> tuple[str, AuditVerdict]:
+                async with candidate_semaphore:
+                    result = await tracker.generate(
+                        instructions=audit_instructions[name],
+                        input_text=audit_input,
+                        settings=auditor_model,
+                        output_type=AuditVerdict,
+                    )
+                    return name, result.parsed
+
+            audit_pairs = await asyncio.gather(*(run_audit(name) for name in required_audits))
+            current_audits = dict(audit_pairs)
+            audit_attempt_dir = ensure_stage_directory(audits_dir / "attempts" / attempt_name)
+            for name, audit in current_audits.items():
+                artifact_paths[f"audit_{attempt_name}_{name}"] = atomic_write_json(
+                    audit_attempt_dir / f"{name}.json", audit
+                )
+                artifact_paths[f"audit_{name}"] = atomic_write_json(
+                    audits_dir / f"{name}.json", audit
+                )
+
+            judge_input = json.dumps(
+                {
+                    "claim_contract": compiled.claim_contract.as_dict(),
+                    "candidate_package": current_candidate.model_dump(mode="json"),
+                    "independent_audits": {
+                        name: audit.model_dump(mode="json")
+                        for name, audit in current_audits.items()
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            judge_result = await tracker.generate(
+                instructions=judge_prompt,
+                input_text=judge_input,
+                settings=auditor_model,
+                output_type=FinalJudgeVerdict,
+            )
+            current_verdict = judge_result.parsed
+            final_judge_response_id = judge_result.response_id
+            artifact_paths[f"verdict_{attempt_name}"] = atomic_write_json(
+                attempt_dir / "verdict.json", current_verdict
+            )
+            artifact_paths["verdict"] = atomic_write_json(
+                destination / "verdict.json", current_verdict
+            )
+
+            audit_obligations = [
+                obligation
+                for audit in current_audits.values()
+                for obligation in audit.unresolved_obligations
+            ]
+            failed_audits = [
+                name
+                for name, audit in current_audits.items()
+                if audit.verdict != AuditDecision.PASS
+                or not audit.target_matches
+                or audit.unresolved_obligations
+            ]
+            if current_verdict.verdict == FinalJudgeDecision.ACCEPTED:
+                inconsistent = [
+                    *current_candidate.unresolved_items,
+                    *audit_obligations,
+                    *current_verdict.unresolved_obligations,
+                ]
+                if failed_audits or inconsistent:
+                    return (
+                        None,
+                        [
+                            *(f"Mandatory audit did not pass: {name}" for name in failed_audits),
+                            *inconsistent,
+                        ],
+                        current_verdict.verdict,
+                    )
+                return (
+                    ResearchAcceptanceGate(
+                        accepted=True,
+                        candidate_sha256=sha256_json(current_candidate),
+                        claim_contract_sha256=sha256_text(
+                            json.dumps(
+                                compiled.claim_contract.as_dict(),
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            )
+                        ),
+                        mandatory_audits=required_audits,
+                        final_judge_response_id=final_judge_response_id,
+                    ),
+                    [],
+                    current_verdict.verdict,
+                )
+            obligations = list(
+                dict.fromkeys(
+                    [
+                        *current_verdict.unresolved_obligations,
+                        *audit_obligations,
+                        *(f"Repair failed {name} audit." for name in failed_audits),
+                        *current_verdict.reasons,
+                    ]
+                )
+            )
+            return None, obligations, current_verdict.verdict
+
         try:
-            reports = await asyncio.gather(*(run_worker(item) for item in plan.assignments))
+            queued_assignments = list(plan.assignments)
+            task_assignments: dict[asyncio.Task[ResearchWorkerReport], ResearchAssignment] = {}
+            pending: set[asyncio.Task[ResearchWorkerReport]] = set()
+
+            def launch_available(
+                *,
+                queue: list[ResearchAssignment] = queued_assignments,
+                active: set[asyncio.Task[ResearchWorkerReport]] = pending,
+                task_map: dict[
+                    asyncio.Task[ResearchWorkerReport], ResearchAssignment
+                ] = task_assignments,
+                maximum_concurrency: int = settings.maximum_concurrent_agents,
+            ) -> None:
+                while queue and len(active) < maximum_concurrency:
+                    assignment = queue.pop(0)
+                    task = asyncio.create_task(run_worker(assignment))
+                    task_map[task] = assignment
+                    active.add(task)
+
+            launch_available()
+            completed_ids: set[str] = set()
+            round_reports: list[ResearchWorkerReport] = []
+            early_attempted = False
+
+            def record_finished(
+                tasks: set[asyncio.Task[ResearchWorkerReport]],
+                *,
+                round_plan: ResearchRoundPlan = plan,
+                task_map: dict[
+                    asyncio.Task[ResearchWorkerReport], ResearchAssignment
+                ] = task_assignments,
+                seen_ids: set[str] = completed_ids,
+                collected_reports: list[ResearchWorkerReport] = round_reports,
+            ) -> list[ResearchWorkerReport]:
+                reports: list[ResearchWorkerReport] = []
+                ordered = sorted(
+                    tasks, key=lambda task: round_plan.assignments.index(task_map[task])
+                )
+                for task in ordered:
+                    report = task.result()
+                    if report.assignment_id in seen_ids:
+                        continue
+                    assignment = task_map[task]
+                    seen_ids.add(report.assignment_id)
+                    reports.append(report)
+                    collected_reports.append(report)
+                    all_reports.append(report)
+                    registry.update(assignment, report)
+                return reports
+
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                newly_finished = record_finished(done)
+                trigger = next(
+                    (
+                        report
+                        for report in newly_finished
+                        if report.status == WorkerStatus.CANDIDATE_COMPLETE
+                    ),
+                    None,
+                )
+                if (
+                    trigger is None
+                    or early_attempted
+                    or budget_limited_initial
+                    or not tracker.can_call(6)
+                ):
+                    launch_available()
+                    continue
+
+                early_attempted = True
+                interrupted = list(pending)
+                for task in interrupted:
+                    task.cancel()
+                interrupted_results = await asyncio.gather(*interrupted, return_exceptions=True)
+                retry_assignments: list[ResearchAssignment] = list(queued_assignments)
+                queued_assignments.clear()
+                finished_during_stop: set[asyncio.Task[ResearchWorkerReport]] = set()
+                for task, result in zip(interrupted, interrupted_results, strict=True):
+                    if isinstance(result, ResearchWorkerReport):
+                        finished_during_stop.add(task)
+                    elif isinstance(result, asyncio.CancelledError):
+                        retry_assignments.append(task_assignments[task])
+                    elif isinstance(result, BaseException):
+                        raise result
+                record_finished(finished_during_stop)
+                pending.clear()
+
+                gate, early_obligations, _ = await evaluate_candidate(
+                    trigger_report=trigger,
+                    attempt_name=f"{round_number}-early",
+                    candidate_semaphore=semaphore,
+                )
+                if gate is not None:
+                    assert current_candidate is not None
+                    artifact_paths["registry"] = atomic_write_json(
+                        destination / "registry.json", registry
+                    )
+                    return await finish(
+                        ResearchOutcome.ACCEPTED,
+                        strongest_result=(
+                            current_verdict.strongest_result
+                            if current_verdict is not None
+                            else current_candidate.exact_theorem
+                        ),
+                        acceptance_gate=gate,
+                    )
+
+                repair_obligations = early_obligations
+                if retry_assignments:
+                    retry_tasks = {
+                        asyncio.create_task(run_worker(assignment)): assignment
+                        for assignment in retry_assignments
+                    }
+                    task_assignments.update(retry_tasks)
+                    retry_done = await asyncio.gather(*retry_tasks, return_exceptions=True)
+                    finished_retries: set[asyncio.Task[ResearchWorkerReport]] = set()
+                    for task, result in zip(retry_tasks, retry_done, strict=True):
+                        if isinstance(result, ResearchWorkerReport):
+                            finished_retries.add(task)
+                        elif isinstance(result, BaseException):
+                            raise result
+                    record_finished(finished_retries)
         except _ResearchBudgetExhausted:
+            live_tasks = [task for task in task_assignments if not task.done()]
+            for task in live_tasks:
+                task.cancel()
+            await asyncio.gather(*live_tasks, return_exceptions=True)
             return await finish(
                 ResearchOutcome.BUDGET_EXHAUSTED,
                 obligations=["Model-call budget exhausted during a worker batch."],
             )
-        all_reports.extend(reports)
-        for assignment, report in zip(plan.assignments, reports, strict=True):
-            registry.update(assignment, report)
+        except BaseException:
+            live_tasks = [task for task in task_assignments if not task.done()]
+            for task in live_tasks:
+                task.cancel()
+            await asyncio.gather(*live_tasks, return_exceptions=True)
+            raise
         artifact_paths["registry"] = atomic_write_json(destination / "registry.json", registry)
 
         if budget_limited_initial:
@@ -685,7 +1036,14 @@ async def run_adaptive_research(
                     "initial portfolio and downstream acceptance audits."
                 ],
             )
-        if plan.stop_recommended and not plan.candidate_packaging_recommended:
+        round_has_candidate = any(
+            report.status == WorkerStatus.CANDIDATE_COMPLETE for report in round_reports
+        )
+        if (
+            plan.stop_recommended
+            and not plan.candidate_packaging_recommended
+            and not round_has_candidate
+        ):
             reason = plan.stop_reason or "Coordinator recommended a budget-aware stop."
             outcome = (
                 ResearchOutcome.BUDGET_EXHAUSTED
@@ -693,198 +1051,16 @@ async def run_adaptive_research(
                 else ResearchOutcome.PARTIAL
             )
             return await finish(outcome, obligations=repair_obligations or [reason])
-        if not plan.candidate_packaging_recommended:
+        if not plan.candidate_packaging_recommended and not round_has_candidate:
             continue
-
-        if not tracker.can_call():
-            return await finish(
-                ResearchOutcome.BUDGET_EXHAUSTED,
-                obligations=["Budget exhausted before candidate proof packaging."],
-            )
-        progress(
-            Ascension.AUDIT_RESEARCH,
-            "Packaging the candidate solution for independent audits.",
+        gate, candidate_obligations, candidate_decision = await evaluate_candidate(
+            trigger_report=None,
+            attempt_name=str(round_number),
+            candidate_semaphore=semaphore,
         )
-        package_input = json.dumps(
-            {
-                "claim_contract": compiled.claim_contract.as_dict(),
-                "approach_registry": registry.model_dump(mode="json"),
-                "visible_worker_reports": [
-                    report.model_dump(mode="json") for report in all_reports
-                ],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        package_result = await tracker.generate(
-            instructions=packager_prompt,
-            input_text=package_input,
-            settings=worker_model,
-            output_type=CandidateProofPackage,
-        )
-        current_candidate = package_result.parsed
-        imported_source_verification = await verify_source_ledger(
-            [theorem.as_source_entry() for theorem in current_candidate.imported_theorems],
-            provider_identifiers=tool_metadata_source_identifiers(package_result.tool_metadata),
-            verifier=source_verifier,
-        )
-        for theorem in current_candidate.imported_theorems:
-            theorem.verified = bool(
-                set(theorem.identifiers).intersection(
-                    imported_source_verification.verified_identifiers
-                )
-            )
-            if not theorem.verified:
-                current_candidate.unresolved_items.append(
-                    f"Imported theorem {theorem.name!r} is not independently verified."
-                )
-        current_candidate.unresolved_items = list(dict.fromkeys(current_candidate.unresolved_items))
-        attempt_dir = ensure_stage_directory(candidate_dir / "attempts" / str(round_number))
-        artifact_paths[f"candidate_attempt_{round_number}"] = atomic_write_json(
-            attempt_dir / "package.json", current_candidate
-        )
-        artifact_paths[f"candidate_attempt_{round_number}_proof"] = atomic_write_text(
-            attempt_dir / "proof.md", current_candidate.full_proof
-        )
-        artifact_paths[f"candidate_attempt_{round_number}_source_verification"] = atomic_write_json(
-            attempt_dir / "source_verification.json", imported_source_verification
-        )
-        # The canonical candidate paths always contain the latest package, even when it is
-        # later rejected or returned for repair. Attempt directories preserve prior versions.
-        artifact_paths["candidate_package"] = atomic_write_json(
-            candidate_dir / "package.json", current_candidate
-        )
-        artifact_paths["candidate_proof"] = atomic_write_text(
-            candidate_dir / "proof.md", current_candidate.full_proof
-        )
-        artifact_paths["candidate_dependency_graph"] = atomic_write_json(
-            candidate_dir / "dependency_graph.json",
-            [
-                dependency.model_dump(mode="json")
-                for dependency in current_candidate.lemma_dependency_graph
-            ],
-        )
-
-        if current_candidate.unresolved_items:
-            repair_obligations = list(current_candidate.unresolved_items)
-            if round_number < settings.maximum_rounds:
-                repair_rounds += 1
-                continue
-            return await finish(
-                ResearchOutcome.PARTIAL,
-                obligations=current_candidate.unresolved_items,
-                strongest_result=current_candidate.exact_theorem,
-            )
-
-        required_audits = list(audit_names)
-        run_complexity = (
-            settings.run_complexity_audit
-            if settings.run_complexity_audit is not None
-            else current_candidate.quantitative_or_algorithmic
-        )
-        if run_complexity:
-            required_audits.append("complexity")
-        calls_needed = len(required_audits) + 1  # independent audits plus final judge
-        if not tracker.can_call(calls_needed):
-            return await finish(
-                ResearchOutcome.BUDGET_EXHAUSTED,
-                obligations=[
-                    "Budget cannot fund all mandatory independent audits and final judge."
-                ],
-                strongest_result=current_candidate.exact_theorem,
-            )
-
-        audit_input = json.dumps(
-            {
-                "claim_contract": compiled.claim_contract.as_dict(),
-                "candidate_package": current_candidate.model_dump(mode="json"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-
-        async def run_audit(
-            name: str,
-            *,
-            audit_semaphore: asyncio.Semaphore = semaphore,
-            audit_payload: str = audit_input,
-        ) -> tuple[str, AuditVerdict]:
-            async with audit_semaphore:
-                result = await tracker.generate(
-                    instructions=audit_instructions[name],
-                    input_text=audit_payload,
-                    settings=auditor_model,
-                    output_type=AuditVerdict,
-                )
-                return name, result.parsed
-
-        audit_pairs = await asyncio.gather(*(run_audit(name) for name in required_audits))
-        current_audits = dict(audit_pairs)
-        for name, audit in current_audits.items():
-            artifact_paths[f"audit_{name}"] = atomic_write_json(audits_dir / f"{name}.json", audit)
-
-        judge_input = json.dumps(
-            {
-                "claim_contract": compiled.claim_contract.as_dict(),
-                "candidate_package": current_candidate.model_dump(mode="json"),
-                "independent_audits": {
-                    name: audit.model_dump(mode="json") for name, audit in current_audits.items()
-                },
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        judge_result = await tracker.generate(
-            instructions=judge_prompt,
-            input_text=judge_input,
-            settings=auditor_model,
-            output_type=FinalJudgeVerdict,
-        )
-        current_verdict = judge_result.parsed
-        final_judge_response_id = judge_result.response_id
-        artifact_paths["verdict"] = atomic_write_json(destination / "verdict.json", current_verdict)
-
-        audit_obligations = [
-            obligation
-            for audit in current_audits.values()
-            for obligation in audit.unresolved_obligations
-        ]
-        failed_audits = [
-            name
-            for name, audit in current_audits.items()
-            if audit.verdict != AuditDecision.PASS
-            or not audit.target_matches
-            or audit.unresolved_obligations
-        ]
-
-        if current_verdict.verdict == FinalJudgeDecision.ACCEPTED:
-            inconsistent_obligations = [
-                *current_candidate.unresolved_items,
-                *audit_obligations,
-                *current_verdict.unresolved_obligations,
-            ]
-            if failed_audits or inconsistent_obligations:
-                reasons = [
-                    *(f"Mandatory audit did not pass: {name}" for name in failed_audits),
-                    *inconsistent_obligations,
-                ]
-                return await finish(
-                    ResearchOutcome.REJECTED,
-                    obligations=list(reasons),
-                    strongest_result=current_verdict.strongest_result,
-                )
-
-            gate = ResearchAcceptanceGate(
-                accepted=True,
-                candidate_sha256=sha256_json(current_candidate),
-                claim_contract_sha256=sha256_text(
-                    json.dumps(
-                        compiled.claim_contract.as_dict(), sort_keys=True, ensure_ascii=False
-                    )
-                ),
-                mandatory_audits=required_audits,
-                final_judge_response_id=final_judge_response_id,
-            )
+        if gate is not None:
+            assert current_candidate is not None
+            assert current_verdict is not None
             return await finish(
                 ResearchOutcome.ACCEPTED,
                 strongest_result=(
@@ -893,16 +1069,29 @@ async def run_adaptive_research(
                 acceptance_gate=gate,
             )
 
-        if current_verdict.verdict == FinalJudgeDecision.REPAIRABLE:
-            repair_obligations = list(
-                dict.fromkeys(
-                    [
-                        *current_verdict.unresolved_obligations,
-                        *audit_obligations,
-                        *(f"Repair failed {name} audit." for name in failed_audits),
-                    ]
+        repair_obligations = candidate_obligations
+        if candidate_decision is None:
+            budget_failure = any("budget" in item.casefold() for item in candidate_obligations)
+            if budget_failure:
+                return await finish(
+                    ResearchOutcome.BUDGET_EXHAUSTED,
+                    obligations=candidate_obligations,
+                    strongest_result=(
+                        current_candidate.exact_theorem if current_candidate is not None else ""
+                    ),
                 )
+            if round_number < settings.maximum_rounds:
+                repair_rounds += 1
+                continue
+            return await finish(
+                ResearchOutcome.PARTIAL,
+                obligations=candidate_obligations,
+                strongest_result=(
+                    current_candidate.exact_theorem if current_candidate is not None else ""
+                ),
             )
+
+        if candidate_decision == FinalJudgeDecision.REPAIRABLE:
             if not repair_obligations:
                 raise StageValidationError(
                     "A repairable final verdict must include at least one exact obligation."
@@ -913,27 +1102,23 @@ async def run_adaptive_research(
             return await finish(
                 ResearchOutcome.PARTIAL,
                 obligations=repair_obligations,
-                strongest_result=current_verdict.strongest_result,
+                strongest_result=current_verdict.strongest_result if current_verdict else "",
             )
 
-        if current_verdict.verdict == FinalJudgeDecision.REJECTED:
+        if candidate_decision in {
+            FinalJudgeDecision.REJECTED,
+            FinalJudgeDecision.ACCEPTED,
+        }:
             return await finish(
                 ResearchOutcome.REJECTED,
-                obligations=[
-                    *current_verdict.unresolved_obligations,
-                    *audit_obligations,
-                    *current_verdict.reasons,
-                ],
-                strongest_result=current_verdict.strongest_result,
+                obligations=candidate_obligations,
+                strongest_result=current_verdict.strongest_result if current_verdict else "",
             )
 
         return await finish(
             ResearchOutcome.PARTIAL,
-            obligations=[
-                *current_verdict.unresolved_obligations,
-                *audit_obligations,
-            ],
-            strongest_result=current_verdict.strongest_result,
+            obligations=candidate_obligations,
+            strongest_result=current_verdict.strongest_result if current_verdict else "",
         )
 
     outcome = (

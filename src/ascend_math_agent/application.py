@@ -15,7 +15,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from .accounting import AccountingModelClient
-from .budget import BudgetTracker, UsageRecord
+from .budget import BudgetExceeded, BudgetTracker, UsageRecord
 from .codex_client import CodexClient
 from .config import AppConfig, ModelSettings, config_as_toml, load_config, merge_config
 from .execution.base import ExecutionBackend
@@ -34,7 +34,11 @@ from .reporting import (
     write_final_report,
 )
 from .resources import resource_path, resource_paths
-from .source_provenance import BoundedHttpSourceVerifier, IdentifierVerifier
+from .source_provenance import (
+    BoundedHttpSourceVerifier,
+    IdentifierVerifier,
+    WebDisabledSourceVerifier,
+)
 from .stages.compile_prompt import (
     EXPECTED_FRAMEWORK_SHA256,
     CompiledProblem,
@@ -225,6 +229,8 @@ class WorkflowRunner:
         self.dependencies = dependencies
 
     def _source_verifier(self, run_root: Path) -> IdentifierVerifier:
+        if not self.config.web_search_enabled:
+            return WebDisabledSourceVerifier()
         if self.dependencies.source_verifier is not None:
             return self.dependencies.source_verifier
         cache_path = run_root / "prompts" / "source_verification_cache.json"
@@ -255,11 +261,22 @@ class WorkflowRunner:
         # conversion. Preserve observed unknown-cost usage without applying the API
         # dollar gate, while enforcing conservative call/thread and wall-clock limits.
         codex_limits = self.config.codex.limits
+        configured_wall_limits = [
+            limit
+            for limit in (
+                self.config.limits.maximum_wall_clock_hours,
+                (
+                    codex_limits.max_wall_clock_minutes / 60
+                    if codex_limits.max_wall_clock_minutes is not None
+                    else None
+                ),
+            )
+            if limit is not None
+        ]
         effective_limits = self.config.limits.model_copy(
             update={
-                "maximum_wall_clock_hours": min(
-                    self.config.limits.maximum_wall_clock_hours,
-                    codex_limits.max_wall_clock_minutes / 60,
+                "maximum_wall_clock_hours": (
+                    min(configured_wall_limits) if configured_wall_limits else None
                 )
             }
         )
@@ -567,7 +584,11 @@ class WorkflowRunner:
                     if selected_provider == "codex"
                     else "per-stage API settings"
                 ),
-                "web_search_policy": ("enabled only for stages whose model settings require it"),
+                "web_search_policy": (
+                    "enabled only for stages whose model settings require it"
+                    if self.config.web_search_enabled
+                    else "disabled for all stages by configuration"
+                ),
             }
         backend_metadata.update(
             {
@@ -577,6 +598,11 @@ class WorkflowRunner:
                     "Codex CLI" if selected_provider == "codex" else "OpenAI Responses API"
                 ),
                 "automatic_fallback": False,
+                "web_search_policy": (
+                    "enabled only for stages whose model settings require it"
+                    if self.config.web_search_enabled
+                    else "disabled for all stages by configuration"
+                ),
             }
         )
         state.metadata["backend"] = backend_metadata
@@ -650,6 +676,22 @@ class WorkflowRunner:
             include_unscoped_usage=not bool(state.metadata.get("backend_history")),
         )
         logger.event("workflow.resumed", data={"run_id": state.run_id})
+        workflow_task = asyncio.current_task()
+        if workflow_task is None:  # pragma: no cover - _execute always runs in an event loop
+            raise WorkflowError("workflow execution has no owning asyncio task")
+        deadline_expired = False
+
+        def expire_workflow() -> None:
+            nonlocal deadline_expired
+            deadline_expired = True
+            workflow_task.cancel()
+
+        remaining_wall_clock = budget.remaining().wall_clock_seconds
+        deadline_handle = (
+            asyncio.get_running_loop().call_later(remaining_wall_clock, expire_workflow)
+            if remaining_wall_clock is not None
+            else None
+        )
         try:
             self._validate_stage_boundary(
                 state,
@@ -729,12 +771,28 @@ class WorkflowRunner:
             await self._lean_stage(state, store, logger, budget, compiled, manuscript, options)
             return WorkflowResult(state=state, report=self._report_stage(state, store, logger))
         except asyncio.CancelledError:
-            self._interrupt_current_stage(state, "workflow task was cancelled")
+            interruption_reason = (
+                "run-wide wall-clock limit reached"
+                if deadline_expired
+                else "workflow task was cancelled"
+            )
+            self._interrupt_current_stage(state, interruption_reason)
             _sync_paid_calls_from_usage(state, _usage_records(run_root))
             state.metadata["usage"] = budget.snapshot().model_dump(mode="json")
             self._sync_backend_metadata(state)
             store.save(state)
             self._report_stage(state, store, logger)
+            if deadline_expired:
+                snapshot = budget.snapshot()
+                configured_hours = budget.limits.maximum_wall_clock_hours
+                assert configured_hours is not None
+                limit = configured_hours * 3600
+                raise BudgetExceeded(
+                    "wall_clock",
+                    limit,
+                    max(snapshot.elapsed_seconds, limit + 1e-9),
+                    snapshot,
+                ) from None
             raise
         except Exception:
             # Stage methods checkpoint their own failures. Always leave a factual report,
@@ -746,6 +804,9 @@ class WorkflowRunner:
             if state.stages[StageName.REPORT].status is not StageStatus.SUCCEEDED:
                 self._report_stage(state, store, logger)
             raise
+        finally:
+            if deadline_handle is not None:
+                deadline_handle.cancel()
 
     def regenerate_report(self, project_root: Path, *, run_id: str | None = None) -> WorkflowResult:
         """Rebuild only deterministic report artifacts from an existing run.

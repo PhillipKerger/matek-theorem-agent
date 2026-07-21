@@ -632,8 +632,10 @@ class SuccessfulResearchClient:
             assignment = json.loads(request.input_text)["assignment"]
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
-            await asyncio.sleep(0.01)
-            self.active -= 1
+            try:
+                await asyncio.sleep(0.01)
+            finally:
+                self.active -= 1
             parsed = ResearchWorkerReport(
                 assignment_id=assignment["id"],
                 status=WorkerStatus.CANDIDATE_COMPLETE,
@@ -712,7 +714,7 @@ def passing_audit() -> AuditVerdict:
 
 
 @pytest.mark.asyncio
-async def test_adaptive_research_bounds_concurrency_and_requires_all_audits(
+async def test_first_complete_proof_is_audited_before_waiting_for_the_round(
     tmp_path: Path,
 ) -> None:
     client = SuccessfulResearchClient()
@@ -726,9 +728,12 @@ async def test_adaptive_research_bounds_concurrency_and_requires_all_audits(
     assert result.outcome == ResearchOutcome.ACCEPTED
     assert result.accepted_for_manuscript
     assert set(result.audits) == {"foundational", "domain", "hostile", "sources"}
-    assert len(result.registry.approaches) == 4
+    # The first two workers finish together under the two-agent semaphore. The
+    # remaining routes are stopped once that visible proof passes the full gate.
+    assert len(result.registry.approaches) == 2
     assert client.maximum_active == 2
-    assert result.calls.model_calls == 11
+    assert result.calls.model_calls == 9
+    assert (tmp_path / "candidate" / "attempts" / "1-early" / "package.json").is_file()
     assert (tmp_path / "candidate" / "package.json").is_file()
     assert (tmp_path / "verdict.json").is_file()
 
@@ -917,18 +922,22 @@ class RepairResearchClient(SuccessfulResearchClient):
 
 
 @pytest.mark.asyncio
-async def test_repairable_verdict_creates_an_adaptive_later_round(tmp_path: Path) -> None:
+async def test_failed_early_audit_uses_other_round_results_before_replanning(
+    tmp_path: Path,
+) -> None:
+    client = RepairResearchClient()
     result = await run_adaptive_research(
-        client=RepairResearchClient(),
+        client=client,
         compiled_problem=compiled_problem(),
         research_dir=tmp_path,
         workflow_settings=ResearchWorkflowSettings(maximum_rounds=2),
     )
     assert result.outcome == ResearchOutcome.ACCEPTED
-    assert result.repair_rounds == 1
-    assert [round_plan.round_id for round_plan in result.rounds] == [1, 2]
+    assert result.repair_rounds == 0
+    assert client.judgments == 2
+    assert [round_plan.round_id for round_plan in result.rounds] == [1]
+    assert (tmp_path / "candidate" / "attempts" / "1-early" / "package.json").is_file()
     assert (tmp_path / "candidate" / "attempts" / "1" / "package.json").is_file()
-    assert (tmp_path / "candidate" / "attempts" / "2" / "package.json").is_file()
 
 
 def accepted_research() -> ResearchResult:

@@ -15,3 +15,7 @@ or verification from a novel result.
 
 For each external source, provide a stable `source_id`, canonical identifiers, and prose evidence
 claims explicitly linked through `source_ids`. Leave verification to ASCEND.
+
+Use `candidate_complete` only when `proof_content` contains a full proof of the exact claim with
+no known gap. This status immediately pauses unfinished assignments and triggers the complete
+independent acceptance audit; an audit failure returns control to the remaining research routes.

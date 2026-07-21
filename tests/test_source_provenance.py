@@ -9,6 +9,7 @@ from ascend_math_agent.source_provenance import (
     BoundedHttpSourceVerifier,
     HttpResponse,
     SourceVerificationStatus,
+    WebDisabledSourceVerifier,
     canonical_identifiers,
 )
 
@@ -132,6 +133,15 @@ async def test_verifier_reports_partially_unavailable_identifier_set() -> None:
     }
     assert report.verified_identifiers == {"doi:10.5555/12345678"}
     assert report.warnings
+
+
+@pytest.mark.asyncio
+async def test_web_disabled_verifier_reports_unavailable_without_network() -> None:
+    report = await WebDisabledSourceVerifier().verify(["doi:10.5555/12345678", "arxiv:2401.01234"])
+
+    assert {record.status for record in report.records} == {SourceVerificationStatus.UNAVAILABLE}
+    assert all("disabled by configuration" in record.detail for record in report.records)
+    assert len(report.warnings) == 2
 
 
 def test_canonical_identifiers_split_combined_model_formatting() -> None:

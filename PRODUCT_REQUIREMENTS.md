@@ -41,6 +41,8 @@ formalization, and generates a reproducible final report.
 - Load `resources/prompts/research_prompt_framework.txt` verbatim.
 - Expected bundled SHA-256: `bd724294a261f4bc2e5da2191813e40c1340bc6ee039c753cb5c60276e7a512c`.
 - Use xhigh reasoning and web search by default.
+- Provide an explicit `--no-web-search` override that disables search across all model stages
+  and ASCEND's identifier-resolution HTTP calls without weakening citation gates.
 - Produce both a complete adapted prompt and structured metadata.
 - Front-load a compact research-mandate snapshot containing the exact target, boundary cases,
   insufficient outcomes, adaptive independent search, persistence, adversarial review, public
@@ -68,8 +70,14 @@ formalization, and generates a reproducible final report.
   counterexamples, dependencies, and status.
 - Support multiple rounds within cost, token, wall-clock, and agent limits.
 - Launch targeted counterexample and lemma-audit tasks when promising claims arise.
-- Produce a candidate proof package only when the coordinator believes the exact success
-  criterion is met.
+- Produce a candidate proof package when the coordinator recommends it or a worker explicitly
+  reports a full proof of the exact success criterion.
+- When a worker reports a complete proof, pause unfinished work and run the full independent
+  acceptance gate immediately. Advance only if it passes; otherwise resume remaining routes
+  with the audit obligations preserved.
+- Expose a total active wall-clock limit for the complete run, persist elapsed time across resume,
+  and use the remaining allowance to bound in-flight model calls. Keep this limit disabled by
+  default and require explicit user configuration.
 
 ### FR-4 Research acceptance gate
 

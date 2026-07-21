@@ -92,6 +92,12 @@ ascend run problem.md --no-lean
 # Research only; no manuscript or Lean formalization
 ascend run problem.md --research-only
 
+# Disable model web search and ASCEND's public-identifier HTTP lookups
+ascend run problem.md --no-web-search --research-only
+
+# Cap total active workflow time, including later resume attempts
+ascend run problem.md --time-limit-minutes 180
+
 # Resolve configuration and show the stage plan without model calls
 ascend run problem.md --dry-run
 ```
@@ -257,8 +263,9 @@ run and returns an actionable error; it cannot unexpectedly create Platform API 
 | `ascend report [RUN_ID] [--rewrite]` | Regenerate the deterministic report, optionally rewriting prose |
 | `ascend verify [RUN_ID]` | Re-run integrity, bibliography, LaTeX, and Lean checks without a model |
 
-Important `run` options include `--backend codex|api`, `--no-lean`, `--research-only`,
-`--dry-run`, `--sandbox native|docker`, and `--allow-project-edits`.
+Important `run` options include `--backend codex|api`, `--time-limit-minutes`,
+`--no-web-search`, `--no-lean`, `--research-only`, `--dry-run`,
+`--sandbox native|docker`, and `--allow-project-edits`.
 
 Ordinary `ascend doctor` sends no model prompt. `--deep` explicitly opts into one minimal live
 Codex structured-output probe and may consume Codex allowance. `--online` separately probes the
@@ -268,6 +275,21 @@ advanced API backend and requires `OPENAI_API_KEY`; it is not needed for Codex m
 explicitly requested provider change is recorded as a provenance event. Successfully returned
 calls are checkpointed atomically. `--force-stage STAGE` starts a new call-cache generation
 while retaining prior records as audit history; resuming a completed run is a no-op.
+
+Web search remains enabled by default. `ascend run --no-web-search` disables search for every
+model stage and disables ASCEND's separate DOI/arXiv/ISBN/URL resolver; the choice is frozen in
+the run configuration. `ascend resume RUN_ID --no-web-search` applies the same restriction to
+all remaining stages. `ASCEND_NO_WEB_SEARCH=true` is the environment equivalent. Because the
+bibliography gate must independently verify every citation, a full run intentionally stops at
+that gate when search is disabled; use `--research-only` when an entirely search-free workflow
+is desired. ASCEND never treats missing online evidence as verified.
+
+`--time-limit-minutes N` sets one active wall-clock allowance for the complete workflow. The
+same limit applies to Codex and API execution, elapsed active time is checkpointed across
+resume attempts, and an in-flight model call is cancelled when the remaining allowance expires.
+Paused time between commands is not charged. There is no time limit by default;
+`ASCEND_TIME_LIMIT_MINUTES=N` is equivalent to the CLI option. Existing configurations that set
+`codex.limits.max_wall_clock_minutes` or `api.limits.maximum_wall_clock_hours` remain supported.
 
 `report` is deterministic and offline by default. `--rewrite` is an explicit model call, but its
 prose cannot change authoritative statuses, hashes, links, or certificates. `verify` is always a
@@ -375,8 +397,11 @@ The image must already contain the configured LaTeX compiler, Lean/Lake toolchai
   resume the checkpointed run.
 - **Rate, allowance, or credit limit reached:** completed artifacts remain saved. Wait until
   access is available and run `ascend resume RUN_ID`; ASCEND will not switch to API billing.
+- **Run time limit reached:** completed calls and artifacts remain checkpointed. Increase the
+  frozen allowance explicitly with `ascend resume RUN_ID --time-limit-minutes N` if desired.
 - **Live search unavailable:** source-dependent stages stop rather than weakening bibliography
-  checks. Restore Codex search or network access, then resume.
+  checks. Restore Codex search or network access, then resume. To intentionally prohibit all
+  research-side web access, use `--no-web-search` (normally together with `--research-only`).
 - **Git repository required:** run ASCEND inside the intended Git project. Power users may set
   `codex.skip_git_repo_check = true`, but doing so weakens change provenance.
 - **Lean/Lake or LaTeX missing:** install the tools reported by `ascend doctor`, use `--no-lean`

@@ -319,10 +319,7 @@ def generate_run_id(
 def validate_run_id(run_id: str) -> str:
     """Validate and return a run ID suitable for use as one path component."""
 
-    if not (
-        _LEGACY_RUN_ID_PATTERN.fullmatch(run_id)
-        or _PROBLEM_RUN_ID_PATTERN.fullmatch(run_id)
-    ):
+    if not (_LEGACY_RUN_ID_PATTERN.fullmatch(run_id) or _PROBLEM_RUN_ID_PATTERN.fullmatch(run_id)):
         raise InvalidRunIdError(
             "run ID must match run-problem[-name]-YYYYMMDDTHHMMSSZ-xxxxxx "
             "(or the legacy YYYYMMDDTHHMMSSZ-name-xxxxxx format) using lowercase safe "

@@ -20,20 +20,24 @@ from ascend_math_agent.application import (
     WorkflowOptions,
     WorkflowRunner,
 )
+from ascend_math_agent.budget import BudgetExceeded
 from ascend_math_agent.cli import app
 from ascend_math_agent.codex_client import CodexRequest, CodexResult
 from ascend_math_agent.config import (
     AppConfig,
     BackendSettings,
     LeanSettings,
+    Limits,
     ManuscriptSettings,
     ResearchSettings,
+    merge_config,
 )
 from ascend_math_agent.execution.base import CommandRequest, CommandResult
 from ascend_math_agent.intake import ingest_problem
 from ascend_math_agent.models import ScientificStatus, StageName, StageStatus
 from ascend_math_agent.openai_client import ModelRequest, ModelResult
 from ascend_math_agent.progress import Ascension
+from ascend_math_agent.source_provenance import WebDisabledSourceVerifier
 from ascend_math_agent.stages.common import sha256_json, sha256_text
 from ascend_math_agent.stages.compile_prompt import (
     CompiledProblem,
@@ -235,6 +239,23 @@ class ResearchWorkflowModel:
             total_tokens=15,
             estimated_cost_usd=0.01,
         )
+
+
+class NeverReturningModel:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def generate_structured(
+        self,
+        request: ModelRequest,
+        output_type: type[Any],
+    ) -> ModelResult[Any]:
+        del request, output_type
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 class ForbiddenBackend:
@@ -799,6 +820,43 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     assert "revise the problem file" in report.lower()
 
 
+@pytest.mark.asyncio
+async def test_run_wide_deadline_interrupts_the_active_stage_and_writes_report(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    model = NeverReturningModel()
+    config = AppConfig(project_root=project)
+    config.api.limits = Limits(
+        maximum_cost_usd=1.0,
+        maximum_wall_clock_hours=0.00003,
+    )
+    runner = WorkflowRunner(
+        config,
+        WorkflowDependencies(
+            model_client=model,  # type: ignore[arg-type]
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+        ),
+    )
+
+    with pytest.raises(BudgetExceeded, match="wall_clock"):
+        await runner.run_new(
+            make_problem(project),
+            project,
+            options=WorkflowOptions(research_only=True),
+            environment_snapshot={"fixture": "offline"},
+        )
+
+    [run_root] = (project / ".ascend" / "runs").iterdir()
+    state = StateStore(run_root).load()
+    assert model.cancelled
+    assert state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.INTERRUPTED
+    assert state.stages[StageName.REPORT].status is StageStatus.SUCCEEDED
+    assert "wall-clock limit" in (state.stages[StageName.PROMPT_COMPILATION].error or "")
+
+
 def placeholder_recovery_runner(
     project: Path,
     model: PlaceholderRecoveryWorkflowModel,
@@ -954,7 +1012,7 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
             encoding="utf-8"
         )
     )
-    assert len(research["rounds"]) == 2
+    assert len(research["rounds"]) == 1
     assert bibliography.status is BibliographyStatus.VERIFIED
     assert all(entry.status is BibliographyEntryStatus.VERIFIED for entry in bibliography.entries)
     assert result.state.scientific_status is ScientificStatus.LEAN_VERIFIED
@@ -972,8 +1030,6 @@ async def test_complete_two_round_pipeline_is_lean_verified_and_resume_is_noop(
     assert [ascension for ascension, _ in updates] == [
         Ascension.FETCH_PROBLEM,
         Ascension.FORMULATE_PROMPT,
-        Ascension.PLAN_RESEARCH,
-        Ascension.RUN_RESEARCH,
         Ascension.PLAN_RESEARCH,
         Ascension.RUN_RESEARCH,
         Ascension.AUDIT_RESEARCH,
@@ -1254,11 +1310,11 @@ async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifac
 
     assert interrupted.stages[StageName.RESEARCH].status is StageStatus.INTERRUPTED
     assert interrupted.stages[StageName.REPORT].status is StageStatus.SUCCEEDED
-    assert len(worker_paths) == 4
-    assert len(initial_paid_ids) == 6  # compiler, coordinator, and four workers
-    assert len(initial_records) == 6
+    assert len(worker_paths) == 2
+    assert len(initial_paid_ids) == 4  # compiler, coordinator, and two visible workers
+    assert len(initial_records) == 4
     assert sum(output_type is ResearchRoundPlan for _, output_type in model.requests) == 1
-    assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 4
+    assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 2
     assert model.candidate_attempts == 1
 
     resumed = await runner.resume(project, run_id=interrupted.run_id)
@@ -1269,11 +1325,11 @@ async def test_resume_after_worker_batch_reuses_paid_calls_and_persisted_artifac
         ScientificStatus.RESEARCH_ACCEPTED_FOR_MANUSCRIPT.value
     )
     assert sum(output_type is ResearchRoundPlan for _, output_type in model.requests) == 1
-    assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 4
+    assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 2
     assert sum(output_type is CandidateProofPackage for _, output_type in model.requests) == 1
     assert model.candidate_attempts == 2
     assert set(initial_paid_ids).issubset(resumed.state.paid_call_ids)
-    assert len(resumed.state.paid_call_ids) == 12
+    assert len(resumed.state.paid_call_ids) == 10
     assert {
         relative: (run_root / relative).read_bytes() for relative in preserved_artifacts
     } == preserved_artifacts
@@ -1309,7 +1365,7 @@ async def test_rejected_full_run_stops_before_manuscript_and_lean(tmp_path: Path
         StageName.LEAN_VERIFICATION,
     ):
         assert result.state.stages[stage].status is StageStatus.SKIPPED
-    assert len(model.requests) == 12
+    assert len(model.requests) == 13
     assert backend.calls == 0
     assert codex.calls == 0
     assert result.report.report_json.is_file()
@@ -1338,8 +1394,8 @@ async def test_research_only_success_writes_complete_report(tmp_path: Path) -> N
     assert result.state.stages[StageName.REPORT].status is StageStatus.SUCCEEDED
     assert result.state.stages[StageName.MANUSCRIPT].status is StageStatus.SKIPPED
     assert result.state.stages[StageName.LEAN_VERIFICATION].status is StageStatus.SKIPPED
-    assert len(result.state.paid_call_ids) == 12
-    assert len(model.requests) == 12
+    assert len(result.state.paid_call_ids) == 10
+    assert len(model.requests) == 10
     assert backend.calls == 0
     assert codex.calls == 0
     assert "research/result.json" in result.report.report.artifacts
@@ -1559,6 +1615,70 @@ def test_cli_dry_run_creates_no_workspace_and_never_constructs_live_runner(
     assert result.exit_code == 0, result.output
     assert "Dry run complete" in result.output
     assert not (tmp_path / ".ascend").exists()
+
+
+def test_cli_no_web_search_is_global_and_default_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    problem = make_problem(tmp_path)
+
+    default = CliRunner().invoke(app, ["run", str(problem), "--dry-run"])
+    disabled = CliRunner().invoke(
+        app,
+        ["run", str(problem), "--no-web-search", "--dry-run"],
+    )
+
+    assert default.exit_code == 0, default.output
+    assert "unlimited" in default.output
+    assert disabled.exit_code == 0, disabled.output
+    assert "enabled per stage" in default.output
+    assert "disabled globally" in disabled.output
+    assert not (tmp_path / ".ascend").exists()
+
+
+def test_cli_time_limit_is_resolved_without_starting_a_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    problem = make_problem(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        ["run", str(problem), "--time-limit-minutes", "25", "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "total active time limit" in result.output
+    assert "25 minutes" in result.output
+    assert not (tmp_path / ".ascend").exists()
+
+
+def test_global_no_web_policy_reaches_every_model_stage_and_source_resolver(
+    tmp_path: Path,
+) -> None:
+    config = merge_config(AppConfig(project_root=tmp_path), {"no_web_search": True})
+    runner = WorkflowRunner(
+        config,
+        WorkflowDependencies(
+            model_client=ResearchWorkflowModel(accepted=False),  # type: ignore[arg-type]
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+        ),
+    )
+
+    assert all(
+        not runner._model_settings(category).web_search
+        for category in ("prompt", "research", "audit", "manuscript")
+    )
+    assert isinstance(
+        runner._source_verifier(tmp_path),
+        WebDisabledSourceVerifier,
+    )
 
 
 def test_cli_progress_uses_ascension_terminal_format() -> None:

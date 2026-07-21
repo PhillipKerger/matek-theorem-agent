@@ -83,6 +83,8 @@ Without a backend flag, a new installation uses Codex. Important options:
 --budget-usd FLOAT
 --max-rounds INTEGER
 --max-agents INTEGER
+--time-limit-minutes INTEGER
+--no-web-search
 --no-lean
 --research-only
 --sandbox native|docker
@@ -94,6 +96,18 @@ Without a backend flag, a new installation uses Codex. Important options:
 
 `--backend api` is explicit consent to use separately billed Platform API access. `--dry-run`
 validates and prints the resolved backend and stage plan without a model call.
+
+`--no-web-search` disables web search in every model stage and disables ASCEND's deterministic
+public-identifier HTTP resolver. Search remains enabled by default. The resolved setting is
+saved with the run; the same flag on `ascend resume` disables it for all remaining stages.
+Unverifiable citations remain unverified, so this option never weakens the bibliography gate and
+a fully offline run should normally also use `--research-only`.
+
+`--time-limit-minutes N` sets the total active wall-clock allowance across prompt compilation,
+research, manuscript work, and formal verification. Elapsed active time is stored in run state
+and carried into resume; time while ASCEND is not running is excluded. The remaining allowance
+also bounds each in-flight model call. There is no wall-clock limit by default.
+`ASCEND_TIME_LIMIT_MINUTES=N` is the environment form.
 
 Generated run directories use
 `run-<problem-file-stem>[-<run-name>]-<UTC-timestamp>-<random-suffix>`. The problem stem and

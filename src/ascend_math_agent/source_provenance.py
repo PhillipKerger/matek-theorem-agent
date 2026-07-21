@@ -73,6 +73,33 @@ class IdentifierVerifier(Protocol):
     ) -> SourceVerificationReport: ...
 
 
+class WebDisabledSourceVerifier:
+    """Return explicit unavailable evidence without performing network I/O."""
+
+    async def verify(
+        self,
+        identifiers: Collection[str],
+        *,
+        expected_title: str | None = None,
+    ) -> SourceVerificationReport:
+        del expected_title
+        records = [
+            SourceVerificationRecord(
+                identifier=identifier,
+                status=SourceVerificationStatus.UNAVAILABLE,
+                detail="web search is disabled by configuration",
+            )
+            for identifier in sorted(set(identifiers))
+        ]
+        return SourceVerificationReport(
+            records=records,
+            warnings=[
+                f"Verification unavailable for {record.identifier}: {record.detail}"
+                for record in records
+            ],
+        )
+
+
 @dataclass(frozen=True)
 class HttpResponse:
     status: int

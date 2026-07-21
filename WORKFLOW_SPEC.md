@@ -16,7 +16,7 @@ The compiler receives:
 - the complete problem text;
 - the verbatim framework;
 - instructions in `resources/prompts/prompt_compiler.md`;
-- web search;
+- web search (enabled by default, omitted under the global `--no-web-search` policy);
 - the structured output schema.
 
 It first decides whether the input uniquely identifies one mathematical target and exact success
@@ -94,6 +94,19 @@ partial_result_only
 
 A repairable verdict creates a new research round and includes exact obligations.
 
+Workers are admitted through a bounded active window rather than all being queued at the model
+backend at once. When a worker returns `candidate_complete`, ASCEND pauses the unfinished window,
+packages that specific proof, and immediately runs every mandatory independent audit plus the
+final judge. Acceptance cancels routes that never started and advances the workflow. If the gate
+does not pass, ASCEND resumes the remaining assignments, retains the failed audit and its exact
+obligations, and then evaluates the combined round normally. A worker's status alone is never
+treated as proof verification.
+
+The optional `--time-limit-minutes` allowance covers active execution across all stages and is
+carried across resume attempts. It bounds in-flight model calls as well as pre-call and stage
+boundary checks; paused time between CLI invocations is not counted. No wall-clock limit is
+applied by default.
+
 ## Stage 4 — Manuscript and bibliography
 
 The manuscript writer receives only the frozen accepted proof package, claim contract, audit
@@ -106,6 +119,12 @@ every substantive related-work characterization. It creates a correction plan. T
 may regenerate the manuscript, after which verification runs again. Limit cycles by config.
 
 Only a fully verified bibliography may proceed.
+
+`--no-web-search` also disables ASCEND's deterministic public-identifier HTTP resolver. Any
+evidence that cannot be established from persisted provider metadata remains unavailable; gates
+fail truthfully instead of treating offline status as verification. Consequently, a fully
+search-free invocation is primarily intended for `--research-only` runs and cannot bypass the
+verified-bibliography prerequisite for manuscript-to-Lean progression.
 
 Compile LaTeX deterministically. Undefined references, missing citations, compilation errors,
 or bibliography mismatches fail the stage.

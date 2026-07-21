@@ -114,7 +114,7 @@ class BudgetExceeded(RuntimeError):
 class BudgetRemaining:
     cost_usd: float
     tokens: int | None
-    wall_clock_seconds: float
+    wall_clock_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,9 +200,13 @@ class BudgetTracker:
                     if token_limit is None
                     else max(0, token_limit - snapshot.total_tokens - reserved_tokens)
                 ),
-                wall_clock_seconds=max(
-                    0.0,
-                    self.limits.maximum_wall_clock_hours * 3600 - snapshot.elapsed_seconds,
+                wall_clock_seconds=(
+                    None
+                    if self.limits.maximum_wall_clock_hours is None
+                    else max(
+                        0.0,
+                        self.limits.maximum_wall_clock_hours * 3600 - snapshot.elapsed_seconds,
+                    )
                 ),
             )
 
@@ -231,9 +235,10 @@ class BudgetTracker:
         projected_tokens = snapshot.total_tokens + additional_tokens
         if token_limit is not None and projected_tokens > token_limit:
             raise BudgetExceeded("tokens", token_limit, projected_tokens, snapshot)
-        wall_limit = self.limits.maximum_wall_clock_hours * 3600
-        if snapshot.elapsed_seconds > wall_limit:
-            raise BudgetExceeded("wall_clock", wall_limit, snapshot.elapsed_seconds, snapshot)
+        if self.limits.maximum_wall_clock_hours is not None:
+            wall_limit = self.limits.maximum_wall_clock_hours * 3600
+            if snapshot.elapsed_seconds > wall_limit:
+                raise BudgetExceeded("wall_clock", wall_limit, snapshot.elapsed_seconds, snapshot)
 
     def ensure_available(
         self,

@@ -18,10 +18,10 @@ skip_git_repo_check = false
 extra_args = []
 
 [codex.limits]
+# No wall-clock limit is imposed unless --time-limit-minutes or an explicit limit is set.
 max_agent_calls = 100
 max_research_rounds = 8
 max_codex_threads = 40
-max_wall_clock_minutes = 480
 max_formalization_iterations = 60
 
 [api]
@@ -89,7 +89,6 @@ approved_axioms = ["propext", "Classical.choice", "Quot.sound"]
 
 [api.limits]
 maximum_cost_usd = 150.0
-maximum_wall_clock_hours = 12
 maximum_api_retries = 4
 
 [logging]

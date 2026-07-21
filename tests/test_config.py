@@ -125,6 +125,66 @@ def test_no_lean_convenience_is_inverted(tmp_path: Path) -> None:
     assert not merge_config(AppConfig(), {"no_lean": True}).lean.enabled
 
 
+def test_no_web_search_disables_every_model_stage_and_defaults_remain_enabled(
+    tmp_path: Path,
+) -> None:
+    default = AppConfig()
+    assert default.web_search_enabled
+    assert all(
+        settings.web_search
+        for settings in (
+            default.models.prompt_compiler,
+            default.models.research,
+            default.models.audit,
+            default.models.manuscript,
+        )
+    )
+
+    cli_disabled = merge_config(default, {"no_web_search": True})
+    env_disabled = load_config(
+        project_root=tmp_path,
+        env={"ASCEND_NO_WEB_SEARCH": "true"},
+    )
+    for config in (cli_disabled, env_disabled):
+        assert not config.web_search_enabled
+        assert not any(
+            settings.web_search
+            for settings in (
+                config.models.prompt_compiler,
+                config.models.research,
+                config.models.audit,
+                config.models.manuscript,
+            )
+        )
+
+
+def test_no_web_search_override_requires_a_boolean() -> None:
+    with pytest.raises(ConfigError, match="no_web_search must be a boolean"):
+        merge_config(AppConfig(), {"no_web_search": "true"})
+
+
+def test_total_time_limit_updates_both_backends_and_environment(tmp_path: Path) -> None:
+    default = AppConfig()
+    configured = merge_config(AppConfig(), {"time_limit_minutes": 45})
+    from_environment = load_config(
+        project_root=tmp_path,
+        env={"ASCEND_TIME_LIMIT_MINUTES": "30"},
+    )
+
+    assert default.codex.limits.max_wall_clock_minutes is None
+    assert default.limits.maximum_wall_clock_hours is None
+    assert configured.codex.limits.max_wall_clock_minutes == 45
+    assert configured.limits.maximum_wall_clock_hours == 0.75
+    assert from_environment.codex.limits.max_wall_clock_minutes == 30
+    assert from_environment.limits.maximum_wall_clock_hours == 0.5
+
+
+@pytest.mark.parametrize("value", [0, True, "30"])
+def test_total_time_limit_rejects_invalid_cli_values(value: object) -> None:
+    with pytest.raises(ConfigError, match="time_limit_minutes"):
+        merge_config(AppConfig(), {"time_limit_minutes": value})
+
+
 def test_nested_and_dotted_cli_overrides_are_supported() -> None:
     nested = merge_config(AppConfig(), {"research": {"maximum_rounds": 3}})
     dotted = merge_config(AppConfig(), {"models.audit.web_search": False})

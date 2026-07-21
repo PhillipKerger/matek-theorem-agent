@@ -177,7 +177,11 @@ def ingest_problem(
             if backend_provider == "codex"
             else "per-stage API settings"
         ),
-        "web_search_policy": "enabled only for stages whose model settings require it",
+        "web_search_policy": (
+            "enabled only for stages whose model settings require it"
+            if config.web_search_enabled
+            else "disabled for all stages by configuration"
+        ),
     }
     # The immutable intake snapshot remains at input/config.resolved.toml for legacy
     # readers. The effective copy is the resume source and may change only during an

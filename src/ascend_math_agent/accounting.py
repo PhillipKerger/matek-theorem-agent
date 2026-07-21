@@ -8,7 +8,7 @@ from typing import Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
 
-from .budget import BudgetReservation, BudgetSnapshot, BudgetTracker, UsageRecord
+from .budget import BudgetExceeded, BudgetReservation, BudgetSnapshot, BudgetTracker, UsageRecord
 from .logging import ModelCallJournalError, ModelCallRecord, RunLogger
 from .openai_client import (
     ModelClient,
@@ -82,7 +82,7 @@ class AccountingModelClient:
 
             reservation = self._reserve(request)
             try:
-                result = await self._delegate.generate_structured(request, output_type)
+                result = await self._generate_with_time_limit(request, output_type)
             except BaseException:
                 if reservation is not None:
                     self._budget.release(reservation)
@@ -107,6 +107,39 @@ class AccountingModelClient:
 
             self._account_if_missing(record.usage, reservation=reservation)
             return self._result_from_record(record, output_type)
+
+    async def _generate_with_time_limit(
+        self,
+        request: ModelRequest,
+        output_type: type[T],
+    ) -> ModelResult[T]:
+        """Bound an in-flight model call by the run-wide remaining wall clock."""
+
+        remaining = self._budget.remaining().wall_clock_seconds
+        if remaining is None:
+            return await self._delegate.generate_structured(request, output_type)
+        if remaining <= 0:
+            snapshot = self._budget.snapshot()
+            configured_hours = self._budget.limits.maximum_wall_clock_hours
+            assert configured_hours is not None
+            limit = configured_hours * 3600
+            raise BudgetExceeded("wall_clock", limit, snapshot.elapsed_seconds, snapshot)
+        task = asyncio.create_task(self._delegate.generate_structured(request, output_type))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if task not in done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            snapshot = self._budget.snapshot()
+            configured_hours = self._budget.limits.maximum_wall_clock_hours
+            assert configured_hours is not None
+            limit = configured_hours * 3600
+            raise BudgetExceeded("wall_clock", limit, snapshot.elapsed_seconds, snapshot)
+        return task.result()
 
     def _reserve(self, request: ModelRequest) -> BudgetReservation | None:
         estimator = getattr(self._delegate, "estimate_request", None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, TypeVar
@@ -8,7 +9,7 @@ import pytest
 from pydantic import BaseModel
 
 from ascend_math_agent.accounting import AccountingModelClient
-from ascend_math_agent.budget import BudgetTracker, UsageRecord
+from ascend_math_agent.budget import BudgetExceeded, BudgetTracker, UsageRecord
 from ascend_math_agent.config import Limits, ModelSettings
 from ascend_math_agent.logging import (
     JournalCorruptionError,
@@ -57,6 +58,22 @@ class FakeClient:
         )
 
 
+class SlowClient:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[T]
+    ) -> ModelResult[T]:
+        del request, output_type
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("slow fixture should have been cancelled")
+
+
 async def test_accounting_decorator_logs_and_aggregates(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     (run_root / "logs").mkdir(parents=True)
@@ -77,6 +94,27 @@ async def test_accounting_decorator_logs_and_aggregates(tmp_path: Path) -> None:
     usage = json.loads((run_root / "logs" / "usage.jsonl").read_text().splitlines()[0])
     assert usage["usage"]["response_id"] == "resp_fixture"
     assert usage["usage"]["reasoning_tokens"] == 3
+
+
+async def test_run_wall_clock_cancels_an_in_flight_model_call(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    delegate = SlowClient()
+    budget = BudgetTracker(Limits(maximum_cost_usd=1.0, maximum_wall_clock_hours=0.00003))
+    client = AccountingModelClient(
+        delegate,
+        stage="research",
+        budget=budget,
+        logger=RunLogger(run_root),
+    )
+
+    with pytest.raises(BudgetExceeded, match="wall_clock"):
+        await client.generate_structured(
+            ModelRequest("research", "problem", ModelSettings()), Answer
+        )
+
+    assert delegate.cancelled
+    assert budget.snapshot().calls == 0
 
 
 async def test_model_call_is_atomically_checkpointed_and_replayed_after_restart(

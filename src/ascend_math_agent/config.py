@@ -109,7 +109,7 @@ class CodexLimits(_StrictSettings):
     max_agent_calls: int = Field(default=100, gt=0)
     max_research_rounds: int = Field(default=8, gt=0)
     max_codex_threads: int = Field(default=40, gt=0)
-    max_wall_clock_minutes: int = Field(default=480, gt=0)
+    max_wall_clock_minutes: int | None = Field(default=None, gt=0)
     max_formalization_iterations: int = Field(default=60, gt=0)
 
 
@@ -265,7 +265,7 @@ class LeanSettings(_StrictSettings):
 
 class Limits(_StrictSettings):
     maximum_cost_usd: float = Field(default=150.0, ge=0, allow_inf_nan=False)
-    maximum_wall_clock_hours: float = Field(default=12.0, gt=0, allow_inf_nan=False)
+    maximum_wall_clock_hours: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     maximum_api_retries: int = Field(default=4, ge=0)
     maximum_total_tokens: int | None = Field(default=None, gt=0)
 
@@ -420,6 +420,26 @@ class AppConfig(_StrictSettings):
     def research_settings(self) -> ResearchSettings:
         return self.research
 
+    @property
+    def web_search_enabled(self) -> bool:
+        """Whether any model stage is allowed to use live web search.
+
+        The CLI-wide ``--no-web-search`` override disables every stage setting.  This
+        aggregate is also the switch for ASCEND's deterministic identifier resolver,
+        so a globally offline run cannot make an unexpected HTTP lookup outside the
+        selected model adapter.
+        """
+
+        return any(
+            settings.web_search
+            for settings in (
+                self.models.prompt_compiler,
+                self.models.research,
+                self.models.audit,
+                self.models.manuscript,
+            )
+        )
+
 
 _CONVENIENCE_PATHS: dict[str, tuple[str, ...]] = {
     "BACKEND": ("backend", "provider"),
@@ -441,6 +461,19 @@ _CLI_PATHS: dict[str, tuple[str, ...]] = {
     "sandbox": ("lean", "execution_backend"),
     "no_lean": ("lean", "enabled"),
 }
+
+_MODEL_STAGE_NAMES = ("prompt_compiler", "research", "audit", "manuscript")
+
+
+def _set_all_web_search(target: dict[str, Any], enabled: bool) -> None:
+    for stage_name in _MODEL_STAGE_NAMES:
+        _set_nested(target, ("api", "models", stage_name, "web_search"), enabled)
+
+
+def _set_total_time_limit(target: dict[str, Any], minutes: int) -> None:
+    _set_nested(target, ("codex", "limits", "max_wall_clock_minutes"), minutes)
+    _set_nested(target, ("api", "limits", "maximum_wall_clock_hours"), minutes / 60.0)
+
 
 _LEGACY_API_SECTIONS = ("models", "limits", "pricing")
 
@@ -596,6 +629,21 @@ def environment_overrides(
             enabled = not _parse_environment_value(raw, False, key)
             _set_nested(overrides, ("lean", "enabled"), enabled)
             continue
+        if suffix == "NO_WEB_SEARCH":
+            disabled = _parse_environment_value(raw, False, key)
+            _set_all_web_search(overrides, not disabled)
+            continue
+        if suffix == "TIME_LIMIT_MINUTES":
+            try:
+                minutes = int(raw.strip())
+            except ValueError as exc:
+                raise ConfigError(
+                    f"invalid value for environment variable {key}: expected an integer"
+                ) from exc
+            if minutes < 1:
+                raise ConfigError(f"invalid value for environment variable {key}: must be >= 1")
+            _set_total_time_limit(overrides, minutes)
+            continue
         path = _CONVENIENCE_PATHS.get(suffix) or flat_paths.get(suffix)
         if path is None:
             if "__" not in suffix:
@@ -605,7 +653,16 @@ def environment_overrides(
             path = tuple(part.lower() for part in suffix.split("__") if part)
         path = _v2_path(path)
         expected = _lookup_template(template, path)
-        _set_nested(overrides, path, _parse_environment_value(raw, expected, key))
+        if path[-1:] == ("maximum_wall_clock_hours",):
+            try:
+                parsed: Any = float(raw.strip())
+            except ValueError as exc:
+                raise ConfigError(
+                    f"invalid value for environment variable {key}: expected a number"
+                ) from exc
+        else:
+            parsed = _parse_environment_value(raw, expected, key)
+        _set_nested(overrides, path, parsed)
     return overrides
 
 
@@ -641,6 +698,18 @@ def normalize_cli_overrides(overrides: ConfigMapping | None) -> dict[str, Any]:
 
     for key, value in overrides.items():
         if value is None:
+            continue
+        if key == "no_web_search":
+            if not isinstance(value, bool):
+                raise ConfigError("CLI override no_web_search must be a boolean")
+            _set_all_web_search(normalized, not value)
+            continue
+        if key == "time_limit_minutes":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError("CLI override time_limit_minutes must be an integer")
+            if value < 1:
+                raise ConfigError("CLI override time_limit_minutes must be at least 1")
+            _set_total_time_limit(normalized, value)
             continue
         if isinstance(value, Mapping):
             path = _v2_path(tuple(key.split(".")))

@@ -118,6 +118,16 @@ def test_budget_carries_elapsed_time_across_resume() -> None:
     assert tracker.snapshot().elapsed_seconds == 35.0
 
 
+def test_budget_has_no_wall_clock_limit_by_default() -> None:
+    tracker = BudgetTracker(
+        Limits(maximum_cost_usd=1.0),
+        prior_elapsed_seconds=10_000_000.0,
+    )
+
+    assert tracker.remaining().wall_clock_seconds is None
+    tracker.ensure_available()
+
+
 def test_unknown_cost_fails_closed_before_another_call() -> None:
     tracker = BudgetTracker(Limits(maximum_cost_usd=10.0, maximum_wall_clock_hours=1.0))
     tracker.record(UsageRecord(input_tokens=1, output_tokens=1), enforce=False)
