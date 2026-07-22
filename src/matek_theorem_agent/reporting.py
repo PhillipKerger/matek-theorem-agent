@@ -166,9 +166,7 @@ def build_final_report(
     configuration = metadata.get("configuration_summary", {})
     clarification = metadata.get("problem_clarification", {})
     raw_knowledge_graph = metadata.get("knowledge_graph", {})
-    knowledge_graph = (
-        dict(raw_knowledge_graph) if isinstance(raw_knowledge_graph, dict) else {}
-    )
+    knowledge_graph = dict(raw_knowledge_graph) if isinstance(raw_knowledge_graph, dict) else {}
     graph_name = knowledge_graph.get("name")
     graph_commands = (
         [
@@ -285,13 +283,9 @@ def render_report_markdown(report: FinalReport) -> str:
 
     if report.knowledge_graph:
         graph_name = str(report.knowledge_graph.get("name", "unknown"))
-        graph_vault = str(
-            report.knowledge_graph.get("vault", f".matek/knowledge/{graph_name}")
-        )
+        graph_vault = str(report.knowledge_graph.get("vault", f".matek/knowledge/{graph_name}"))
         graph_index = str(
-            report.knowledge_graph.get(
-                "index", f".matek/knowledge/{graph_name}/graph-index.sqlite"
-            )
+            report.knowledge_graph.get("index", f".matek/knowledge/{graph_name}/graph-index.sqlite")
         )
         lines.extend(
             [

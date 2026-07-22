@@ -1661,12 +1661,14 @@ async def test_problem_files_get_separate_graphs_and_can_explicitly_reuse_one(
     assert follow_up.state.metadata["knowledge_graph"]["selection"] == "explicit_existing"
     primary_graph = KnowledgeGraph(project, "problem")
     independent_graph = KnowledgeGraph(project, "independent")
-    assert len(
-        [node for node in primary_graph.load_nodes() if node.node_type is NodeType.PROBLEM]
-    ) == 2
-    assert len(
-        [node for node in independent_graph.load_nodes() if node.node_type is NodeType.PROBLEM]
-    ) == 1
+    assert (
+        len([node for node in primary_graph.load_nodes() if node.node_type is NodeType.PROBLEM])
+        == 2
+    )
+    assert (
+        len([node for node in independent_graph.load_nodes() if node.node_type is NodeType.PROBLEM])
+        == 1
+    )
     assert primary_graph.validate().valid
     assert independent_graph.validate().valid
 

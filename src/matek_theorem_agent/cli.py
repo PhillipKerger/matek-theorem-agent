@@ -382,9 +382,7 @@ def _project_graph(graph_name: str | None = None) -> KnowledgeGraph:
         selected = normalize_graph_name(graph_name)
         if selected not in available:
             suffix = f" Available graphs: {', '.join(available)}." if available else ""
-            raise GraphNotInitializedError(
-                f"knowledge graph {selected!r} does not exist.{suffix}"
-            )
+            raise GraphNotInitializedError(f"knowledge graph {selected!r} does not exist.{suffix}")
     elif len(available) == 1:
         selected = available[0]
     elif not available:
@@ -471,7 +469,7 @@ def graph_list() -> None:
 
 @graph_app.command("validate")
 def graph_validate(
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
     """Validate Markdown, machine ownership, relations, DAGs, and index revision."""
 
@@ -488,7 +486,7 @@ def graph_validate(
 
 @graph_app.command("status")
 def graph_status_command(
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
     """Show the current graph revision and typed node/status counts."""
 
@@ -515,7 +513,7 @@ def graph_frontier(
 
 @graph_app.command("rebuild-index")
 def graph_rebuild_index(
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
     """Rebuild the disposable SQLite index from authoritative Markdown notes."""
 
@@ -527,9 +525,7 @@ def graph_rebuild_index(
 
 
 @graph_app.command("open")
-def graph_open(
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
-) -> None:
+def graph_open(knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")) -> None:
     """Open the vault in Obsidian when available, otherwise print its path."""
 
     try:
@@ -857,9 +853,7 @@ def run(
                 "concurrent agents": config.research.maximum_concurrent_agents,
                 "knowledge graph name": selected_graph_name,
                 "knowledge graph selection": graph_selection,
-                "persistent knowledge graph": (
-                    root / ".matek" / "knowledge" / selected_graph_name
-                ),
+                "persistent knowledge graph": (root / ".matek" / "knowledge" / selected_graph_name),
                 "graph context limit": (
                     f"{config.graph.maximum_context_nodes} nodes / "
                     f"{config.graph.maximum_context_characters} characters"
