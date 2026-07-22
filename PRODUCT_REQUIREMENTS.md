@@ -123,8 +123,13 @@ formalization, and generates a reproducible final report.
 
 ### FR-3A Persistent mathematical knowledge graph
 
-- MATEK shall maintain one project-scoped, persistent graph per source problem beneath
-  `.matek/knowledge/`, independent of run directories and reusable by later runs.
+- MATEK shall maintain named, project-scoped persistent graphs beneath
+  `.matek/knowledge/<graph-name>/`, independent of run directories. The default graph name is
+  derived from the source problem filename without its extension, so different problem files do
+  not share memory by default and later runs of the same file reuse it.
+- A user may explicitly attach a related or follow-up problem to an existing graph with
+  `--knowledge-graph NAME`. Unknown explicit names shall fail instead of creating a graph, and the
+  selected graph shall be frozen in run metadata for resume.
 - Portable Markdown with flat typed YAML frontmatter is authoritative. The SQLite index is a
   disposable acceleration layer rebuildable from Markdown.
 - The graph shall represent problem, definition, claim, proof, approach, task, counterexample,

@@ -11,8 +11,11 @@ streamed to the user.
 Inputs: problem file, optional framework override, config, CLI flags.
 Outputs: original problem, normalized problem, hashes, environment snapshot, initial state.
 
-Load and validate the project graph, reconcile permitted human edits, map the source file to one
-stable problem ID, and create an idempotent run node. Conflicting manual edits stop the run.
+Derive the default graph name from the problem filename stem, or validate an explicitly selected
+existing graph supplied with `--knowledge-graph`. Load and validate only that named graph,
+reconcile permitted human edits, map the source file to one stable problem ID, and create an
+idempotent run node. Freeze the graph name in run state for resume. Conflicting manual edits stop
+the run; different files never share a graph unless the user explicitly requests reuse.
 
 ## Stage 1 — Prompt compilation
 
@@ -251,5 +254,6 @@ Generate `REPORT.md`, `report.json`, and `verification_certificate.json`. The re
 truthful even when research or formalization fails.
 
 Update the persistent run node with the strongest result, unresolved obligations, and terminal or
-incomplete status. Report metadata links the stable problem ID, current revision, Home note, and
-derived index without folding mutable cross-run graph files into the run certificate.
+incomplete status. Report metadata links the graph name and selection mode, stable problem ID,
+current revision, Home note, and derived index without folding mutable cross-run graph files into
+the run certificate.

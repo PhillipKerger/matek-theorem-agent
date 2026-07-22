@@ -16,6 +16,9 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 - Frontier selection, graph-scoped task creation, bounded context slices, manuscript mappings,
   and exact-version Lean records.
 - Graph CLI behavior, including graceful operation when Obsidian is not installed.
+- Problem-stem graph naming, isolation between different problem files, explicit existing-graph
+  reuse for follow-up work, unknown-name rejection, resume identity freezing, and ambiguous CLI
+  selection when multiple graphs exist.
 
 - Config precedence and validation.
 - Backend resolution, Codex default, legacy API migration, and no-silent-fallback policy.
@@ -63,6 +66,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 
 - Run two independent `WorkflowRunner.run_new` calls for the same source problem and assert one
   stable problem node, distinct run nodes, increasing revisions, and a valid shared vault.
+- Run different source files and assert separate default vaults, then explicitly reuse one vault
+  for a follow-up source and assert both stable problem nodes coexist only in that selected graph.
 - Assert worker evidence precedes graph integration and graph patch artifacts/events remain
   replayable without another paid call.
 

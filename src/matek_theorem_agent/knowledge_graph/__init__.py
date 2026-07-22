@@ -20,16 +20,19 @@ from .models import (
     WorkflowStatus,
 )
 from .service import (
-    GRAPH_VAULT_RELATIVE,
+    GRAPH_COLLECTION_RELATIVE,
     GraphConflictError,
     GraphNotInitializedError,
     GraphValidationError,
     KnowledgeGraph,
     KnowledgeGraphError,
+    list_graph_names,
+    normalize_graph_name,
+    problem_graph_name,
 )
 
 __all__ = [
-    "GRAPH_VAULT_RELATIVE",
+    "GRAPH_COLLECTION_RELATIVE",
     "ClaimType",
     "EpistemicStatus",
     "GraphConflictError",
@@ -52,4 +55,7 @@ __all__ = [
     "NodeType",
     "RelationType",
     "WorkflowStatus",
+    "list_graph_names",
+    "normalize_graph_name",
+    "problem_graph_name",
 ]

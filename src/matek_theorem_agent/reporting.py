@@ -165,6 +165,19 @@ def build_final_report(
     )
     configuration = metadata.get("configuration_summary", {})
     clarification = metadata.get("problem_clarification", {})
+    raw_knowledge_graph = metadata.get("knowledge_graph", {})
+    knowledge_graph = (
+        dict(raw_knowledge_graph) if isinstance(raw_knowledge_graph, dict) else {}
+    )
+    graph_name = knowledge_graph.get("name")
+    graph_commands = (
+        [
+            f"matek graph validate --knowledge-graph {graph_name}",
+            f"matek graph status --knowledge-graph {graph_name}",
+        ]
+        if isinstance(graph_name, str) and graph_name
+        else ["matek graph validate", "matek graph status"]
+    )
     return FinalReport(
         run_id=state.run_id,
         scientific_status=scientific,
@@ -193,17 +206,12 @@ def build_final_report(
         lean_consent=(
             dict(metadata["lean_consent"]) if isinstance(metadata.get("lean_consent"), dict) else {}
         ),
-        knowledge_graph=(
-            dict(metadata["knowledge_graph"])
-            if isinstance(metadata.get("knowledge_graph"), dict)
-            else {}
-        ),
+        knowledge_graph=knowledge_graph,
         reproducibility=[
             f"matek status {state.run_id}",
             f"matek verify {state.run_id}",
             f"matek resume {state.run_id}",
-            "matek graph validate",
-            "matek graph status",
+            *graph_commands,
         ],
         narrative=narrative,
     )
@@ -276,15 +284,25 @@ def render_report_markdown(report: FinalReport) -> str:
         )
 
     if report.knowledge_graph:
+        graph_name = str(report.knowledge_graph.get("name", "unknown"))
+        graph_vault = str(
+            report.knowledge_graph.get("vault", f".matek/knowledge/{graph_name}")
+        )
+        graph_index = str(
+            report.knowledge_graph.get(
+                "index", f".matek/knowledge/{graph_name}/graph-index.sqlite"
+            )
+        )
         lines.extend(
             [
                 "## Persistent knowledge graph",
                 "",
+                f"- Graph: `{graph_name}`",
                 f"- Problem node: `{report.knowledge_graph.get('problem_id', 'unknown')}`",
                 f"- Revision: `{report.knowledge_graph.get('revision', 'unknown')}`",
-                "- Obsidian vault: [open Home](../../../knowledge/Home.md) "
-                "(project path: `.matek/knowledge`)",
-                "- Rebuildable index: project path `.matek/graph-index.sqlite`",
+                f"- Obsidian vault: [open Home](../../../knowledge/{graph_name}/Home.md) "
+                f"(project path: `{graph_vault}`)",
+                f"- Rebuildable index: project path `{graph_index}`",
                 "",
             ]
         )

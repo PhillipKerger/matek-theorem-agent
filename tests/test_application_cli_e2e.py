@@ -36,7 +36,7 @@ from matek_theorem_agent.config import (
 )
 from matek_theorem_agent.execution.base import CommandRequest, CommandResult
 from matek_theorem_agent.intake import ingest_problem
-from matek_theorem_agent.knowledge_graph import KnowledgeGraph, NodeType
+from matek_theorem_agent.knowledge_graph import GraphNotInitializedError, KnowledgeGraph, NodeType
 from matek_theorem_agent.models import ScientificStatus, StageName, StageStatus
 from matek_theorem_agent.openai_client import ModelRequest, ModelResult
 from matek_theorem_agent.progress import Ascension
@@ -1604,7 +1604,7 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
 
     assert first_graph["problem_id"] == second_graph["problem_id"]
     assert first_graph["revision"] != second_graph["revision"]
-    graph = KnowledgeGraph(project)
+    graph = KnowledgeGraph(project, "problem")
     nodes = graph.load_nodes()
     assert len([node for node in nodes if node.node_type is NodeType.PROBLEM]) == 1
     assert any(node.node_type is NodeType.TASK for node in nodes)
@@ -1614,6 +1614,82 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
     run_ids = {node.created_in_run for node in nodes if node.node_type is NodeType.RUN}
     assert {first.state.run_id, second.state.run_id} <= run_ids
     assert graph.validate().valid
+
+
+@pytest.mark.asyncio
+async def test_problem_files_get_separate_graphs_and_can_explicitly_reuse_one(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runner, _, _, _ = workflow_runner(project, accepted=True)
+    primary_problem = make_problem(project)
+    independent_problem = project / "independent.md"
+    independent_problem.write_text("Prove an independent theorem.\n", encoding="utf-8")
+    follow_up_problem = project / "follow-up.md"
+    follow_up_problem.write_text(
+        "Extend the original theorem to a new setting.\n", encoding="utf-8"
+    )
+
+    primary = await runner.run_new(
+        primary_problem,
+        project,
+        options=WorkflowOptions(research_only=True, run_name="primary"),
+        environment_snapshot={"fixture": "offline"},
+    )
+    independent = await runner.run_new(
+        independent_problem,
+        project,
+        options=WorkflowOptions(research_only=True, run_name="independent"),
+        environment_snapshot={"fixture": "offline"},
+    )
+    follow_up = await runner.run_new(
+        follow_up_problem,
+        project,
+        options=WorkflowOptions(
+            research_only=True,
+            run_name="follow-up",
+            knowledge_graph="problem",
+        ),
+        environment_snapshot={"fixture": "offline"},
+    )
+
+    assert primary.state.metadata["knowledge_graph"]["name"] == "problem"
+    assert independent.state.metadata["knowledge_graph"]["name"] == "independent"
+    assert independent.state.metadata["knowledge_graph"]["selection"] == "problem_stem"
+    assert follow_up.state.metadata["knowledge_graph"]["name"] == "problem"
+    assert follow_up.state.metadata["knowledge_graph"]["selection"] == "explicit_existing"
+    primary_graph = KnowledgeGraph(project, "problem")
+    independent_graph = KnowledgeGraph(project, "independent")
+    assert len(
+        [node for node in primary_graph.load_nodes() if node.node_type is NodeType.PROBLEM]
+    ) == 2
+    assert len(
+        [node for node in independent_graph.load_nodes() if node.node_type is NodeType.PROBLEM]
+    ) == 1
+    assert primary_graph.validate().valid
+    assert independent_graph.validate().valid
+
+
+@pytest.mark.asyncio
+async def test_explicit_graph_reuse_rejects_unknown_graph_before_creating_run(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runner, model, _, _ = workflow_runner(project, accepted=True)
+    problem = make_problem(project)
+
+    with pytest.raises(GraphNotInitializedError, match="does not exist"):
+        await runner.run_new(
+            problem,
+            project,
+            options=WorkflowOptions(research_only=True, knowledge_graph="typo"),
+            environment_snapshot={"fixture": "offline"},
+        )
+
+    assert not (project / ".matek" / "runs").exists()
+    assert model.requests == []
 
 
 @pytest.mark.asyncio

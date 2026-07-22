@@ -20,6 +20,8 @@ from matek_theorem_agent.knowledge_graph import (
     KnowledgeGraph,
     NodeType,
     RelationType,
+    list_graph_names,
+    problem_graph_name,
 )
 
 
@@ -37,7 +39,7 @@ def initialized_graph(tmp_path: Path) -> tuple[KnowledgeGraph, Path, str, str]:
     project.mkdir()
     problem = project / "problem.md"
     problem.write_text("Prove that every test object has the desired property.\n", encoding="utf-8")
-    graph = KnowledgeGraph(project, clock=AdvancingClock())
+    graph = KnowledgeGraph(project, "problem", clock=AdvancingClock())
     problem_id, first_revision = graph.initialize_problem(
         source_path=problem,
         problem_text=problem.read_text(encoding="utf-8"),
@@ -375,7 +377,10 @@ def test_graph_cli_operates_without_obsidian(
 
     initialized = cli.invoke(app, ["init"])
     assert initialized.exit_code == 0, initialized.output
-    assert (project / ".matek" / "knowledge" / "Home.md").is_file()
+    assert not (project / ".matek" / "knowledge").exists()
+    graph_initialized = cli.invoke(app, ["graph", "init", "problem"])
+    assert graph_initialized.exit_code == 0, graph_initialized.output
+    assert (project / ".matek" / "knowledge" / "problem" / "Home.md").is_file()
     validated = cli.invoke(app, ["graph", "validate"])
     assert validated.exit_code == 0, validated.output
     status = cli.invoke(app, ["graph", "status"])
@@ -388,3 +393,79 @@ def test_graph_cli_operates_without_obsidian(
     assert opened.exit_code == 0
     assert "Vault:" in opened.output
     assert "Obsidian unavailable" in opened.output
+
+
+def test_problem_graph_names_create_isolated_vaults(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    first_problem = project / "First Result.md"
+    second_problem = project / "second-problem.txt"
+    first_problem.write_text("Prove the first result.\n", encoding="utf-8")
+    second_problem.write_text("Prove the second result.\n", encoding="utf-8")
+
+    first_name = problem_graph_name(first_problem)
+    second_name = problem_graph_name(second_problem)
+    first = KnowledgeGraph(project, first_name)
+    second = KnowledgeGraph(project, second_name)
+    first.initialize_problem(
+        source_path=first_problem,
+        problem_text=first_problem.read_text(encoding="utf-8"),
+        run_id="run-first",
+    )
+    second.initialize_problem(
+        source_path=second_problem,
+        problem_text=second_problem.read_text(encoding="utf-8"),
+        run_id="run-second",
+    )
+
+    assert first_name == "first-result"
+    assert second_name == "second-problem"
+    assert first.vault_root != second.vault_root
+    assert first.index_path != second.index_path
+    assert first.load_state().graph_name == first_name
+    assert second.load_state().graph_name == second_name
+    assert list_graph_names(project) == [first_name, second_name]
+    assert len([node for node in first.load_nodes() if node.node_type is NodeType.PROBLEM]) == 1
+    assert len([node for node in second.load_nodes() if node.node_type is NodeType.PROBLEM]) == 1
+
+
+def test_graph_cli_requires_selection_when_multiple_graphs_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "cli-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    monkeypatch.chdir(project)
+    cli = CliRunner()
+
+    assert cli.invoke(app, ["init"]).exit_code == 0
+    assert cli.invoke(app, ["graph", "init", "alpha"]).exit_code == 0
+    assert cli.invoke(app, ["graph", "init", "beta"]).exit_code == 0
+    listed = cli.invoke(app, ["graph", "list"])
+    assert listed.exit_code == 0
+    assert '"name": "alpha"' in listed.output
+    assert '"name": "beta"' in listed.output
+    ambiguous = cli.invoke(app, ["graph", "status"])
+    assert ambiguous.exit_code == 2
+    assert "multiple knowledge graphs exist" in ambiguous.output
+    selected = cli.invoke(app, ["graph", "status", "--knowledge-graph", "alpha"])
+    assert selected.exit_code == 0
+    assert '"graph_name": "alpha"' in selected.output
+
+    follow_up = project / "follow-up.md"
+    follow_up.write_text("Prove the follow-up theorem.\n", encoding="utf-8")
+    reuse_plan = cli.invoke(
+        app,
+        ["run", str(follow_up), "--knowledge-graph", "alpha", "--dry-run"],
+        terminal_width=240,
+    )
+    assert reuse_plan.exit_code == 0, reuse_plan.output
+    assert "knowledge graph name" in reuse_plan.output
+    assert "alpha" in reuse_plan.output
+    assert "explicit existing graph" in reuse_plan.output
+    missing = cli.invoke(
+        app,
+        ["run", str(follow_up), "--knowledge-graph", "missing", "--dry-run"],
+    )
+    assert missing.exit_code == 2
+    assert "does not exist" in missing.output

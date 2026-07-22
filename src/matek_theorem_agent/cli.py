@@ -45,10 +45,14 @@ from .execution.native import NativeBackend
 from .initialization import InitializationError, initialize_project
 from .intake import IntakeError, normalize_problem_text
 from .knowledge_graph import (
+    GraphNotInitializedError,
     GraphValidationError,
     KnowledgeGraph,
     KnowledgeGraphError,
     RelationType,
+    list_graph_names,
+    normalize_graph_name,
+    problem_graph_name,
 )
 from .logging import JournalCorruptionError
 from .models import RunState, StageName, StageStatus
@@ -370,11 +374,42 @@ def _print_result(result: WorkflowResult) -> None:
     console.print(f"Report: {result.report.report_markdown}")
 
 
-def _project_graph() -> KnowledgeGraph:
+def _project_graph(graph_name: str | None = None) -> KnowledgeGraph:
+    root = _project_root()
+    config = load_config(project_root=root)
+    available = list_graph_names(root)
+    if graph_name is not None:
+        selected = normalize_graph_name(graph_name)
+        if selected not in available:
+            suffix = f" Available graphs: {', '.join(available)}." if available else ""
+            raise GraphNotInitializedError(
+                f"knowledge graph {selected!r} does not exist.{suffix}"
+            )
+    elif len(available) == 1:
+        selected = available[0]
+    elif not available:
+        raise GraphNotInitializedError(
+            "no knowledge graphs exist; start a run or use 'matek graph init GRAPH_NAME'"
+        )
+    else:
+        raise KnowledgeGraphError(
+            "multiple knowledge graphs exist; select one with --knowledge-graph NAME "
+            f"(available: {', '.join(available)})"
+        )
+    return KnowledgeGraph(
+        root,
+        selected,
+        maximum_context_nodes=config.graph.maximum_context_nodes,
+        maximum_context_characters=config.graph.maximum_context_characters,
+    )
+
+
+def _new_project_graph(graph_name: str) -> KnowledgeGraph:
     root = _project_root()
     config = load_config(project_root=root)
     return KnowledgeGraph(
         root,
+        normalize_graph_name(graph_name),
         maximum_context_nodes=config.graph.maximum_context_nodes,
         maximum_context_characters=config.graph.maximum_context_characters,
     )
@@ -389,38 +424,59 @@ def init(
     try:
         root = _project_root()
         result = initialize_project(root, force=force)
-        graph = _project_graph()
-        graph.initialize()
         for path in result.created:
             console.print(f"[green]✓[/green] Created {path.relative_to(root)}")
         for path in result.overwritten:
             console.print(f"[yellow]![/yellow] Replaced {path.relative_to(root)}")
         for path in result.preserved:
             console.print(f"[dim]- Preserved {path.relative_to(root)}[/dim]")
-        console.print(f"[green]✓[/green] Knowledge vault {graph.vault_root.relative_to(root)}")
+        console.print(
+            "[dim]Knowledge graphs are created per problem when 'matek run' starts.[/dim]"
+        )
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("init")
-def graph_init() -> None:
-    """Create the portable Markdown vault and rebuildable graph index."""
+def graph_init(graph_name: str = typer.Argument(..., help="Name for the knowledge graph.")) -> None:
+    """Create one named Markdown vault and rebuildable graph index."""
 
     try:
-        graph = _project_graph()
+        graph = _new_project_graph(graph_name)
         state = graph.initialize()
+        console.print(f"Graph: {graph.graph_name}")
         console.print(f"Vault: {graph.vault_root}")
         console.print(f"Revision: {state.revision}")
     except BaseException as exc:
         _abort(exc)
 
 
+@graph_app.command("list")
+def graph_list() -> None:
+    """List the initialized knowledge graphs in this project."""
+
+    try:
+        root = _project_root()
+        values = [
+            {
+                "name": name,
+                "vault": str((root / ".matek" / "knowledge" / name).relative_to(root)),
+            }
+            for name in list_graph_names(root)
+        ]
+        console.print(json.dumps(values, indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
 @graph_app.command("validate")
-def graph_validate() -> None:
+def graph_validate(
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+) -> None:
     """Validate Markdown, machine ownership, relations, DAGs, and index revision."""
 
     try:
-        report = _project_graph().validate()
+        report = _project_graph(knowledge_graph).validate()
         console.print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
         if not report.valid:
             raise typer.Exit(code=6)
@@ -431,44 +487,53 @@ def graph_validate() -> None:
 
 
 @graph_app.command("status")
-def graph_status_command() -> None:
+def graph_status_command(
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+) -> None:
     """Show the current graph revision and typed node/status counts."""
 
     try:
-        status_value = _project_graph().status()
+        status_value = _project_graph(knowledge_graph).status()
         console.print(json.dumps(status_value.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("frontier")
-def graph_frontier(problem_id: str | None = typer.Option(None, "--problem-id")) -> None:
+def graph_frontier(
+    problem_id: str | None = typer.Option(None, "--problem-id"),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """Show unresolved claims, audits, contradictions, blockers, and active tasks."""
 
     try:
-        frontier_value = _project_graph().frontier(problem_id)
+        frontier_value = _project_graph(knowledge_graph).frontier(problem_id)
         console.print(json.dumps(frontier_value.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("rebuild-index")
-def graph_rebuild_index() -> None:
+def graph_rebuild_index(
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+) -> None:
     """Rebuild the disposable SQLite index from authoritative Markdown notes."""
 
     try:
-        path = _project_graph().rebuild_index()
+        path = _project_graph(knowledge_graph).rebuild_index()
         console.print(f"Rebuilt {path}")
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("open")
-def graph_open() -> None:
+def graph_open(
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g")
+) -> None:
     """Open the vault in Obsidian when available, otherwise print its path."""
 
     try:
-        opened, path, detail = _project_graph().open_in_obsidian()
+        opened, path, detail = _project_graph(knowledge_graph).open_in_obsidian()
         console.print(f"Vault: {path}")
         console.print(("Opened in Obsidian. " if opened else "Obsidian unavailable. ") + detail)
     except BaseException as exc:
@@ -479,11 +544,12 @@ def graph_open() -> None:
 def graph_export(
     output_format: GraphExportChoice = typer.Option(GraphExportChoice.JSON, "--format"),
     output: Path | None = typer.Option(None, "--output", dir_okay=False),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
     """Export JSON, Graphviz DOT, or Mermaid without requiring Obsidian."""
 
     try:
-        rendered = _project_graph().export(output_format=output_format.value)
+        rendered = _project_graph(knowledge_graph).export(output_format=output_format.value)
         if output is None:
             console.print(rendered, markup=False, end="")
         else:
@@ -496,22 +562,29 @@ def graph_export(
 
 
 @graph_app.command("diff")
-def graph_diff(revision_a: str, revision_b: str) -> None:
+def graph_diff(
+    revision_a: str,
+    revision_b: str,
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """Compare two durable graph snapshots."""
 
     try:
-        difference = _project_graph().diff(revision_a, revision_b)
+        difference = _project_graph(knowledge_graph).diff(revision_a, revision_b)
         console.print(json.dumps(difference.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("show")
-def graph_show(node_id: str) -> None:
+def graph_show(
+    node_id: str,
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """Show one node by immutable ID."""
 
     try:
-        node = _project_graph().show(node_id)
+        node = _project_graph(knowledge_graph).show(node_id)
         console.print(json.dumps(node.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
@@ -524,55 +597,75 @@ def _print_graph_nodes(nodes: Sequence[BaseModel]) -> None:
 
 
 @graph_app.command("dependencies")
-def graph_dependencies(node_id: str) -> None:
+def graph_dependencies(
+    node_id: str,
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """Traverse mathematical dependencies of a node."""
 
     try:
         _print_graph_nodes(
-            _project_graph().traverse(node_id, downstream=False, relation=RelationType.DEPENDS_ON)
+            _project_graph(knowledge_graph).traverse(
+                node_id, downstream=False, relation=RelationType.DEPENDS_ON
+            )
         )
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("downstream")
-def graph_downstream(node_id: str) -> None:
+def graph_downstream(
+    node_id: str,
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """Traverse nodes invalidated when this dependency changes."""
 
     try:
         _print_graph_nodes(
-            _project_graph().traverse(node_id, downstream=True, relation=RelationType.DEPENDS_ON)
+            _project_graph(knowledge_graph).traverse(
+                node_id, downstream=True, relation=RelationType.DEPENDS_ON
+            )
         )
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("stale")
-def graph_stale(problem_id: str | None = typer.Option(None, "--problem-id")) -> None:
+def graph_stale(
+    problem_id: str | None = typer.Option(None, "--problem-id"),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """List stale nodes and invalidation reasons."""
 
     try:
-        _print_graph_nodes(_project_graph().list_stale(problem_id))
+        _print_graph_nodes(_project_graph(knowledge_graph).list_stale(problem_id))
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("tasks")
-def graph_tasks(problem_id: str | None = typer.Option(None, "--problem-id")) -> None:
+def graph_tasks(
+    problem_id: str | None = typer.Option(None, "--problem-id"),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """List persistent graph-scoped research tasks."""
 
     try:
-        _print_graph_nodes(_project_graph().list_tasks(problem_id))
+        _print_graph_nodes(_project_graph(knowledge_graph).list_tasks(problem_id))
     except BaseException as exc:
         _abort(exc)
 
 
 @graph_app.command("tombstone")
-def graph_tombstone(node_id: str, reason: str = typer.Option(..., "--reason")) -> None:
+def graph_tombstone(
+    node_id: str,
+    reason: str = typer.Option(..., "--reason"),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
     """Retain a superseded node identity and invalidate its dependents."""
 
     try:
-        result = _project_graph().tombstone(node_id, reason=reason)
+        result = _project_graph(knowledge_graph).tombstone(node_id, reason=reason)
         console.print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
@@ -677,6 +770,12 @@ def run(
     research_only: bool = typer.Option(False, "--research-only"),
     sandbox: SandboxChoice | None = typer.Option(None, "--sandbox"),
     allow_project_edits: bool = typer.Option(False, "--allow-project-edits"),
+    knowledge_graph: str | None = typer.Option(
+        None,
+        "--knowledge-graph",
+        "-g",
+        help="Reuse an existing named graph instead of the problem filename's graph.",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept safety confirmations."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -703,6 +802,18 @@ def run(
             cli_overrides=overrides,
         )
         problem = _validate_problem_for_dry_run(problem_file)
+        if knowledge_graph is None:
+            selected_graph_name = problem_graph_name(problem_file)
+            graph_selection = "problem filename"
+        else:
+            selected_graph_name = normalize_graph_name(knowledge_graph)
+            graph_selection = "explicit existing graph"
+            if selected_graph_name not in list_graph_names(root):
+                available = list_graph_names(root)
+                suffix = f" Available graphs: {', '.join(available)}." if available else ""
+                raise GraphNotInitializedError(
+                    f"knowledge graph {selected_graph_name!r} does not exist.{suffix}"
+                )
         if framework is not None:
             framework_path = framework.expanduser().resolve(strict=True)
             framework_hash = sha256_file(framework_path)
@@ -744,7 +855,11 @@ def run(
                 "maximum pending assignments": (config.research.maximum_pending_assignments),
                 "coordinator decisions": (config.research.maximum_coordinator_decisions),
                 "concurrent agents": config.research.maximum_concurrent_agents,
-                "persistent knowledge graph": root / ".matek" / "knowledge",
+                "knowledge graph name": selected_graph_name,
+                "knowledge graph selection": graph_selection,
+                "persistent knowledge graph": (
+                    root / ".matek" / "knowledge" / selected_graph_name
+                ),
                 "graph context limit": (
                     f"{config.graph.maximum_context_nodes} nodes / "
                     f"{config.graph.maximum_context_characters} characters"
@@ -788,6 +903,7 @@ def run(
                     no_lean=no_lean,
                     research_only=research_only,
                     allow_project_edits=allow_project_edits,
+                    knowledge_graph=knowledge_graph,
                     invocation={
                         "config": str(config_path) if config_path else None,
                         "backend": config.backend.provider,
@@ -798,6 +914,7 @@ def run(
                         "time_limit_minutes": time_limit_minutes,
                         "no_web_search": no_web_search,
                         "sandbox": sandbox.value if sandbox else None,
+                        "knowledge_graph": knowledge_graph,
                     },
                 ),
             )

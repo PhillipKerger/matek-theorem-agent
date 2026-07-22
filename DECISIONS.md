@@ -20,6 +20,11 @@ authoritative, SQLite is derived, and the vault stays beneath `.matek/` to prese
 write boundary. The central coordinator alone creates tasks and accepts validated worker patches;
 subagents never mutate shared graph files concurrently.
 
+Graphs are named and isolated beneath `.matek/knowledge/`. A run derives its default graph name
+from the problem filename stem. Users may explicitly reuse an initialized graph for related or
+follow-up work, but typoed/unknown names fail closed. Resume uses the graph identity frozen at
+intake, and graph maintenance requires explicit selection whenever more than one graph exists.
+
 - Explicit application-level agents are the stable default.
 - Run workers concurrently with `asyncio` and bounded concurrency.
 - Research uses one durable logical coordinator with a completion-driven mailbox and live worker

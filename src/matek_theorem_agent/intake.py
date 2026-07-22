@@ -272,7 +272,7 @@ def ingest_problem(
                 "maximum_pending_assignments": (config.research.maximum_pending_assignments),
                 "maximum_coordinator_decisions": (config.research.maximum_coordinator_decisions),
                 "maximum_concurrent_agents": config.research.maximum_concurrent_agents,
-                "knowledge_graph_vault": ".matek/knowledge",
+                "knowledge_graph_collection": ".matek/knowledge",
                 "graph_maximum_context_nodes": config.graph.maximum_context_nodes,
                 "graph_maximum_context_characters": config.graph.maximum_context_characters,
                 "maximum_cost_usd": config.limits.maximum_cost_usd,

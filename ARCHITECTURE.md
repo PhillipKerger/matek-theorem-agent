@@ -206,12 +206,16 @@ sources, and Lean formalizations. Status promotion and staleness are determinist
 rules. The manuscript and Lean stages consume accepted graph slices, and their mappings and exact
 verification records are written back only after existing gates pass.
 
-`.matek/knowledge/` is an ordinary Obsidian-compatible vault and the portable source of truth.
-`.matek/graph-state.json` stores revision/hashes, ownership baselines, source-problem mappings,
-processed operation IDs, and change records; `.matek/snapshots/` supports diffs and safe stale
-rebases. `.matek/graph-index.sqlite` is derived and may be deleted/rebuilt. A pending transaction
-file plus `.matek/locks/graph.lock` makes multi-note commits crash-recoverable and cross-process
-serialized. This placement preserves the default no-write-outside-`.matek/` boundary.
+Each `.matek/knowledge/<graph-name>/` directory is an ordinary Obsidian-compatible vault and a
+separate portable source of truth. New runs normally derive `<graph-name>` from the source
+filename stem; `--knowledge-graph NAME` deliberately attaches related work to an already
+initialized graph. The chosen name is frozen in run state. Within each vault, `graph-state.json`
+stores its name, revision/hashes, ownership baselines, source-problem mappings, processed
+operation IDs, and change records; `snapshots/` supports diffs and safe stale rebases.
+`graph-index.sqlite` is derived and may be deleted/rebuilt. A pending transaction file plus
+`locks/graph.lock` makes each graph's multi-note commits crash-recoverable and cross-process
+serialized. This placement preserves the default no-write-outside-`.matek/` boundary and prevents
+unrelated problems from sharing memory by default.
 
 ### Command execution backends
 

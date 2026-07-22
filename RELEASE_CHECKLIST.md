@@ -62,6 +62,9 @@
 - [x] LaTeX compile/citation gate implemented.
 - [x] Persistent typed Markdown graph extends the same problem across runs and keeps claims,
   proofs, audits, sources, tasks, counterexamples, and formalizations separate.
+- [x] Problem filename stems select isolated default graphs; explicit existing-graph reuse,
+  unknown-name rejection, frozen resume identity, listing, and multi-graph CLI selection are
+  covered by offline tests.
 - [x] Coordinator frontier queries, bounded worker contexts, structured patches, atomic conflict
   checks, partial-work retention, and dependency invalidation are covered by offline tests.
 - [x] Obsidian Home/dashboards/canvases are generated, while every graph command remains usable

@@ -420,6 +420,7 @@ class GraphContextSlice(_GraphModel):
 
 
 class GraphStatus(_GraphModel):
+    graph_name: str
     initialized: bool
     vault_path: str
     revision: str | None
@@ -457,6 +458,7 @@ class GraphChangeRecord(_GraphModel):
 
 class GraphState(_GraphModel):
     schema_version: Literal[1] = 1
+    graph_name: str
     revision_number: int = Field(default=0, ge=0)
     revision: str
     created_at: datetime

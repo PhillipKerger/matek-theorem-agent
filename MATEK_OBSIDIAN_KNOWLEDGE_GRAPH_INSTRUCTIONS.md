@@ -24,36 +24,41 @@ Obsidian is the recommended human interface, but **must not be the only database
 
 ## 2. Per-problem workspace
 
-Create or extend one persistent workspace per problem:
+Create or extend one persistent named graph per problem inside the project workspace:
 
 ```text
 <problem-workspace>/
 ├── problem.md
 ├── matek.toml
-├── knowledge/
-│   ├── Home.md
-│   ├── Definitions/
-│   ├── Claims/
-│   ├── Proofs/
-│   ├── Approaches/
-│   ├── Counterexamples/
-│   ├── Experiments/
-│   ├── Sources/
-│   ├── Tasks/
-│   ├── Audits/
-│   ├── Formalizations/
-│   ├── Runs/
-│   └── Dashboards/
-├── .matek/
-│   ├── graph-schema.json
-│   ├── graph-index.sqlite
-│   ├── graph-state.json
-│   ├── snapshots/
-│   └── locks/
-└── .obsidian/               # Optional Obsidian configuration
+└── .matek/
+    └── knowledge/
+        └── <graph-name>/
+            ├── Home.md
+            ├── Definitions/
+            ├── Claims/
+            ├── Proofs/
+            ├── Approaches/
+            ├── Counterexamples/
+            ├── Experiments/
+            ├── Sources/
+            ├── Tasks/
+            ├── Audits/
+            ├── Formalizations/
+            ├── Runs/
+            ├── Dashboards/
+            ├── graph-schema.json
+            ├── graph-index.sqlite
+            ├── graph-state.json
+            ├── snapshots/
+            ├── locks/
+            └── .obsidian/       # Optional Obsidian configuration
 ```
 
-The knowledge graph must persist independently of individual run directories. Later runs on the same problem should load, validate, and extend the existing graph.
+The default graph name is the normalized problem filename without its extension. The knowledge
+graph must persist independently of individual run directories. Later runs on the same problem
+should load, validate, and extend the existing graph, while different problem filenames use
+separate graphs by default. A user may explicitly select an existing graph for related or
+follow-up work; an unknown explicit name must fail rather than create a new graph implicitly.
 
 ---
 
@@ -480,14 +485,15 @@ Do not weaken any existing bibliography, proof-audit, manuscript-compilation, or
 Add commands appropriate to the current CLI architecture:
 
 ```bash
-matek graph init
-matek graph validate
-matek graph status
-matek graph frontier
-matek graph rebuild-index
-matek graph open
-matek graph export
-matek graph diff <revision-a> <revision-b>
+matek graph list
+matek graph init <graph-name>
+matek graph validate --knowledge-graph <graph-name>
+matek graph status --knowledge-graph <graph-name>
+matek graph frontier --knowledge-graph <graph-name>
+matek graph rebuild-index --knowledge-graph <graph-name>
+matek graph open --knowledge-graph <graph-name>
+matek graph export --knowledge-graph <graph-name>
+matek graph diff <revision-a> <revision-b> --knowledge-graph <graph-name>
 ```
 
 Useful optional commands:
@@ -501,6 +507,9 @@ matek graph tasks
 ```
 
 `matek graph open` may open the vault in Obsidian when available, but must fail gracefully and print the vault path when Obsidian is absent.
+
+Graph query and maintenance commands may auto-select when exactly one graph exists, but must
+require `--knowledge-graph` when multiple graphs would make the operation ambiguous.
 
 ---
 

@@ -95,22 +95,24 @@ verification-certificate inventory:
 
 ```text
 .matek/
-├── knowledge/{Problems,Definitions,Claims,Proofs,Approaches,Counterexamples,Experiments,
-│   Sources,Tasks,Audits,Formalizations,Runs,Artifacts,Human Notes,Dashboards}/
-├── knowledge/Home.md
-├── graph-schema.json
-├── graph-state.json
-├── graph-index.sqlite
-├── graph-pending.json       # exists only across an interrupted commit
-├── snapshots/<revision>.json
-└── locks/graph.lock
+└── knowledge/<graph-name>/
+    ├── {Problems,Definitions,Claims,Proofs,Approaches,Counterexamples,Experiments,
+    │   Sources,Tasks,Audits,Formalizations,Runs,Artifacts,Human Notes,Dashboards}/
+    ├── Home.md
+    ├── graph-schema.json
+    ├── graph-state.json
+    ├── graph-index.sqlite
+    ├── graph-pending.json       # exists only across an interrupted commit
+    ├── snapshots/<revision>.json
+    └── locks/graph.lock
 ```
 
 Markdown notes with typed flat frontmatter are authoritative. `graph-state.json` binds their
 content, statement, and machine-owned-field hashes to a revision. SQLite, Home, dashboards, and
-canvases are derived and rebuildable. Each run report records the problem ID, graph revision,
-vault path, index path, validation warnings, and graph status rather than certifying a mutable
-cross-run tree as a run-local artifact.
+canvases are derived and rebuildable. Each run report records the selected graph name, selection
+mode, problem ID, graph revision, vault path, index path, validation warnings, and graph status
+rather than certifying a mutable cross-run tree as a run-local artifact. The selection is frozen
+for resume.
 
 ## Integrity
 

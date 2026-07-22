@@ -18,6 +18,11 @@
   distilled failed/partial routes, manuscript mappings, and exact-version Lean verification
   records. Added `matek graph` init/validate/status/frontier/rebuild/open/export/diff and focused
   traversal commands; Obsidian remains optional.
+- Isolated persistent memory into named per-problem vaults at
+  `.matek/knowledge/<graph-name>/`. The default name comes from the problem filename stem; related
+  or follow-up problems may explicitly reuse an existing graph with `--knowledge-graph NAME`.
+  Graph selection is frozen across resume, and the CLI lists graphs and requires a choice when
+  maintenance would otherwise be ambiguous.
 - Replaced fixed research rounds and wait-for-all batches with a durable, completion-driven
   logical coordinator. Worker completions and failed audits become atomically written immutable
   event files; the coordinator reacts and refills the live pool without waiting for unrelated

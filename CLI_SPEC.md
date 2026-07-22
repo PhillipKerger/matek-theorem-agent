@@ -87,6 +87,7 @@ Without a backend flag, a new installation uses Codex. Important options:
 --no-web-search
 --no-lean
 --research-only
+--knowledge-graph NAME
 --sandbox native|docker
 --allow-project-edits
 --dry-run
@@ -113,6 +114,12 @@ public-identifier HTTP resolver. Search remains enabled by default. The resolved
 saved with the run; the same flag on `matek resume` disables it for all remaining stages.
 Unverifiable citations remain unverified, so this option never weakens the bibliography gate and
 a fully offline run should normally also use `--research-only`.
+
+Unless `--knowledge-graph` is supplied, the problem filename without its extension is normalized
+to a portable graph name (`My Problem.md` becomes `my-problem`) and the run uses
+`.matek/knowledge/<graph-name>/`. `--knowledge-graph NAME` is an intentional reuse operation for
+related or follow-up work: the named graph must already exist. The choice is recorded in run state
+and resume always uses that frozen graph.
 
 `--time-limit-minutes N` sets the total active wall-clock allowance across prompt compilation,
 research, manuscript work, and formal verification. Elapsed active time is stored in run state
@@ -209,8 +216,10 @@ even when the frozen run used Docker.
 
 Graph commands are local and model-free:
 
-- `matek graph init` creates `.matek/knowledge/`, its schema/state, initial snapshot,
-  navigation, canvases, and SQLite index.
+- `matek graph list` lists initialized graph names and vault paths.
+- `matek graph init GRAPH_NAME` creates `.matek/knowledge/<graph-name>/`, its schema/state,
+  initial snapshot, navigation, canvases, and SQLite index. `matek init` does not create an
+  identity-free graph.
 - `matek graph validate` checks Markdown parsing, stable IDs, machine ownership, endpoint/type
   constraints, dependency cycles, hashes, and index revision; invalid graphs exit 6.
 - `matek graph status` and `frontier [--problem-id ID]` render typed machine-readable summaries.
@@ -222,6 +231,10 @@ Graph commands are local and model-free:
 - `show`, `dependencies`, `downstream`, `stale`, and `tasks` provide focused graph queries.
 - `tombstone NODE_ID --reason TEXT` preserves an obsolete identity and invalidates dependents;
   managed notes must not be deleted directly.
+
+Every query/maintenance command accepts `--knowledge-graph NAME` or `-g NAME`. It auto-selects
+only when exactly one initialized graph exists; with multiple graphs an explicit selection is
+required, and an unknown name is an error.
 
 The vault lives beneath `.matek/` so these commands do not imply consent to edit project source.
 

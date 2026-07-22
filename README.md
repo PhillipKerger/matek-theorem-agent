@@ -22,7 +22,7 @@ Further, even if a result is not proven, MATEK can later pick up exactly where t
 | --- | --- |
 | Model access | Official Codex CLI with ChatGPT sign-in; no OpenAI API key required |
 | Run outputs | `.matek/runs/<run-id>/` inside your project |
-| Persistent memory | Typed Markdown knowledge graph in `.matek/knowledge/`, shared across runs |
+| Persistent memory | One typed Markdown graph per problem in `.matek/knowledge/<graph-name>/`, shared across runs |
 | Research breadth | A continuous logical coordinator starts 16 diverse workers, then refills a live pool up to 32 active workers; there is no cumulative worker-count cap |
 | Parallelism | Configurable; the default Codex run admits up to 32 web-enabled research agents at once |
 | Research roles | GPT 5.6 Sol with max coordinator effort and independent xhigh workers; the API adapter also requests pro mode |
@@ -111,6 +111,9 @@ matek run problem.md --time-limit-minutes 180
 
 # Resolve configuration and show the stage plan without model calls
 matek run problem.md --dry-run
+
+# Reuse an existing graph for a related or follow-up problem
+matek run follow-up.md --knowledge-graph problem
 ```
 
 ## Choosing the research strength and number of agents
@@ -318,12 +321,14 @@ write boundary:
 
 ```text
 .matek/
-├── knowledge/              # Obsidian-compatible Markdown source of truth and dashboards
-├── graph-schema.json       # typed node/edge and patch schema
-├── graph-index.sqlite      # disposable, rebuildable query index
-├── graph-state.json        # revision, hashes, ownership, and operation journal
-├── snapshots/              # immutable revision snapshots used by diff/conflict detection
-└── locks/graph.lock        # cross-process graph serialization
+└── knowledge/
+    └── <graph-name>/       # one Obsidian vault, normally named from the problem file stem
+        ├── Home.md and typed note directories
+        ├── graph-schema.json
+        ├── graph-index.sqlite
+        ├── graph-state.json
+        ├── snapshots/
+        └── locks/graph.lock
 ```
 
 Use `matek status` for the latest run or `matek status <run-id>` for a specific run. By
@@ -332,13 +337,19 @@ default, MATEK writes only beneath `.matek/`; editing project source requires th
 
 ### Persistent knowledge graph and Obsidian
 
-Every run loads and validates the graph for its source problem, creates a distinct run node, and
-extends the same stable problem node used by earlier runs. Claims, proofs, audits,
+By default, MATEK normalizes the problem filename without its extension into a graph name:
+`problem.md` uses `.matek/knowledge/problem/`. A later run of that file loads and validates the
+same graph, creates a distinct run node, and extends the same stable problem node. A different
+filename gets a separate graph. To intentionally place related or follow-up work in an existing
+graph, pass `--knowledge-graph NAME`; an unknown name is rejected rather than silently creating
+one. The selected graph is frozen in run metadata, so resume cannot drift to another graph.
+
+Claims, proofs, audits,
 counterexamples, formalizations, sources, tasks, and artifacts remain separate typed notes with
 immutable IDs. The Markdown notes and flat YAML frontmatter are authoritative; SQLite is only a
 rebuildable index, and MATEK works normally when Obsidian is not installed.
 
-Open `.matek/knowledge/` as an Obsidian vault to use `Home.md`, backlinks, typed properties,
+Open `.matek/knowledge/<graph-name>/` as an Obsidian vault to use `Home.md`, backlinks, typed properties,
 dashboard notes, and the four curated canvases. Human prose outside `MATEK:GENERATED` markers and
 note filenames may be edited. Changing an exact claim statement increments its version and marks
 dependent proofs/formalizations stale; changing an audited proof requires re-audit. Fields named
@@ -348,18 +359,23 @@ than being overwritten.
 Useful offline commands include:
 
 ```bash
-matek graph status
-matek graph frontier
-matek graph validate
-matek graph show CLM-...
-matek graph dependencies CLM-...
-matek graph downstream CLM-...
-matek graph tombstone CLM-... --reason "Superseded by the corrected statement"
-matek graph diff REVISION_A REVISION_B
-matek graph export --format mermaid
-matek graph rebuild-index
-matek graph open
+matek graph list
+matek graph status --knowledge-graph problem
+matek graph frontier -g problem
+matek graph validate -g problem
+matek graph show CLM-... -g problem
+matek graph dependencies CLM-... -g problem
+matek graph downstream CLM-... -g problem
+matek graph tombstone CLM-... --reason "Superseded by the corrected statement" -g problem
+matek graph diff REVISION_A REVISION_B -g problem
+matek graph export --format mermaid -g problem
+matek graph rebuild-index -g problem
+matek graph open -g problem
 ```
+
+The graph commands omit `-g` safely when exactly one graph exists. If several exist, selection is
+required. `matek graph init NAME` can create an empty named graph for later explicit reuse;
+ordinary `matek init` leaves graph creation to the first problem run.
 
 ## How the workflow works
 
@@ -486,7 +502,8 @@ run and returns an actionable error; it cannot unexpectedly create Platform API 
 
 Important `run` options include `--backend codex|api`, `--max-agents`,
 `--max-coordinator-decisions`, `--time-limit-minutes`, `--no-web-search`, `--no-lean`,
-`--research-only`, `--dry-run`, `--sandbox native|docker`, and `--allow-project-edits`.
+`--research-only`, `--knowledge-graph NAME`, `--dry-run`, `--sandbox native|docker`, and
+`--allow-project-edits`.
 Deprecated `--max-rounds` is accepted only to migrate existing scripts to a decision budget; it
 does not select round-based execution.
 

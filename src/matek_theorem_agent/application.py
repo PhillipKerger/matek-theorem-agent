@@ -21,7 +21,13 @@ from .codex_client import CodexClient
 from .config import AppConfig, ModelSettings, config_as_toml, load_config, merge_config
 from .execution.base import ExecutionBackend
 from .intake import ingest_problem
-from .knowledge_graph import GraphValidationError, KnowledgeGraph
+from .knowledge_graph import (
+    GraphNotInitializedError,
+    GraphValidationError,
+    KnowledgeGraph,
+    normalize_graph_name,
+    problem_graph_name,
+)
 from .logging import RunLogger, load_usage_journal_strict
 from .models import RunState, ScientificStatus, StageName, StageStatus
 from .openai_client import ModelClient, ModelRequest
@@ -108,6 +114,7 @@ class WorkflowOptions(BaseModel):
     no_lean: bool = False
     research_only: bool = False
     allow_project_edits: bool = False
+    knowledge_graph: str | None = None
     invocation: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -230,12 +237,23 @@ class WorkflowRunner:
         self.config = config
         self.dependencies = dependencies
 
-    def _knowledge_graph(self, project_root: Path) -> KnowledgeGraph:
+    def _knowledge_graph(self, project_root: Path, graph_name: str) -> KnowledgeGraph:
         return KnowledgeGraph(
             project_root,
+            graph_name,
             maximum_context_nodes=self.config.graph.maximum_context_nodes,
             maximum_context_characters=self.config.graph.maximum_context_characters,
         )
+
+    @staticmethod
+    def _graph_name(state: RunState) -> str:
+        raw = state.metadata.get("knowledge_graph")
+        if not isinstance(raw, dict) or not isinstance(raw.get("name"), str):
+            raise StateCorruptionError("run has no persistent knowledge-graph name")
+        return normalize_graph_name(str(raw["name"]))
+
+    def _knowledge_graph_for_state(self, state: RunState) -> KnowledgeGraph:
+        return self._knowledge_graph(state.project_root, self._graph_name(state))
 
     @staticmethod
     def _graph_problem_id(state: RunState) -> str:
@@ -250,22 +268,44 @@ class WorkflowRunner:
         *,
         source_path: Path | None = None,
         problem_text: str | None = None,
+        graph_name: str | None = None,
+        selection: str | None = None,
     ) -> KnowledgeGraph:
         """Initialize/reconcile the persistent graph and reject conflicting edits."""
 
-        graph = self._knowledge_graph(state.project_root)
         graph_metadata = state.metadata.get("knowledge_graph")
         if not isinstance(graph_metadata, dict) or not isinstance(
             graph_metadata.get("problem_id"), str
         ):
-            if source_path is None:
-                invocation_path = state.run_root / "input" / "invocation.json"
-                try:
-                    invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
-                    candidate = Path(str(invocation["problem_file"]))
-                    source_path = candidate if candidate.is_file() else None
-                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    source_path = None
+            invocation_problem_path: Path | None = None
+            invocation_graph_name: str | None = None
+            invocation_path = state.run_root / "input" / "invocation.json"
+            try:
+                invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+                candidate = Path(str(invocation["problem_file"]))
+                invocation_problem_path = candidate
+                if source_path is None and candidate.is_file():
+                    source_path = candidate
+                arguments = invocation.get("arguments", {})
+                if isinstance(arguments, dict) and isinstance(
+                    arguments.get("knowledge_graph"), str
+                ):
+                    invocation_graph_name = normalize_graph_name(arguments["knowledge_graph"])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            if graph_name is None:
+                if invocation_graph_name is not None:
+                    graph_name = invocation_graph_name
+                    selection = selection or "explicit_existing"
+                elif source_path is not None:
+                    graph_name = problem_graph_name(source_path)
+                elif invocation_problem_path is not None:
+                    graph_name = problem_graph_name(invocation_problem_path)
+                else:
+                    raise StateCorruptionError(
+                        "a new run requires a problem path or explicit knowledge-graph name"
+                    )
+            graph = self._knowledge_graph(state.project_root, graph_name)
             source_path = source_path or (state.run_root / "input" / "problem.md")
             problem_text = problem_text or (state.run_root / "input" / "problem.md").read_text(
                 encoding="utf-8"
@@ -276,6 +316,7 @@ class WorkflowRunner:
                 run_id=state.run_id,
             )
         else:
+            graph = self._knowledge_graph_for_state(state)
             if not graph.initialized:
                 raise GraphValidationError(
                     "run metadata references a knowledge graph that is not initialized"
@@ -287,15 +328,26 @@ class WorkflowRunner:
         if not validation.valid:
             errors = [issue.message for issue in validation.issues if issue.severity == "error"]
             raise GraphValidationError("knowledge graph validation failed: " + "; ".join(errors))
+        existing_selection = (
+            str(graph_metadata.get("selection", "problem_stem"))
+            if isinstance(graph_metadata, dict)
+            else "problem_stem"
+        )
         state.metadata["knowledge_graph"] = {
+            "name": graph.graph_name,
             "problem_id": problem_id,
             "revision": revision,
-            "vault": ".matek/knowledge",
-            "index": ".matek/graph-index.sqlite",
+            "selection": selection or existing_selection,
+            "vault": f".matek/knowledge/{graph.graph_name}",
+            "index": f".matek/knowledge/{graph.graph_name}/graph-index.sqlite",
             "validation_warnings": [
                 issue.message for issue in validation.issues if issue.severity == "warning"
             ],
         }
+        configuration = state.metadata.get("configuration_summary")
+        if isinstance(configuration, dict):
+            configuration["knowledge_graph_name"] = graph.graph_name
+            configuration["knowledge_graph_vault"] = f".matek/knowledge/{graph.graph_name}"
         return graph
 
     def _refresh_graph_metadata(self, state: RunState, graph: KnowledgeGraph) -> None:
@@ -342,7 +394,7 @@ class WorkflowRunner:
             None,
         )
         axiom_path = state.run_root / "lean" / "axioms.txt"
-        graph = self._knowledge_graph(state.project_root)
+        graph = self._knowledge_graph_for_state(state)
         graph.record_lean_result(
             problem_id=self._graph_problem_id(state),
             run_id=state.run_id,
@@ -535,6 +587,18 @@ class WorkflowRunner:
         environment_snapshot: Mapping[str, Any] | None = None,
     ) -> WorkflowResult:
         selected = options or WorkflowOptions()
+        default_graph_name = problem_graph_name(problem_file)
+        if selected.knowledge_graph is None:
+            graph_name = default_graph_name
+            graph_selection = "problem_stem"
+        else:
+            graph_name = normalize_graph_name(selected.knowledge_graph)
+            graph_selection = "explicit_existing"
+            if not self._knowledge_graph(project_root, graph_name).initialized:
+                raise GraphNotInitializedError(
+                    f"knowledge graph {graph_name!r} does not exist; available graphs must be "
+                    "created by an earlier run or 'matek graph init GRAPH_NAME'"
+                )
         self.dependencies.progress(Ascension.FETCH_PROBLEM, "Fetching problem.")
         intake = ingest_problem(
             problem_file=problem_file,
@@ -550,6 +614,7 @@ class WorkflowRunner:
                     "research_only": selected.research_only,
                     "no_lean": selected.no_lean,
                     "allow_project_edits": selected.allow_project_edits,
+                    "knowledge_graph_requested": selected.knowledge_graph,
                     "custom_framework_path": (
                         str(selected.framework_path.resolve()) if selected.framework_path else None
                     ),
@@ -559,6 +624,8 @@ class WorkflowRunner:
                 intake.state,
                 source_path=problem_file,
                 problem_text=intake.problem_text,
+                graph_name=graph_name,
+                selection=graph_selection,
             )
             self._refresh_graph_metadata(intake.state, graph)
             self._sync_backend_metadata(intake.state)
@@ -1519,7 +1586,7 @@ class WorkflowRunner:
         result_path = state.run_root / "prompts" / "compiled_problem.json"
         if not self._begin(state, store, logger, StageName.PROMPT_COMPILATION):
             compiled = CompiledProblem.model_validate_json(result_path.read_text(encoding="utf-8"))
-            graph = self._knowledge_graph(state.project_root)
+            graph = self._knowledge_graph_for_state(state)
             graph.record_compiled_problem(
                 problem_id=self._graph_problem_id(state),
                 run_id=state.run_id,
@@ -1623,7 +1690,7 @@ class WorkflowRunner:
         else:
             state.scientific_status = ScientificStatus.PROMPT_COMPILED
             state.metadata["research_status"] = ScientificStatus.PROMPT_COMPILED.value
-        graph = self._knowledge_graph(state.project_root)
+        graph = self._knowledge_graph_for_state(state)
         graph.record_compiled_problem(
             problem_id=self._graph_problem_id(state),
             run_id=state.run_id,
@@ -1653,7 +1720,7 @@ class WorkflowRunner:
         result_path = state.run_root / "research" / "result.json"
         if not self._begin(state, store, logger, StageName.RESEARCH):
             result = ResearchResult.model_validate_json(result_path.read_text(encoding="utf-8"))
-            graph = self._knowledge_graph(state.project_root)
+            graph = self._knowledge_graph_for_state(state)
             graph.record_research_result(
                 problem_id=self._graph_problem_id(state),
                 run_id=state.run_id,
@@ -1731,7 +1798,7 @@ class WorkflowRunner:
                     },
                     source_verifier=self._source_verifier(state.run_root),
                     remaining_run_model_calls=remaining_global_calls,
-                    knowledge_graph=self._knowledge_graph(state.project_root),
+                    knowledge_graph=self._knowledge_graph_for_state(state),
                     graph_problem_id=self._graph_problem_id(state),
                     run_id=state.run_id,
                     graph_replay_dir=graph_replay_dir,
@@ -1747,7 +1814,7 @@ class WorkflowRunner:
             ResearchOutcome.PARTIAL: ScientificStatus.RESEARCH_PARTIAL,
             ResearchOutcome.BUDGET_EXHAUSTED: ScientificStatus.RESEARCH_PARTIAL,
         }[result.outcome]
-        graph = self._knowledge_graph(state.project_root)
+        graph = self._knowledge_graph_for_state(state)
         graph.record_research_result(
             problem_id=self._graph_problem_id(state),
             run_id=state.run_id,
@@ -1820,7 +1887,7 @@ class WorkflowRunner:
         result_path = state.run_root / "manuscript" / "result.json"
         if not self._begin(state, store, logger, StageName.MANUSCRIPT):
             result = ManuscriptResult.model_validate_json(result_path.read_text(encoding="utf-8"))
-            graph = self._knowledge_graph(state.project_root)
+            graph = self._knowledge_graph_for_state(state)
             graph.record_manuscript_result(
                 problem_id=self._graph_problem_id(state),
                 run_id=state.run_id,
@@ -1834,7 +1901,7 @@ class WorkflowRunner:
             "Writing manuscript and verifying bibliography.",
         )
         resume_bibliography = bool(state.metadata.get("resume_bibliography_correction", False))
-        graph = self._knowledge_graph(state.project_root)
+        graph = self._knowledge_graph_for_state(state)
         manuscript_graph_context = graph.manuscript_context(self._graph_problem_id(state))
         try:
             with resource_paths(
@@ -1984,8 +2051,8 @@ class WorkflowRunner:
                     ),
                     manuscript_result=manuscript,
                     claim_contract=compiled.claim_contract.as_dict(),
-                    knowledge_graph_context=self._knowledge_graph(
-                        state.project_root
+                    knowledge_graph_context=self._knowledge_graph_for_state(
+                        state
                     ).formalization_context(self._graph_problem_id(state)),
                     lean_dir=state.run_root / "lean",
                     lean_project_root=state.project_root,
@@ -2118,7 +2185,7 @@ class WorkflowRunner:
         existing = state.stages[StageName.REPORT]
         if existing.status is StageStatus.SUCCEEDED:
             return load_final_report(state.run_root)
-        graph = self._knowledge_graph(state.project_root)
+        graph = self._knowledge_graph_for_state(state)
         raw_obligations = state.metadata.get("unresolved_obligations", [])
         graph.record_run_status(
             problem_id=self._graph_problem_id(state),

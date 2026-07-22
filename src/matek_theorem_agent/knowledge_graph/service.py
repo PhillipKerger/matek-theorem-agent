@@ -75,7 +75,7 @@ from .models import (
 )
 
 GRAPH_SCHEMA_VERSION = 1
-GRAPH_VAULT_RELATIVE = Path(".matek") / "knowledge"
+GRAPH_COLLECTION_RELATIVE = Path(".matek") / "knowledge"
 GRAPH_DIRECTORIES = (
     "Problems",
     "Definitions",
@@ -96,6 +96,7 @@ GRAPH_DIRECTORIES = (
 
 _REVISION = re.compile(r"\A\d{8}-[0-9a-f]{16}\Z")
 _SLUG_UNSAFE = re.compile(r"[^a-z0-9]+")
+_GRAPH_NAME = re.compile(r"\A[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 
 
 class KnowledgeGraphError(RuntimeError):
@@ -141,6 +142,39 @@ def _slug(value: str) -> str:
     return _SLUG_UNSAFE.sub("-", ascii_value).strip("-")[:56] or "note"
 
 
+def normalize_graph_name(value: str) -> str:
+    """Return one portable graph-directory name from a problem stem or user label."""
+
+    normalized = _slug(value)[:64].rstrip("-")
+    if not _GRAPH_NAME.fullmatch(normalized):  # pragma: no cover - guarded by _slug
+        raise KnowledgeGraphError(f"invalid knowledge-graph name: {value!r}")
+    return normalized
+
+
+def problem_graph_name(source_path: Path) -> str:
+    """Derive the default graph identity from the problem filename without its extension."""
+
+    return normalize_graph_name(source_path.stem)
+
+
+def list_graph_names(project_root: Path) -> list[str]:
+    """List initialized named graphs without opening or mutating any of them."""
+
+    root = project_root.expanduser().resolve(strict=True)
+    collection = ensure_path_confined(root, root / GRAPH_COLLECTION_RELATIVE)
+    if not collection.is_dir():
+        return []
+    names: list[str] = []
+    for candidate in sorted(collection.iterdir(), key=lambda item: item.name):
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        if not _GRAPH_NAME.fullmatch(candidate.name):
+            continue
+        if (candidate / "graph-state.json").is_file():
+            names.append(candidate.name)
+    return names
+
+
 def _revision(number: int, node_hashes: Mapping[str, str]) -> str:
     digest = hashlib.sha256(_canonical_json(dict(sorted(node_hashes.items()))).encode()).hexdigest()
     return f"{number:08d}-{digest[:16]}"
@@ -171,17 +205,19 @@ def _unique_edges(edges: Iterable[GraphEdge]) -> list[GraphEdge]:
 
 
 class KnowledgeGraph:
-    """One project-scoped graph supporting multiple stable problem nodes.
+    """One named project-scoped graph supporting related stable problem nodes.
 
     MATEK's existing security contract permits automatic writes only beneath
-    ``.matek/``.  The Obsidian vault therefore lives at ``.matek/knowledge``;
-    opening that directory in Obsidian behaves like any other Markdown vault while
-    keeping ordinary workflow runs out of the user's source tree.
+    ``.matek/``.  Each Obsidian vault therefore lives at
+    ``.matek/knowledge/<graph-name>/``.  A normal run derives ``graph-name`` from
+    the problem filename; an explicit selection may attach related problems to an
+    existing graph without merging unrelated default vaults.
     """
 
     def __init__(
         self,
         project_root: Path,
+        graph_name: str,
         *,
         clock: Callable[[], datetime] | None = None,
         maximum_context_nodes: int = 48,
@@ -191,14 +227,19 @@ class KnowledgeGraph:
         if not root.is_dir():
             raise KnowledgeGraphError(f"project root is not a directory: {project_root}")
         self.project_root = root
-        self.matek_root = ensure_path_confined(root, root / ".matek")
-        self.vault_root = ensure_path_confined(root, root / GRAPH_VAULT_RELATIVE)
-        self.state_path = ensure_path_confined(root, self.matek_root / "graph-state.json")
-        self.schema_path = ensure_path_confined(root, self.matek_root / "graph-schema.json")
-        self.index_path = ensure_path_confined(root, self.matek_root / "graph-index.sqlite")
-        self.pending_path = ensure_path_confined(root, self.matek_root / "graph-pending.json")
-        self.snapshots_root = ensure_path_confined(root, self.matek_root / "snapshots")
-        self.locks_root = ensure_path_confined(root, self.matek_root / "locks")
+        self.graph_name = normalize_graph_name(graph_name)
+        self.collection_root = ensure_path_confined(root, root / GRAPH_COLLECTION_RELATIVE)
+        requested_root = root / GRAPH_COLLECTION_RELATIVE / self.graph_name
+        if requested_root.is_symlink():
+            raise KnowledgeGraphError(f"refusing symlinked knowledge graph: {requested_root}")
+        self.graph_root = ensure_path_confined(root, requested_root)
+        self.vault_root = self.graph_root
+        self.state_path = ensure_path_confined(root, self.graph_root / "graph-state.json")
+        self.schema_path = ensure_path_confined(root, self.graph_root / "graph-schema.json")
+        self.index_path = ensure_path_confined(root, self.graph_root / "graph-index.sqlite")
+        self.pending_path = ensure_path_confined(root, self.graph_root / "graph-pending.json")
+        self.snapshots_root = ensure_path_confined(root, self.graph_root / "snapshots")
+        self.locks_root = ensure_path_confined(root, self.graph_root / "locks")
         self.lock_path = ensure_path_confined(root, self.locks_root / "graph.lock")
         self._clock = clock or _utc_now
         self.maximum_context_nodes = maximum_context_nodes
@@ -214,7 +255,8 @@ class KnowledgeGraph:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        self.matek_root.mkdir(mode=0o700, exist_ok=True)
+        self.collection_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.graph_root.mkdir(mode=0o700, exist_ok=True)
         self.locks_root.mkdir(mode=0o700, exist_ok=True)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -235,8 +277,8 @@ class KnowledgeGraph:
         return self.state_path.is_file() and self.vault_root.is_dir()
 
     def _ensure_layout(self) -> None:
-        self.matek_root.mkdir(mode=0o700, exist_ok=True)
-        self.vault_root.mkdir(mode=0o700, exist_ok=True)
+        self.collection_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.graph_root.mkdir(mode=0o700, exist_ok=True)
         self.snapshots_root.mkdir(mode=0o700, exist_ok=True)
         self.locks_root.mkdir(mode=0o700, exist_ok=True)
         for relative in GRAPH_DIRECTORIES:
@@ -259,7 +301,7 @@ class KnowledgeGraph:
             "relation_types": [item.value for item in RelationType],
             "node_types": [item.value for item in NodeType],
         }
-        atomic_write_json(self.schema_path, schema, confinement_root=self.matek_root)
+        atomic_write_json(self.schema_path, schema, confinement_root=self.graph_root)
 
     def initialize(self) -> GraphState:
         """Create an empty portable vault and derived index idempotently."""
@@ -274,11 +316,12 @@ class KnowledgeGraph:
                 now = self._now()
                 empty_revision = _revision(0, {})
                 state = GraphState(
+                    graph_name=self.graph_name,
                     revision=empty_revision,
                     created_at=now,
                     updated_at=now,
                 )
-                atomic_write_json(self.state_path, state, confinement_root=self.matek_root)
+                atomic_write_json(self.state_path, state, confinement_root=self.graph_root)
                 self._write_snapshot_unlocked(state, [])
             nodes = self._load_nodes_unlocked(include_human_notes=True)
             self._write_navigation_unlocked(state, nodes)
@@ -288,7 +331,8 @@ class KnowledgeGraph:
     def _load_state_unlocked(self) -> GraphState:
         if not self.state_path.is_file():
             raise GraphNotInitializedError(
-                f"knowledge graph is not initialized; run 'matek graph init' in {self.project_root}"
+                "knowledge graph is not initialized; run "
+                f"'matek graph init {self.graph_name}' in {self.project_root}"
             )
         try:
             state = GraphState.model_validate_json(self.state_path.read_text(encoding="utf-8"))
@@ -296,6 +340,10 @@ class KnowledgeGraph:
             raise GraphValidationError(f"graph state is invalid: {exc}") from exc
         if not _REVISION.fullmatch(state.revision):
             raise GraphValidationError("graph state contains an invalid revision identifier")
+        if state.graph_name != self.graph_name:
+            raise GraphValidationError(
+                f"graph state is named {state.graph_name!r}, not {self.graph_name!r}"
+            )
         return state
 
     def load_state(self) -> GraphState:
@@ -337,7 +385,7 @@ class KnowledgeGraph:
                 atomic_write_text(
                     target, cast(str, contents), confinement_root=self.vault_root, mode=0o600
                 )
-        atomic_write_json(self.state_path, state_after, confinement_root=self.matek_root)
+        atomic_write_json(self.state_path, state_after, confinement_root=self.graph_root)
         nodes = self._load_nodes_unlocked(include_human_notes=True)
         self._write_snapshot_unlocked(state_after, nodes)
         self._write_navigation_unlocked(state_after, nodes)
@@ -504,13 +552,13 @@ class KnowledgeGraph:
             "writes": writes,
             "state_after": next_state.model_dump(mode="json"),
         }
-        atomic_write_json(self.pending_path, transaction, confinement_root=self.matek_root)
+        atomic_write_json(self.pending_path, transaction, confinement_root=self.graph_root)
         for write in writes:
             target = ensure_path_confined(self.vault_root, self.vault_root / write["path"])
             atomic_write_text(
                 target, write["contents"], confinement_root=self.vault_root, mode=0o600
             )
-        atomic_write_json(self.state_path, next_state, confinement_root=self.matek_root)
+        atomic_write_json(self.state_path, next_state, confinement_root=self.graph_root)
         committed_nodes = list(nodes.values())
         self._write_snapshot_unlocked(next_state, committed_nodes)
         self._write_navigation_unlocked(next_state, committed_nodes)
@@ -566,7 +614,7 @@ class KnowledgeGraph:
             else self._load_nodes_unlocked(include_human_notes=True)
         )
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".graph-index.", suffix=".sqlite", dir=self.matek_root
+            prefix=".graph-index.", suffix=".sqlite", dir=self.graph_root
         )
         os.close(descriptor)
         temporary = Path(temporary_name)
@@ -1202,6 +1250,7 @@ class KnowledgeGraph:
     def status(self) -> GraphStatus:
         if not self.initialized:
             return GraphStatus(
+                graph_name=self.graph_name,
                 initialized=False,
                 vault_path=str(self.vault_root),
                 revision=None,
@@ -1216,6 +1265,7 @@ class KnowledgeGraph:
             state = self._load_state_unlocked()
             nodes = self._load_nodes_unlocked(include_human_notes=True)
             return GraphStatus(
+                graph_name=self.graph_name,
                 initialized=True,
                 vault_path=str(self.vault_root),
                 revision=state.revision,
@@ -3715,12 +3765,15 @@ class KnowledgeGraph:
 
 
 __all__ = [
+    "GRAPH_COLLECTION_RELATIVE",
     "GRAPH_DIRECTORIES",
     "GRAPH_SCHEMA_VERSION",
-    "GRAPH_VAULT_RELATIVE",
     "GraphConflictError",
     "GraphNotInitializedError",
     "GraphValidationError",
     "KnowledgeGraph",
     "KnowledgeGraphError",
+    "list_graph_names",
+    "normalize_graph_name",
+    "problem_graph_name",
 ]

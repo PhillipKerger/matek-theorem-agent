@@ -41,9 +41,11 @@ are created in a disposable private temporary directory and removed afterward.
 
 ## Filesystem confinement
 
-The persistent graph vault is `.matek/knowledge/`, not a top-level project directory. This is a
-normal Obsidian vault while retaining the default no-write-outside-`.matek/` guarantee. Graph
-paths are confinement-checked; a project-scoped advisory lock serializes writers. Workers return
+Persistent graph vaults are `.matek/knowledge/<graph-name>/`, not top-level project directories.
+Each is a normal Obsidian vault while retaining the default no-write-outside-`.matek/` guarantee.
+Graph names are normalized to portable single-directory slugs, explicit reuse requires an
+initialized graph, and paths are confinement-checked. A graph-scoped advisory lock serializes
+writers. Workers return
 data-only patches and never receive filesystem authority to edit shared notes. A write-ahead
 transaction, node hashes, machine-field ownership hashes, snapshots, and operation IDs prevent
 partial, conflicting, or duplicated commits. SQLite is untrusted derived state and is rebuildable
