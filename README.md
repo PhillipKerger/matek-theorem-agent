@@ -275,6 +275,12 @@ records and declines that recommendation, then asks for new or redirected work. 
 scientifically only with acceptance of the exact claim or a verified exact refutation; configured
 resource/provider limits can still produce a truthful budget outcome or retriable pause.
 
+After `matek run` or `matek resume` returns, the CLI prints a deterministic **MATEK run summary**.
+It states whether the exact problem passed the research gate, where execution stopped, the work
+completed, the strongest retained result, remaining obligations, the next action, and the paths to
+the full report and run artifacts. This terminal handoff is derived from the persisted report and
+does not consume an additional model call.
+
 Coordinator transport defaults to a conservative 800,000-character ceiling measured after the
 backend has serialized its final input. Compaction never byte-truncates JSON or mathematics. Each
 activation persists a manifest with included and omitted artifact IDs, validated relative paths,

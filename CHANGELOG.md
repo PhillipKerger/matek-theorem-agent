@@ -41,6 +41,9 @@
   remain durable intermediate evidence, while scientific no-progress/reduction stop requests are
   declined and research continues until exact acceptance, exact refutation, or an explicit
   resource/provider boundary.
+- `matek run` and `matek resume` now finish with a deterministic terminal report summary covering
+  exact-problem resolution, stopping point, completed work, strongest result, remaining
+  obligations, next action, and artifact locations without adding another model call.
 - Literature-only source outages now quarantine and qualify dependent claims without blocking
   research, with an `arxiv.org/abs/` fallback; strict proof, citation, and bibliography gates are
   unchanged.

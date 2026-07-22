@@ -897,6 +897,12 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     assert "web access" in invocation.output
     assert "up to 32 effective" in invocation.output
     assert "no automatic API fallback" in invocation.output
+    assert "MATEK run summary" in invocation.output
+    assert "Problem solved?" in invocation.output
+    assert "UNDETERMINED" in invocation.output
+    assert "Where it stopped" in invocation.output
+    assert "Prompt compilation" in invocation.output
+    assert "Full report" in invocation.output
     assert "stopped before research" in invocation.output
     assert "What mathematical objects are being extended?" in invocation.output
     [run_root] = (project / ".matek" / "runs").iterdir()
@@ -1127,6 +1133,16 @@ async def test_complete_continuous_pipeline_is_lean_verified_and_resume_is_noop(
     assert result.report.report.lean_status == ScientificStatus.LEAN_VERIFIED.value
     assert result.state.stages[StageName.LEAN_VERIFICATION].status is StageStatus.SUCCEEDED
     assert result.report.report.artifacts
+    with cli_module.console.capture() as capture:
+        cli_module._print_result(result)
+    terminal_summary = capture.get()
+    assert "MATEK run summary" in terminal_summary
+    assert "Problem solved?" in terminal_summary
+    assert "YES — the exact research result passed" in terminal_summary
+    assert "Research performed" in terminal_summary
+    assert "Strongest result" in terminal_summary
+    assert "Full report" in terminal_summary
+    assert str(result.report.report_markdown) in terminal_summary
     report_markdown = result.report.report_markdown.read_text(encoding="utf-8")
     assert all(f"[`{relative}`]" in report_markdown for relative in result.report.report.artifacts)
     assert (result.state.run_root / "manuscript" / "paper.pdf").is_file()

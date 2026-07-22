@@ -16,6 +16,7 @@ import typer
 from pydantic import BaseModel
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .application import (
     LeanConsentOutcome,
@@ -64,6 +65,7 @@ from .openai_client import (
 )
 from .progress import Ascension
 from .redaction import redact_text
+from .reporting import FinalReport
 from .resources import resource_path
 from .stages.compile_prompt import EXPECTED_FRAMEWORK_SHA256
 from .state import (
@@ -461,16 +463,123 @@ def _validate_problem_for_dry_run(problem_file: Path) -> str:
     return normalize_problem_text(content)
 
 
+def _compact_terminal_text(value: str, *, limit: int = 600) -> str:
+    """Keep the terminal handoff readable without changing the persisted report."""
+
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def _problem_resolution_summary(report: FinalReport) -> str:
+    if report.scientific_status == "RESEARCH_ACCEPTED_FOR_MANUSCRIPT":
+        return "YES — the exact research result passed the mandatory acceptance gate."
+    if report.scientific_status == "RESEARCH_REJECTED":
+        return "NO — MATEK did not establish an accepted proof; the research result was rejected."
+    if report.scientific_status == "NEEDS_PROBLEM_CLARIFICATION":
+        return "UNDETERMINED — the target must be clarified before research can start."
+    if report.scientific_status == "CANDIDATE_AWAITING_AUDIT":
+        return "NOT YET — a candidate exists but mandatory audits are still incomplete."
+    return "NOT YET — no proof of the exact target has passed the acceptance gate."
+
+
+def _workflow_stop_summary(report: FinalReport) -> str:
+    if report.problem_clarification.get("required") is True:
+        return "Prompt compilation: the mathematical target was ambiguous."
+    checkpoint = report.research_checkpoint
+    if report.workflow_status == "PAUSED_RETRIABLE":
+        phase = checkpoint.get("phase") if isinstance(checkpoint, dict) else None
+        suffix = f" (scheduler phase: {phase})" if phase else ""
+        return f"Paused retriably during research{suffix}."
+    failed = [
+        stage.replace("_", " ")
+        for stage, status in report.stage_statuses.items()
+        if status in {"failed", "interrupted", "running"}
+    ]
+    if failed:
+        return f"Stopped at {', '.join(failed)}."
+    if report.scientific_status in {"RESEARCH_PARTIAL", "RESEARCH_REJECTED"}:
+        return "Research ended without an accepted proof of the exact target."
+    if report.workflow_status == "COMPLETE_WITH_WARNINGS":
+        return "All reachable stages finished; warnings or publication blockers remain."
+    return "All configured and reachable workflow stages finished."
+
+
+def _research_activity_summary(report: FinalReport) -> str:
+    checkpoint = report.research_checkpoint
+    if not isinstance(checkpoint, dict) or not checkpoint:
+        return "Research did not produce a scheduler checkpoint."
+    assignments = checkpoint.get("assignments", {})
+    completed = assignments.get("completed", 0) if isinstance(assignments, dict) else 0
+    decisions = checkpoint.get("coordinator_decisions", 0)
+    rejected = checkpoint.get("rejected_candidates", 0)
+    completed_audits = checkpoint.get("completed_audits", [])
+    audits = ", ".join(str(item) for item in completed_audits) or "none"
+    return (
+        f"{completed} worker report(s); {decisions} coordinator decision(s); "
+        f"{rejected} rejected candidate(s); completed audits: {audits}."
+    )
+
+
+def _terminal_summary_rows(result: WorkflowResult) -> list[tuple[str, str]]:
+    report = result.report.report
+    completed_stages = [
+        stage.replace("_", " ")
+        for stage, status in report.stage_statuses.items()
+        if status == "succeeded"
+    ]
+    skipped_stages = [
+        str(item.get("stage", "unknown")).replace("_", " ") for item in report.skipped_stages
+    ]
+    next_action = report.resume_action
+    if not next_action and report.problem_clarification.get("required") is True:
+        next_action = "Clarify the problem statement and start a new run."
+    if not next_action and report.retriable_actions:
+        next_action = report.retriable_actions[0]
+    if not next_action:
+        next_action = "Review the full report and retained artifacts."
+
+    rows = [
+        ("Run", result.state.run_id),
+        ("Problem solved?", _problem_resolution_summary(report)),
+        ("Where it stopped", _workflow_stop_summary(report)),
+        ("Scientific", report.scientific_status),
+        ("Workflow", report.workflow_status),
+        ("Manuscript", report.manuscript_status),
+        ("Publication", report.publication_status),
+        ("Lean", report.lean_status),
+        ("Research performed", _research_activity_summary(report)),
+        ("Completed stages", ", ".join(completed_stages) or "none"),
+    ]
+    if skipped_stages:
+        rows.append(("Skipped stages", ", ".join(skipped_stages)))
+    rows.extend(
+        [
+            ("Strongest result", _compact_terminal_text(report.strongest_result)),
+            ("Next action", _compact_terminal_text(next_action)),
+        ]
+    )
+    return rows
+
+
 def _print_result(result: WorkflowResult) -> None:
-    console.print(f"Run: [bold]{result.state.run_id}[/bold]")
+    table = Table(title="MATEK run summary", show_header=False)
+    table.add_column("Item", style="bold cyan", no_wrap=True)
+    table.add_column("Result")
+    for label, value in _terminal_summary_rows(result):
+        table.add_row(Text(label), Text(value))
+    console.print(table)
+    report_path = Text("Full report: ", style="bold cyan")
+    report_path.append(str(result.report.report_markdown))
+    console.print(report_path, soft_wrap=True)
+    artifact_path = Text("Run artifacts: ", style="bold cyan")
+    artifact_path.append(str(result.state.run_root))
+    console.print(artifact_path, soft_wrap=True)
+
     backend = result.state.metadata.get("backend", {})
     if isinstance(backend, dict):
         console.print(f"Backend: {backend.get('display_name', backend.get('provider', 'unknown'))}")
-    console.print(f"Research: {result.report.report.scientific_status}")
-    console.print(f"Workflow: {result.report.report.workflow_status}")
-    console.print(f"Manuscript: {result.report.report.manuscript_status}")
-    console.print(f"Publication: {result.report.report.publication_status}")
-    console.print(f"Lean: {result.report.report.lean_status}")
     clarification = result.report.report.problem_clarification
     if clarification.get("required") is True:
         console.print(
@@ -488,7 +597,13 @@ def _print_result(result: WorkflowResult) -> None:
             "Revise the problem file with the requested details, then start a new run with "
             "[bold]matek run PROBLEM_FILE[/bold]."
         )
-    console.print(f"Report: {result.report.report_markdown}")
+    obligations = result.report.report.unresolved_obligations
+    if obligations:
+        console.print("[bold yellow]Remaining obligations[/bold yellow]")
+        for obligation in obligations[:5]:
+            console.print("  • ", Text(_compact_terminal_text(obligation)), sep="")
+        if len(obligations) > 5:
+            console.print(f"  • … and {len(obligations) - 5} more in the full report")
 
 
 def _project_graph(graph_name: str | None = None) -> KnowledgeGraph:

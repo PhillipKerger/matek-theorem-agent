@@ -173,6 +173,13 @@ persisted initial count and effective concurrency. They do not repeat at artific
 boundaries; candidate-audit milestones may recur for distinct candidate attempts. Skipped or
 already checkpointed stages do not print misleading progress lines.
 
+After `run` or `resume` returns a finalized report, MATEK prints a deterministic terminal summary
+derived from that report. It answers whether the exact problem passed the scientific acceptance
+gate, identifies where execution stopped, summarizes worker/coordinator/audit activity and stage
+coverage, shows the strongest retained result and next action, lists remaining obligations, and
+prints complete paths to the report and run artifacts. Terminal summarization does not make an
+additional model call.
+
 After research is accepted and a safe manuscript draft is durable, an interactive full run asks.
 Publication warnings or a failed bibliography gate do not misrepresent the scientific result and
 do not independently block statement-aligned formalization:
