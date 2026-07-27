@@ -15,6 +15,13 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   conflicts, unknown Markdown notes, crash recovery, snapshots, diffs, and SQLite rebuilds.
 - Frontier selection, graph-scoped task creation, bounded context slices, manuscript mappings,
   and exact-version Lean records.
+- Bootstrap, existing-graph, continuation, and resume activation metadata; exact reviewed-revision
+  attestation; and current-frontier reconstruction without provider conversation memory.
+- Explicit assignment branch-target validation, including rejection of empty, unknown,
+  cross-problem, tombstoned, and non-research targets without main-claim fallback.
+- Distinct same-family assignment branches, durable blocked/refuted outcomes and reopen
+  conditions, and conservative branch-local counterexample links that cannot silently refute the
+  main claim.
 - Graph CLI behavior, including graceful operation when Obsidian is not installed.
 - Problem-stem graph naming, isolation between different problem files, explicit existing-graph
   reuse for follow-up work, unknown-name rejection, resume identity freezing, and ambiguous CLI

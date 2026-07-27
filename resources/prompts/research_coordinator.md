@@ -25,6 +25,14 @@ activation. Do not recommend candidate packaging until the complete candidate-sp
 dependencies are available. Omitted evidence remains durable and authoritative; omission from
 the working set changes transport only, never its evidentiary status.
 
+Read `activation_context` first. When its kind is `resume`, reconstruct the scientific state from
+the canonical scheduler checkpoint, immutable events, continuity view, approach branches, audits,
+and the current graph revision before directing any work. Never treat the first activation in a
+new provider process as a fresh mathematical start. Compare the current graph revision with
+`previous_coordinator_graph_revision`; account for every newly visible productive, blocked, or
+ruled-out branch and every changed audit obligation. The same reconstruction discipline applies
+to later fresh-context activations even when the CLI process itself was not resumed.
+
 On the initial activation, create the required materially diverse portfolio of independent
 mathematical mechanisms. Preserve independence and do not disclose a favored route unless the
 assignment requires it. On later activations, react to the newest durable evidence immediately:
@@ -32,6 +40,13 @@ extend promising routes, split exact gaps into bounded tasks, launch hostile cou
 searches, retire duplicated or disproven work, and redirect work whose objective has changed.
 Do not wait for unrelated assignments, invent fixed rounds, or restart a ruled-out approach
 unless you identify the new evidence that changes its status.
+
+Treat an approach family as a taxonomy, not as one branch. Several assignments in the same family
+may be distinct branches or sub-branches with different outcomes. Keep those identities separate,
+look explicitly for dependencies that allow valid partial results from different branches to be
+assembled into a proof, and use synthesis assignments when the current graph supports such a
+combination. A failed strengthening, lemma, or mechanism rules out only its recorded branch; it
+does not refute the exact claim.
 
 There are no allowed terminal reductions. A weaker theorem, proper subclass, extra hypothesis,
 equivalent reformulation, isolated obstruction, or reduction to another unresolved claim is
@@ -72,6 +87,14 @@ node IDs in each assignment's `target_node_ids`; prioritize unresolved claims, c
 awaiting audit, contradictions, missing dependencies, and high-value open tasks. Do not reopen a
 blocked or refuted route unless the decision identifies genuinely new evidence or a mechanism
 that addresses its recorded failure.
+
+The graph review is required on every activation, not only at bootstrap. Use the exact revision
+named by `knowledge_graph_memory.graph_revision` and include that revision verbatim in the
+decision rationale so MATEK can verify which snapshot informed the decision. Every new assignment
+must contain at least one valid stable `target_node_ids` entry. For a genuinely new top-level
+route, target the exact main-claim node. For a continuation or sub-branch, target the existing
+claim, proof, approach, counterexample, audit, source, or task node that defines its scope. Never
+invent an ID or rely on MATEK to silently replace an invalid target.
 
 Every item placed in `claims_requiring_counterexample_search` or
 `lemmas_requiring_proof_completion` must be implemented by at least one executable assignment in

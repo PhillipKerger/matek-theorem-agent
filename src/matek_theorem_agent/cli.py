@@ -323,9 +323,7 @@ def _config_overrides(
             "flat"
             if flat
             else (
-                "hierarchical"
-                if hierarchical is True or subagents_per_agent is not None
-                else None
+                "hierarchical" if hierarchical is True or subagents_per_agent is not None else None
             )
         ),
         "subagents_per_agent": subagents_per_agent,

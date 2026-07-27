@@ -71,6 +71,20 @@ stale patch produces a durable warning while the proof, counterexample, or parti
 available. MATEK binds graph content hashes from the frozen revision rather than trusting hashes
 supplied by a worker.
 
+Every new coordinator payload includes an activation context. It distinguishes bootstrap,
+existing-graph bootstrap, continuation, and process resume; says explicitly that no provider
+conversation memory may be assumed; and identifies the current and previously observed graph
+revisions. The coordinator reconstructs the current branch map from the canonical scheduler,
+events, registry, continuity state, audits, and graph frontier, then includes the reviewed
+revision in its decision rationale. This applies to same-run resume as well as graph reuse across
+runs.
+
+Graph-scoped assignments fail closed unless they name at least one existing live target belonging
+to the selected problem. MATEK never silently replaces an unknown, cross-problem, tombstoned, or
+non-research target with the main claim. A top-level route normally targets the main claim; a
+continuation or sub-branch targets the claim, proof, approach, counterexample, source, audit, or
+task that actually defines its scope.
+
 Research is a nested orchestration boundary. The deterministic outer workflow starts or resumes
 one application-owned logical research coordinator and gives it the complete, unabridged compiled
 research prompt and exact claim contract. This is MATEK's closest reproducible analogue of giving
@@ -172,6 +186,13 @@ with an exact recovery obligation. Research continues until the exact claim is a
 refuted, or an explicit resource/provider boundary is reached. Workers must return concrete formal
 content using `ResearchWorkerReport`; a blocked route must identify the exact missing statement
 and any counterexample found.
+
+The approach registry and graph preserve one entry per assignment branch rather than collapsing
+all work sharing an approach-family label. Blocked and ruled-out branches retain their exact gap,
+counterexamples, and reopen condition even when another branch in the same family remains
+productive. Automatically distilled worker counterexamples are linked to their approach branch,
+not promoted to refutations of the main theorem. A claim-level refutation requires an explicit
+typed graph proposal and still passes through independent scientific review.
 
 There is no cumulative research-worker ceiling. Total-open-assignment, active-concurrency,
 coordinator-decision, model-call, cost, token, and optional active-wall-clock limits remain

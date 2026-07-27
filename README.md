@@ -254,14 +254,18 @@ The prompt flow is:
    the scheduler constraints. Before its first decision, it also reviews the selected knowledge
    graph's problem-scoped overview and frontier when prior graph memory exists, then uses stable
    node IDs and prior results, failures, gaps, audits, and tasks to shape delegation. The API
-   adapter also requests pro mode. Its first decision creates eight precise, materially
-   different assignments by default.
+   adapter also requests pro mode. On resume, an explicit activation context tells it to
+   reconstruct the current scientific state from the canonical checkpoint and compare the current
+   graph revision with the revision seen by its previous decision; no provider conversation is
+   assumed. Its first decision creates eight precise, materially different assignments by
+   default.
 3. Every independent GPT 5.6 Sol xhigh worker receives the complete big prompt, the exact
    claim contract, and one assignment containing its route, inputs, expected output, and stopping
    condition, plus a bounded graph slice containing its stable task/target IDs and relevant prior
    dependencies, proofs, counterexamples, sources, and audits. The assignment narrows the route
    but cannot change the target. Workers do not see or coordinate with concurrent workers and
-   return structured graph patches instead of editing the vault.
+   return structured graph patches instead of editing the vault. Graph assignments must name
+   explicit live targets; invalid IDs fail instead of falling back to the main claim.
 4. When any worker finishes, MATEK saves its complete raw report and associated
    `research/source-verification/<assignment-id>.json` first, checkpoints the transition with its
    pending-event write-ahead record, creates a sequenced immutable event such as
@@ -279,6 +283,12 @@ The prompt flow is:
    blocked routes, exact gaps, dependencies, prior directives, and audit repairs. The canonical
    scheduler checkpoint, immutable event evidence, and full reports remain available; the index
    never compresses them away.
+
+Approach families are broad labels, while each assignment is a durable branch or sub-branch.
+MATEK keeps separate registry entries and graph nodes for same-family assignments, so a later
+productive report cannot overwrite an earlier blocked or ruled-out route. Branch-local
+counterexamples stay linked to that branch. Promoting one to a refutation of a claim requires an
+explicit typed proposal and independent review.
 
 The coordinator is “continuous” as a logical actor, not one never-ending Codex/API request. Each
 activation may use a fresh provider context. `research/coordinator/state.json` is the canonical
@@ -420,6 +430,12 @@ Claims, proofs, audits,
 counterexamples, formalizations, sources, tasks, and artifacts remain separate typed notes with
 immutable IDs. The Markdown notes and flat YAML frontmatter are authoritative; SQLite is only a
 rebuildable index, and MATEK works normally when Obsidian is not installed.
+
+Every coordinator activation reviews the current frontier revision, including after
+`matek resume`, and records that revision in its decision rationale. Tasks point to explicit graph nodes
+that define their branch scope. Blocked and ruled-out approaches retain their exact failure,
+counterexamples, and reopen condition, while partial results from different branches remain
+available for later synthesis.
 
 Managed notes use their human-readable title as the filename, with the immutable MATEK ID kept in
 the parent directory. Obsidian therefore shows titles rather than IDs in Graph view without making

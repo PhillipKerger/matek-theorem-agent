@@ -322,15 +322,23 @@ class CoordinatorContextBuilder:
             "graph_revision": graph_memory.get("graph_revision"),
             "problem_id": graph_memory.get("problem_id"),
             "index_path": graph_memory.get("index_path"),
-            "node_count": overview_mapping.get(
-                "node_count", graph_memory.get("node_count")
-            ),
-            "edge_count": overview_mapping.get(
-                "edge_count", graph_memory.get("edge_count")
-            ),
+            "node_count": overview_mapping.get("node_count", graph_memory.get("node_count")),
+            "edge_count": overview_mapping.get("edge_count", graph_memory.get("edge_count")),
             "review_required_before_delegation": graph_memory.get(
                 "review_required_before_delegation", False
             ),
+            "current_frontier_review_required": graph_memory.get(
+                "current_frontier_review_required", True
+            ),
+            "resume_reconstruction": graph_memory.get("resume_reconstruction", False),
+            "previous_coordinator_graph_revision": graph_memory.get(
+                "previous_coordinator_graph_revision"
+            ),
+            "graph_changed_since_previous_coordinator_activation": graph_memory.get(
+                "graph_changed_since_previous_coordinator_activation", False
+            ),
+            "overview": dict(overview_mapping),
+            "instruction": graph_memory.get("instruction"),
             "retrieval_instruction": (
                 "Use graph_node_summaries as the bounded working set. Read the validated graph "
                 "index or a hash-bound node path only when deeper graph evidence is needed."
@@ -339,16 +347,13 @@ class CoordinatorContextBuilder:
 
     @staticmethod
     def _mandatory_payload(source: Mapping[str, object]) -> dict[str, object]:
-        return {
-            key: source[key]
-            for key in ("compiled_prompt", "claim_contract")
-            if key in source
-        }
+        return {key: source[key] for key in ("compiled_prompt", "claim_contract") if key in source}
 
     @staticmethod
     def _operational_controls(source: Mapping[str, object]) -> dict[str, object]:
         keys = {
             "coordinator_mode",
+            "activation_context",
             "research_agent_hierarchy",
             "decision_id",
             "after_event_sequence",
@@ -360,6 +365,7 @@ class CoordinatorContextBuilder:
             "refundable_unlaunched_assignment_count",
             "coordinator_headroom_borrowed_assignment_id",
             "maximum_new_assignments_this_decision",
+            "replacement_rule",
             "maximum_concurrent_workers",
             "worker_web_search_enabled",
             "open_assignment_count",
@@ -426,14 +432,11 @@ class CoordinatorContextBuilder:
         _, compact_probe_characters = self._measure(compact_probe)
         mode: Literal["compact", "indexed"] = (
             "indexed"
-            if indexed_base is not None
-            and compact_probe_characters > self.packing_character_limit
+            if indexed_base is not None and compact_probe_characters > self.packing_character_limit
             else "compact"
         )
         source_base = (
-            indexed_base
-            if mode == "indexed" and indexed_base is not None
-            else compact_base
+            indexed_base if mode == "indexed" and indexed_base is not None else compact_base
         )
         return self._build_bounded(
             decision_id=decision_id,
@@ -512,6 +515,7 @@ class CoordinatorContextBuilder:
             minimum_controls: dict[str, object] = {
                 key: source_base[key]
                 for key in (
+                    "activation_context",
                     "research_agent_hierarchy",
                     "decision_id",
                     "after_event_sequence",
@@ -642,8 +646,7 @@ class CoordinatorContextBuilder:
             lifecycle.append(assignment_item)
             candidate_serialized, candidate_characters = self._measure(payload)
             if (
-                field_characters("assignment_lifecycle")
-                > section_caps["assignment_lifecycle"]
+                field_characters("assignment_lifecycle") > section_caps["assignment_lifecycle"]
                 or candidate_characters > packing_limit
             ):
                 lifecycle.pop()
@@ -662,8 +665,7 @@ class CoordinatorContextBuilder:
             payload["unacknowledged_events"] = selected_events
             candidate_serialized, candidate_characters = self._measure(payload)
             if (
-                field_characters("unacknowledged_events")
-                > section_caps["unacknowledged_events"]
+                field_characters("unacknowledged_events") > section_caps["unacknowledged_events"]
                 or candidate_characters > packing_limit
             ):
                 selected_events.remove(event)
@@ -809,8 +811,7 @@ class CoordinatorContextBuilder:
             lifecycle.append(assignment_item)
             candidate_serialized, candidate_characters = self._measure(payload)
             if (
-                field_characters("assignment_lifecycle")
-                > section_caps["assignment_lifecycle"]
+                field_characters("assignment_lifecycle") > section_caps["assignment_lifecycle"]
                 or candidate_characters > packing_limit
             ):
                 lifecycle.pop()

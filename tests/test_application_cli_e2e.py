@@ -88,6 +88,26 @@ E2E_CLAIM_CONTRACT = {
     "quantifiers": "for every natural number n",
     "conclusion": "P(n)",
 }
+
+
+def graph_decision_contract(payload: dict[str, Any], rationale: str) -> tuple[str, str]:
+    memory = payload["knowledge_graph_memory"]
+    assert isinstance(memory, dict)
+    revision = memory["graph_revision"]
+    assert isinstance(revision, str)
+    summaries = payload.get("graph_node_summaries", [])
+    target_id = next(
+        (
+            item["matek_id"]
+            for item in summaries
+            if isinstance(item, dict) and item.get("node_type") == "claim"
+        ),
+        memory["problem_id"],
+    )
+    assert isinstance(target_id, str)
+    return target_id, f"Graph review {revision}: {rationale}"
+
+
 FRAMEWORK_SECTIONS = (
     "Current task statement",
     "Exact success criterion",
@@ -185,6 +205,14 @@ class ResearchWorkflowModel:
         elif output_type is ResearchCoordinatorDecision:
             payload = json.loads(request.input_text)
             decision_id = int(payload["decision_id"])
+            target_id, graph_rationale = graph_decision_contract(
+                payload,
+                (
+                    "Four materially different proof mechanisms."
+                    if decision_id == 1
+                    else "Use the durable candidate and audit state."
+                ),
+            )
             completed_ids = [
                 report["assignment_id"] for report in payload["visible_worker_reports"]
             ]
@@ -204,6 +232,7 @@ class ResearchWorkflowModel:
                             approach_family=family,
                             task=f"Develop the {family} route.",
                             expected_output="A complete proof or an exact obstruction.",
+                            target_node_ids=[target_id],
                         )
                         for index, family in enumerate(
                             ("direct", "structural", "counterexample", "literature"),
@@ -214,11 +243,13 @@ class ResearchWorkflowModel:
                     else []
                 ),
                 rationale=(
-                    "Four materially different proof mechanisms."
+                    graph_rationale
                     if decision_id == 1
-                    else "The independent judge definitively refuted the fixture candidate."
+                    else f"{graph_rationale} The independent judge definitively refuted the "
+                    "fixture candidate."
                     if definitively_refuted
-                    else "Submit the completed route for an aggregate independent judgment."
+                    else f"{graph_rationale} Submit the completed route for an aggregate "
+                    "independent judgment."
                 ),
                 candidate_packaging_recommended=decision_id > 1 and not definitively_refuted,
                 candidate_report_ids=(
@@ -547,6 +578,10 @@ class FullWorkflowModel(ResearchWorkflowModel):
             self.requests.append((request, output_type))
             payload = json.loads(request.input_text)
             decision_id = int(payload["decision_id"])
+            target_id, graph_rationale = graph_decision_contract(
+                payload,
+                "Synthesize newly completed independent evidence.",
+            )
             families = (
                 ("direct", "structural", "counterexample", "literature")
                 if decision_id == 1
@@ -561,10 +596,11 @@ class FullWorkflowModel(ResearchWorkflowModel):
                         approach_family=family,
                         task=f"Develop the {family} route after decision {decision_id}.",
                         expected_output="A complete proof or an exact obstruction.",
+                        target_node_ids=[target_id],
                     )
                     for index, family in enumerate(families, start=1)
                 ],
-                rationale="The follow-up synthesizes newly completed independent evidence.",
+                rationale=graph_rationale,
             )
         elif output_type is ResearchWorkerReport:
             assignment = json.loads(request.input_text)["assignment"]
@@ -1658,7 +1694,7 @@ async def test_force_prompt_stage_reuses_successful_source_work_and_records(
 async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    runner, _, _, _ = workflow_runner(project, accepted=True)
+    runner, model, _, _ = workflow_runner(project, accepted=True)
     problem = make_problem(project)
 
     first = await runner.run_new(
@@ -1688,6 +1724,31 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
     run_ids = {node.created_in_run for node in nodes if node.node_type is NodeType.RUN}
     assert {first.state.run_id, second.state.run_id} <= run_ids
     assert graph.validate().valid
+    coordinator_payloads = [
+        json.loads(request.input_text)
+        for request, output_type in model.requests
+        if output_type is ResearchCoordinatorDecision
+    ]
+    assert coordinator_payloads[0]["activation_context"]["kind"] == "bootstrap"
+    assert coordinator_payloads[1]["activation_context"]["kind"] == "existing_graph_bootstrap"
+    assert (
+        coordinator_payloads[1]["knowledge_graph_memory"]["review_required_before_delegation"]
+        is True
+    )
+    assert (
+        coordinator_payloads[1]["activation_context"]["provider_conversation_memory_assumed"]
+        is False
+    )
+    second_decision = json.loads(
+        (
+            second.state.run_root / "research" / "coordinator" / "decisions" / "00000001.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert all(assignment["target_node_ids"] for assignment in second_decision["assignments"])
+    assert (
+        coordinator_payloads[1]["knowledge_graph_memory"]["graph_revision"]
+        in second_decision["rationale"]
+    )
 
 
 @pytest.mark.asyncio

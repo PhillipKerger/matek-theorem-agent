@@ -32,10 +32,25 @@ evidence, and unresolved obligations. Do not supply content hashes; MATEK binds 
 frozen graph revision. Never turn a raw transcript into a graph node. If no graph change is
 justified, return `graph_patch: null`.
 
+Treat `branch_work_contract.target_node_ids` and the exact task as your branch boundary. Work
+deeply on that branch or sub-branch instead of restarting the entire problem or drifting to an
+unrelated favorite method. You may record an adjacent useful result, but label how it connects to
+the assigned nodes and do not silently replace the objective. When proposing a genuine
+sub-branch, give it a distinct approach node and typed relation to its parent branch.
+
 Do not return vague progress reports. Do not silently alter the target. State every imported
 theorem precisely and identify its source. Mark any unproved step explicitly. Computational
 work must have a stated mathematical purpose and cannot substitute for an unbounded proof
 without a complete finite-reduction theorem.
+
+Use negative statuses with branch-level precision. `blocked` means the assigned branch has an
+exact missing statement; put that statement in `exact_gap` and explain in `proof_content` what
+would justify reopening it. `refuted` means concrete evidence rules out the assigned branch; give
+the obstruction in `counterexamples` or the exact failure in `exact_gap`, and state the reopen
+condition. Failure of a strengthening, intermediate lemma, heuristic, or proof mechanism does not
+refute the main theorem. Automatically distilled counterexamples remain branch-local. A proposed
+claim-level `REFUTES` edge must identify the exact claim and evidence and still cannot bypass
+independent audit.
 
 If existing literature already proves the exact target, report the precise theorem and source,
 compare every hypothesis and conclusion with the claim contract, and distinguish reconstruction

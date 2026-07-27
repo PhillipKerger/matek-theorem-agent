@@ -251,6 +251,18 @@ sources, and Lean formalizations. Status promotion and staleness are determinist
 rules. The manuscript and Lean stages consume accepted graph slices, and their mappings and exact
 verification records are written back only after existing gates pass.
 
+Fresh coordinator calls carry an explicit bootstrap/continuation/resume activation context,
+current and previously observed graph revisions, and a no-hidden-memory reconstruction contract.
+The decision attests the reviewed revision before new tasks are accepted. Assignment targets are
+validated as live stable nodes in the selected problem; invalid IDs never fall back silently to
+the main claim.
+
+Approach families are labels, while assignment IDs define durable branch identity. Separate
+assignments in one family therefore create separate approach nodes and registry entries. A
+blocked or refuted branch cannot be overwritten by a later productive sibling. Conservative
+automatic distillation links counterexamples to the branch that produced them; claim-level
+refutation requires an explicit typed patch and independent scientific review.
+
 Each `.matek/knowledge/<graph-name>/` directory is an ordinary Obsidian-compatible vault and a
 separate portable source of truth. New runs normally derive `<graph-name>` from the source
 filename stem; `--knowledge-graph NAME` deliberately attaches related work to an already

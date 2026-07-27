@@ -189,6 +189,14 @@ formalization, and generates a reproducible final report.
   research frontier when prior graph memory exists, then use prior results, failures, gaps,
   audits, and tasks to shape graph-scoped assignments. Workers receive bounded context slices and
   return structured optimistic-concurrency patches rather than mutating the shared vault.
+- Every fresh-context coordinator activation, especially after `resume`, shall receive an explicit
+  activation kind, the current and previously observed graph revisions, and a no-hidden-memory
+  reconstruction instruction. It shall attest the exact reviewed graph revision in its decision
+  and reconsider productive, blocked, and ruled-out branches, open tasks, audit obligations, and
+  cross-branch proof-synthesis opportunities before assigning work.
+- Every new graph-scoped assignment shall name at least one existing, problem-scoped, live stable
+  target node. Unknown, cross-problem, tombstoned, or non-research targets shall fail validation;
+  MATEK shall not silently substitute the main claim for an invalid target.
 - Patch merges shall validate types, IDs, relation constraints, dependency acyclicity, duplicate
   likelihood, node hashes, status transitions, and base revisions before an atomic commit and
   snapshot/index update.
@@ -197,6 +205,11 @@ formalization, and generates a reproducible final report.
   build result, and axiom report.
 - Distilled failed/blocked work and valid partial results shall persist across incomplete runs;
   raw transcripts remain run artifacts rather than first-class graph nodes.
+- Approach families are taxonomic groupings, not branch identities. Each assignment branch or
+  sub-branch shall retain its own approach record and node so a later report in the same family
+  cannot overwrite a prior blocked or ruled-out route. Automatically distilled counterexamples
+  are branch-local; claim-level refutation requires an explicit typed proposal and remains subject
+  to independent scientific audit.
 - Humans may rename notes and edit prose outside generated blocks. Exact-statement/proof edits
   trigger versioning/re-audit; machine-field conflicts fail validation instead of being silently
   overwritten.

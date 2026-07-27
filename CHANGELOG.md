@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Added explicit bootstrap/continuation/resume coordinator activation metadata with current and
+  previous graph revisions. Fresh coordinator contexts now reconstruct the branch map from
+  canonical scheduler, event, audit, continuity, registry, and graph state, and decisions attest
+  the reviewed revision.
+- Made graph assignment targets fail closed: every new assignment names a live stable node in the
+  selected problem, with no silent fallback for empty, unknown, cross-problem, tombstoned, or
+  non-research targets.
+- Preserved one registry record and graph approach node per assignment branch rather than
+  collapsing same-family work. Blocked/refuted branches retain their failure and reopen
+  conditions, while automatically distilled counterexamples remain branch-local unless an
+  explicit typed claim-refutation proposal passes independent review.
+- Fixed worker graph-patch role binding so a worker cannot impersonate an auditor, create
+  `audit_passed` or `lean_verified` evidence, or directly mark a claim refuted.
+
 ## 0.3.0 — 2026-07-23
 
 - Made Codex hierarchical research the default: eight first-level workers may each use up to

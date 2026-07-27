@@ -28,7 +28,7 @@ from ..coordinator_context import (
     serialize_coordinator_payload,
 )
 from ..failures import classify_failure, recovery_obligations
-from ..knowledge_graph import GraphPatch, KnowledgeGraph
+from ..knowledge_graph import GraphPatch, GraphValidationError, KnowledgeGraph
 from ..models import FailureCategory
 from ..openai_client import (
     ModelClient,
@@ -217,6 +217,9 @@ class ResearchAssignmentState(BaseModel):
     graph_task_id: str | None = None
     graph_revision: str | None = None
     graph_context: dict[str, object] | None = None
+    # Assignments created before branch-scoped graph enforcement remain readable.
+    # New graph-integrated assignments use version 1 and are validated strictly.
+    graph_contract_version: Literal[1] | None = None
     graph_patch_path: str | None = None
     graph_patch_sha256: str | None = None
     repair_generation: int = Field(default=0, ge=0, le=1)
@@ -454,11 +457,14 @@ class WorkerCollectionResult(BaseModel):
 
 
 class ApproachRecord(BaseModel):
+    branch_id: str = ""
     family: str
     mechanism: str
     strongest_result: str = ""
     exact_gap: str = ""
     status: str = "active"
+    target_node_ids: list[str] = Field(default_factory=list)
+    reopen_condition: str = ""
     assumptions: list[str] = Field(default_factory=list)
     counterexamples: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
@@ -469,21 +475,29 @@ class ApproachRegistry(BaseModel):
     approaches: list[ApproachRecord] = Field(default_factory=list)
 
     def update(self, assignment: ResearchAssignment, report: ResearchWorkerReport) -> None:
-        key = assignment.approach_family.casefold().strip()
-        existing = next(
-            (item for item in self.approaches if item.family.casefold().strip() == key), None
-        )
+        # One family can contain several independent branches and sub-branches. Keep
+        # them separate so a later report cannot overwrite a blocked or refuted route.
+        existing = next((item for item in self.approaches if item.branch_id == assignment.id), None)
         strongest = "\n\n".join(item for item in report.formal_results if item.strip())
         if not strongest:
             strongest = report.proof_content.strip()
+        reopen_condition = (
+            "Reopen only with new evidence that resolves the recorded exact gap or defeats "
+            "the recorded counterexample."
+            if report.status in {WorkerStatus.BLOCKED, WorkerStatus.REFUTED}
+            else "Continue only through a coordinator assignment targeting the remaining gap."
+        )
         if existing is None:
             self.approaches.append(
                 ApproachRecord(
+                    branch_id=assignment.id,
                     family=assignment.approach_family,
                     mechanism=report.mechanism or assignment.task,
                     strongest_result=strongest,
                     exact_gap=report.exact_gap or "",
                     status=report.status.value,
+                    target_node_ids=list(dict.fromkeys(assignment.target_node_ids)),
+                    reopen_condition=reopen_condition,
                     assumptions=list(dict.fromkeys(report.assumptions)),
                     counterexamples=list(dict.fromkeys(report.counterexamples)),
                     dependencies=list(dict.fromkeys(report.dependencies)),
@@ -500,6 +514,10 @@ class ApproachRegistry(BaseModel):
                 dict.fromkeys(item for item in (existing.exact_gap, report.exact_gap) if item)
             )
         existing.status = report.status.value
+        existing.target_node_ids = list(
+            dict.fromkeys([*existing.target_node_ids, *assignment.target_node_ids])
+        )
+        existing.reopen_condition = reopen_condition
         existing.assumptions = list(dict.fromkeys([*existing.assumptions, *report.assumptions]))
         existing.counterexamples = list(
             dict.fromkeys([*existing.counterexamples, *report.counterexamples])
@@ -519,6 +537,7 @@ class ResearchContinuityRoute(BaseModel):
     event_sequence: int = 0
     assignment_id: str
     approach_family: str
+    target_node_ids: list[str] = Field(default_factory=list)
     status: WorkerStatus
     mechanism: str
     formal_results: list[str]
@@ -527,6 +546,7 @@ class ResearchContinuityRoute(BaseModel):
     assumptions: list[str]
     counterexamples: list[str]
     dependencies: list[str]
+    reopen_condition: str = ""
 
 
 class ResearchContinuityState(BaseModel):
@@ -1748,9 +1768,33 @@ async def run_adaptive_research(
                     "knowledge_graph_context": record.graph_context,
                     "graph_task_id": record.graph_task_id,
                     "base_graph_revision": record.graph_revision,
+                    "branch_work_contract": {
+                        "contract_version": record.graph_contract_version,
+                        "target_node_ids": record.assignment.target_node_ids,
+                        "scope_rule": (
+                            "Treat these target nodes and the exact task as this assignment's "
+                            "branch boundary. Work deeply on that branch. Record adjacent useful "
+                            "facts without silently changing the assigned objective."
+                        ),
+                        "negative_result_rule": (
+                            "If this branch cannot work, use blocked for a precise missing "
+                            "statement or refuted only for a concrete obstruction to this "
+                            "assigned branch. State the exact failure and evidence. Do not claim "
+                            "that the main theorem is false merely because a strengthening, "
+                            "lemma, or mechanism fails."
+                        ),
+                        "reopen_rule": (
+                            "For blocked or refuted work, make proof_content identify what new "
+                            "evidence or mechanism would justify reopening the branch."
+                        ),
+                    },
                     "graph_patch_contract": (
                         "Return graph_patch as a structured proposal. Do not edit the shared "
-                        "vault. Distill mathematical results; do not copy raw transcripts."
+                        "vault. Distill mathematical results; do not copy raw transcripts. "
+                        "Use the frozen task and target IDs. Create a distinct approach node "
+                        "for a genuine sub-branch and propose explicit typed relations. A "
+                        "branch-local counterexample must not be linked as a refutation of the "
+                        "exact main claim."
                     ),
                 }
             )
@@ -2222,6 +2266,7 @@ async def run_adaptive_research(
                     event_sequence=record.completed_event_sequence or 0,
                     assignment_id=report.assignment_id,
                     approach_family=record.assignment.approach_family,
+                    target_node_ids=record.assignment.target_node_ids,
                     status=report.status,
                     mechanism=report.mechanism or record.assignment.task,
                     formal_results=report.formal_results,
@@ -2230,6 +2275,12 @@ async def run_adaptive_research(
                     assumptions=report.assumptions,
                     counterexamples=report.counterexamples,
                     dependencies=report.dependencies,
+                    reopen_condition=(
+                        "Reopen only with new evidence that resolves the recorded exact gap or "
+                        "defeats the recorded counterexample."
+                        if report.status in {WorkerStatus.BLOCKED, WorkerStatus.REFUTED}
+                        else "Continue through a coordinator task targeting the remaining gap."
+                    ),
                 )
             )
         decisions = [item.decision for item in scheduler.decisions]
@@ -2810,6 +2861,9 @@ async def run_adaptive_research(
                 "status": record.status.value,
                 "approach_family": record.assignment.approach_family,
                 "objective": compact_text(record.assignment.task),
+                "target_node_ids": record.assignment.target_node_ids,
+                "graph_task_id": record.graph_task_id,
+                "frozen_graph_revision": record.graph_revision,
                 "artifact_id": (
                     f"worker-report:{record.assignment.id}" if record.report_path else None
                 ),
@@ -3020,6 +3074,21 @@ async def run_adaptive_research(
             )
         return result
 
+    def previous_coordinator_graph_revision() -> str | None:
+        """Read the graph revision actually seen by the last committed activation."""
+
+        if not scheduler.decisions:
+            return None
+        previous_request = resolved_artifact(scheduler.decisions[-1].request_path)
+        raw = json.loads(read_regular_text(previous_request))
+        if not isinstance(raw, dict):
+            raise StageValidationError("Previous coordinator request is not a JSON object.")
+        memory = raw.get("knowledge_graph_memory")
+        if not isinstance(memory, dict):
+            return None
+        revision = memory.get("graph_revision")
+        return revision if isinstance(revision, str) else None
+
     def provider_input_character_measure(
         serialized_payload: str,
         model_settings: ModelSettings,
@@ -3188,6 +3257,7 @@ async def run_adaptive_research(
         }
         graph_memory: dict[str, object] | None = None
         replayed_graph_payload: dict[str, object] | None = None
+        prior_graph_revision = previous_coordinator_graph_revision()
         if knowledge_graph is not None:
             assert graph_problem_id is not None
             replay_request = (
@@ -3212,11 +3282,60 @@ async def run_adaptive_research(
                 graph_memory = knowledge_graph.coordinator_memory(
                     graph_problem_id,
                     current_run_id=run_id,
+                    resume_reconstruction=resumed,
+                    previous_coordinator_revision=prior_graph_revision,
                 )
             payload["knowledge_graph_memory"] = graph_memory
+        prior_node_count = 0
+        if graph_memory is not None:
+            overview = graph_memory.get("overview")
+            if isinstance(overview, dict):
+                raw_prior_count = overview.get("prior_node_count", 0)
+                if isinstance(raw_prior_count, int) and not isinstance(raw_prior_count, bool):
+                    prior_node_count = raw_prior_count
+        activation_kind = (
+            "resume"
+            if resumed
+            else "existing_graph_bootstrap"
+            if initial and prior_node_count > 0
+            else "bootstrap"
+            if initial
+            else "continuation"
+        )
+        payload["activation_context"] = {
+            "kind": activation_kind,
+            "run_resumed_from_canonical_checkpoint": resumed,
+            "provider_conversation_memory_assumed": False,
+            "coordinator_decisions_already_committed": len(scheduler.decisions),
+            "durable_events_already_committed": event_sequence,
+            "knowledge_graph_contract_version": 1 if graph_memory is not None else None,
+            "branch_target_binding_required": graph_memory is not None,
+            "graph_review_attestation_required": graph_memory is not None,
+            "current_graph_revision": (
+                graph_memory.get("graph_revision") if graph_memory is not None else None
+            ),
+            "previous_coordinator_graph_revision": prior_graph_revision,
+            "graph_changed_since_previous_coordinator_activation": (
+                graph_memory.get("graph_changed_since_previous_coordinator_activation", False)
+                if graph_memory is not None
+                else False
+            ),
+            "instruction": (
+                "Reconstruct the scientific state from the canonical scheduler, new events, "
+                "continuity, registry, audits, and the current graph frontier before directing "
+                "work. Compare productive, blocked, and ruled-out branches; look for proof "
+                "synthesis across branches; then bind every new assignment to explicit stable "
+                "target_node_ids. Include the current graph revision verbatim in the decision "
+                "rationale."
+                if graph_memory is not None
+                else "Reconstruct state only from the durable scheduler payload; never assume "
+                "provider conversation memory."
+            ),
+        }
         decision_model_settings = coordinator_model
         control_keys = {
             "coordinator_mode",
+            "activation_context",
             "research_agent_hierarchy",
             "compiled_prompt",
             "claim_contract",
@@ -3268,10 +3387,13 @@ async def run_adaptive_research(
             base["approach_registry"] = {
                 "approaches": [
                     {
+                        "branch_id": approach.branch_id,
                         "approach_family": approach.family,
                         "status": approach.status,
                         "mechanism": compact_text(approach.mechanism),
                         "exact_gap": compact_text(approach.exact_gap, words=64),
+                        "target_node_ids": approach.target_node_ids,
+                        "reopen_condition": compact_text(approach.reopen_condition, words=48),
                         "assignment_ids": approach.assignment_ids,
                     }
                     for approach in registry.approaches
@@ -3322,9 +3444,7 @@ async def run_adaptive_research(
                 "latest_final_judge_verdict",
             }
             base = {
-                key: source_payload[key]
-                for key in indexed_control_keys
-                if key in source_payload
+                key: source_payload[key] for key in indexed_control_keys if key in source_payload
             }
             assignment_counts = {
                 status.value: len(assignment_records(status)) for status in AssignmentLifecycle
@@ -3453,17 +3573,16 @@ async def run_adaptive_research(
             ]
             catalog_identity = sha256_json(complete_catalog)
             complete_catalog_path = _atomic_write_immutable_json(
-                context_catalogs_dir
-                / f"{decision_id:08d}-{catalog_identity[:16]}.json",
+                context_catalogs_dir / f"{decision_id:08d}-{catalog_identity[:16]}.json",
                 {
                     "schema_version": 1,
                     "decision_id": decision_id,
                     "artifacts": complete_catalog,
                 },
             )
-            artifact_paths[
-                f"coordinator_artifact_catalog_{decision_id}_{catalog_identity[:8]}"
-            ] = complete_catalog_path
+            artifact_paths[f"coordinator_artifact_catalog_{decision_id}_{catalog_identity[:8]}"] = (
+                complete_catalog_path
+            )
             builder = CoordinatorContextBuilder(
                 configured_character_limit=settings.maximum_coordinator_context_characters,
                 effective_character_limit=character_limit,
@@ -3520,8 +3639,7 @@ async def run_adaptive_research(
             if (
                 prior_manifest_path.is_file()
                 and pending_request.context_manifest_sha256 is not None
-                and sha256_file(prior_manifest_path)
-                == pending_request.context_manifest_sha256
+                and sha256_file(prior_manifest_path) == pending_request.context_manifest_sha256
             ):
                 prior_manifest = CoordinatorContextManifest.model_validate_json(
                     read_regular_text(prior_manifest_path)
@@ -3822,6 +3940,39 @@ async def run_adaptive_research(
             known_assignment_ids={record.assignment.id for record in scheduler.assignments},
             completed_assignment_ids=completed_ids,
         )
+        activation_contract = payload.get("activation_context")
+        graph_contract_version = (
+            activation_contract.get("knowledge_graph_contract_version")
+            if isinstance(activation_contract, dict)
+            else None
+        )
+        if knowledge_graph is not None and graph_contract_version == 1:
+            request_graph_memory = payload.get("knowledge_graph_memory")
+            if not isinstance(request_graph_memory, dict):
+                raise StageValidationError(
+                    "Graph-integrated coordinator request lost its graph memory descriptor."
+                )
+            reviewed_revision = request_graph_memory.get("graph_revision")
+            if (
+                not isinstance(reviewed_revision, str)
+                or reviewed_revision not in decision.rationale
+            ):
+                raise StageValidationError(
+                    "Coordinator decision did not attest the exact graph revision reviewed in "
+                    "its rationale."
+                )
+            assert graph_problem_id is not None
+            try:
+                knowledge_graph.validate_assignment_targets(
+                    problem_id=graph_problem_id,
+                    assignments=[
+                        assignment.model_dump(mode="json") for assignment in decision.assignments
+                    ],
+                )
+            except GraphValidationError as exc:
+                raise StageValidationError(
+                    f"Coordinator decision has invalid graph branch targets: {exc}"
+                ) from exc
         scientific_stop_declined = bool(
             decision.stop_recommended and decision.stop_category == "scientific"
         )
@@ -3952,6 +4103,7 @@ async def run_adaptive_research(
                     run_id=run_id,
                     decision_id=decision.decision_id,
                     assignments=[item.model_dump(mode="json") for item in decision.assignments],
+                    allow_legacy_default_targets=graph_contract_version != 1,
                 )
                 graph_tasks = task_map
                 graph_contexts = {
@@ -3969,6 +4121,7 @@ async def run_adaptive_research(
                     dict[str, object] | None,
                     graph_contexts.get(assignment.id),
                 ),
+                graph_contract_version=(1 if graph_contract_version == 1 else None),
             )
             reserve_worker_request(record)
             scheduler.assignments.append(record)
@@ -4075,6 +4228,29 @@ async def run_adaptive_research(
                 f"Worker report {result.parsed.assignment_id!r} does not match "
                 f"assignment {assignment.id!r}."
             )
+        if record.graph_contract_version == 1:
+            if not assignment.target_node_ids:
+                raise StageValidationError(
+                    f"Graph-scoped worker {assignment.id!r} has no stable branch target."
+                )
+            if not (result.parsed.mechanism or "").strip():
+                raise StageValidationError(
+                    f"Graph-scoped worker {assignment.id!r} did not identify its mechanism."
+                )
+            if result.parsed.status is WorkerStatus.REFUTED and not (
+                result.parsed.counterexamples or (result.parsed.exact_gap or "").strip()
+            ):
+                raise StageValidationError(
+                    f"Refuted branch {assignment.id!r} has no concrete obstruction or exact "
+                    "failure statement."
+                )
+            if (
+                result.parsed.status is WorkerStatus.CANDIDATE_COMPLETE
+                and (result.parsed.exact_gap or "").strip()
+            ):
+                raise StageValidationError(
+                    f"Candidate-complete branch {assignment.id!r} still declares an exact gap."
+                )
         evidence_path = worker_evidence_dir / f"{assignment.id}.json"
         if evidence_path.is_file():
             evidence = ResearchWorkerEvidence.model_validate_json(read_regular_text(evidence_path))

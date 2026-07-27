@@ -18,9 +18,11 @@ from matek_theorem_agent.knowledge_graph import (
     GraphNodeUpdate,
     GraphPatch,
     GraphStatusChange,
+    GraphValidationError,
     KnowledgeGraph,
     NodeType,
     RelationType,
+    WorkflowStatus,
     list_graph_names,
     problem_graph_name,
 )
@@ -127,7 +129,173 @@ def test_existing_problem_graph_requires_coordinator_review_before_delegation(
     frontier = memory["frontier"]
     assert isinstance(frontier, dict)
     assert frontier["unresolved_claims"]
-    assert "Before creating initial assignments" in memory["instruction"]
+    assert "Reconstruct the current branch map" in memory["instruction"]
+
+
+def test_same_run_resume_requires_current_frontier_reconstruction(tmp_path: Path) -> None:
+    graph, _, problem_id, _ = initialized_graph(tmp_path)
+
+    memory = graph.coordinator_memory(
+        problem_id,
+        current_run_id="run-one",
+        resume_reconstruction=True,
+        previous_coordinator_revision="00000000-0000000000000000",
+    )
+
+    assert memory["review_required_before_delegation"] is True
+    assert memory["current_frontier_review_required"] is True
+    assert memory["resume_reconstruction"] is True
+    assert memory["graph_changed_since_previous_coordinator_activation"] is True
+    assert memory["graph_revision"] in memory["instruction"]
+
+
+def test_assignment_graph_targets_are_explicit_and_never_silently_replaced(
+    tmp_path: Path,
+) -> None:
+    graph, _, problem_id, _ = initialized_graph(tmp_path)
+
+    with pytest.raises(GraphValidationError, match="must name at least one graph target"):
+        graph.record_assignment_tasks(
+            problem_id=problem_id,
+            run_id="run-one",
+            decision_id=3,
+            assignments=[
+                {
+                    "id": "untargeted",
+                    "approach_family": "direct",
+                    "task": "Try a direct proof.",
+                    "expected_output": "A proof or exact obstruction.",
+                    "target_node_ids": [],
+                }
+            ],
+        )
+
+    with pytest.raises(GraphValidationError, match="unknown target"):
+        graph.validate_assignment_targets(
+            problem_id=problem_id,
+            assignments=[
+                {
+                    "id": "invented-target",
+                    "target_node_ids": ["CLM-NOTREAL1"],
+                }
+            ],
+        )
+
+
+def test_same_family_worker_branches_keep_distinct_negative_history(tmp_path: Path) -> None:
+    graph, _, problem_id, _ = initialized_graph(tmp_path)
+    target_id = graph.main_claim_id(problem_id)
+    tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id="run-one",
+        decision_id=4,
+        assignments=[
+            {
+                "id": "algebra-strengthening",
+                "approach_family": "algebraic",
+                "task": "Test a strong algebraic invariant.",
+                "expected_output": "A proof or a concrete obstruction.",
+                "target_node_ids": [target_id],
+            },
+            {
+                "id": "algebra-decomposition",
+                "approach_family": "algebraic",
+                "task": "Develop a decomposition lemma.",
+                "expected_output": "A precise lemma and proof.",
+                "target_node_ids": [target_id],
+            },
+        ],
+    )
+
+    graph.integrate_worker_report(
+        problem_id=problem_id,
+        run_id="run-one",
+        assignment={
+            "id": "algebra-strengthening",
+            "approach_family": "algebraic",
+            "task": "Test a strong algebraic invariant.",
+            "target_node_ids": [target_id],
+        },
+        task_id=tasks["algebra-strengthening"],
+        report={
+            "assignment_id": "algebra-strengthening",
+            "status": "refuted",
+            "formal_results": [],
+            "proof_content": "The strengthening fails on the smallest nontrivial object.",
+            "exact_gap": None,
+            "counterexamples": ["A three-element object violates the proposed invariant."],
+            "dependencies": [],
+            "assumptions": [],
+            "mechanism": "Strong algebraic invariant",
+            "sources": [],
+        },
+        proposed_patch=None,
+        source_artifact="research/workers/algebra-strengthening.json",
+        operation_id="worker-report:run-one:algebra-strengthening",
+    )
+    graph.integrate_worker_report(
+        problem_id=problem_id,
+        run_id="run-one",
+        assignment={
+            "id": "algebra-decomposition",
+            "approach_family": "algebraic",
+            "task": "Develop a decomposition lemma.",
+            "target_node_ids": [target_id],
+        },
+        task_id=tasks["algebra-decomposition"],
+        report={
+            "assignment_id": "algebra-decomposition",
+            "status": "progress",
+            "formal_results": ["Every minimal object admits the required decomposition."],
+            "proof_content": "Choose a minimal separator and decompose along it.",
+            "exact_gap": "Show that the decomposition recombines without loss.",
+            "counterexamples": [],
+            "dependencies": [],
+            "assumptions": [],
+            "mechanism": "Minimal-separator decomposition",
+            "sources": [],
+        },
+        proposed_patch=None,
+        source_artifact="research/workers/algebra-decomposition.json",
+        operation_id="worker-report:run-one:algebra-decomposition",
+    )
+
+    nodes = graph.load_nodes()
+    algebra_branches = [
+        node
+        for node in nodes
+        if node.node_type is NodeType.APPROACH
+        and node.metadata.get("matek_assignment_ids")
+        in (["algebra-strengthening"], ["algebra-decomposition"])
+    ]
+    assert len(algebra_branches) == 2
+    refuted_branch = next(
+        node
+        for node in algebra_branches
+        if node.metadata["matek_assignment_ids"] == ["algebra-strengthening"]
+    )
+    productive_branch = next(
+        node
+        for node in algebra_branches
+        if node.metadata["matek_assignment_ids"] == ["algebra-decomposition"]
+    )
+    assert refuted_branch.epistemic_status is EpistemicStatus.REFUTED
+    assert refuted_branch.workflow_status is WorkflowStatus.ABANDONED
+    assert productive_branch.epistemic_status is EpistemicStatus.OPEN
+    assert productive_branch.workflow_status is WorkflowStatus.ACTIVE
+
+    [counterexample] = [node for node in nodes if node.node_type is NodeType.COUNTEREXAMPLE]
+    assert any(
+        edge.relation is RelationType.RELATED_TO and edge.target_id == refuted_branch.matek_id
+        for edge in counterexample.relations
+    )
+    assert not any(
+        edge.relation is RelationType.REFUTES and edge.target_id == target_id
+        for edge in counterexample.relations
+    )
+    assert refuted_branch.matek_id in {
+        item.matek_id for item in graph.frontier(problem_id).refuted_or_unproductive_routes
+    }
 
 
 def test_obsidian_note_paths_use_titles_and_migrate_legacy_generated_names(
@@ -214,6 +382,49 @@ def test_patch_merge_validates_relations_duplicates_and_lean_promotion(tmp_path:
     )
     assert rejected.status == "rejected"
     assert "deterministic Lean" in " ".join(rejected.issues)
+
+    prepromoted = GraphPatch(
+        base_graph_revision=graph.load_state().revision,
+        run_id="run-one",
+        task_id=task_id,
+        create_nodes=[
+            GraphNodeCreate(
+                matek_id="CLM-TEST0002",
+                node_type=NodeType.CLAIM,
+                claim_type=ClaimType.LEMMA,
+                title="Worker-preapproved lemma",
+                body="## Exact statement\n\nA worker-declared audited lemma.",
+                epistemic_status=EpistemicStatus.AUDIT_PASSED,
+            )
+        ],
+    )
+    prepromoted_result = graph.merge_patch(
+        prepromoted,
+        problem_id=problem_id,
+        operation_id="worker-created-audit-promotion",
+    )
+    assert prepromoted_result.status == "rejected"
+    assert "independent audit" in " ".join(prepromoted_result.issues)
+
+    worker_refutation = GraphPatch(
+        base_graph_revision=graph.load_state().revision,
+        run_id="run-one",
+        task_id=task_id,
+        proposed_status_changes=[
+            GraphStatusChange(
+                matek_id=claim_id,
+                epistemic_status=EpistemicStatus.REFUTED,
+                reason="The worker claims a counterexample.",
+            )
+        ],
+    )
+    worker_refutation_result = graph.merge_patch(
+        worker_refutation,
+        problem_id=problem_id,
+        operation_id="worker-claim-refutation",
+    )
+    assert worker_refutation_result.status == "rejected"
+    assert "independent review" in " ".join(worker_refutation_result.issues)
     tombstone = graph.tombstone(proof_id, reason="Superseded by a corrected proof.")
     assert tombstone.committed
     assert graph.show(proof_id).tombstone
@@ -253,7 +464,7 @@ def test_accepted_result_marks_exact_main_proof_support_subgraph(tmp_path: Path)
                     node_type=NodeType.SOURCE,
                     title="Needed imported result",
                     body="## Source record\n\nVerified source metadata.",
-                    epistemic_status=EpistemicStatus.AUDIT_PASSED,
+                    epistemic_status=EpistemicStatus.CANDIDATE,
                 ),
                 GraphNodeCreate(
                     matek_id=approach_id,

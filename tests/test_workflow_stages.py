@@ -707,8 +707,29 @@ async def test_invalid_optional_graph_proposal_does_not_discard_scientific_repor
                 assert memory["node_count"] > 0
                 assert memory["graph_root"].endswith("/resilience")
                 assert payload["graph_node_summaries"]
+                assert payload["activation_context"]["kind"] == "existing_graph_bootstrap"
+                assert (
+                    payload["activation_context"]["provider_conversation_memory_assumed"] is False
+                )
                 self.initial_graph_review_seen = True
             result = await super().generate_structured(request, output_type)
+            if output_type is ResearchCoordinatorDecision:
+                memory = payload["knowledge_graph_memory"]
+                target_id = next(
+                    (
+                        item["matek_id"]
+                        for item in payload["graph_node_summaries"]
+                        if item["node_type"] == "claim"
+                    ),
+                    memory["problem_id"],
+                )
+                result.parsed.assignments = [
+                    assignment.model_copy(update={"target_node_ids": [target_id]})
+                    for assignment in result.parsed.assignments
+                ]
+                result.parsed.rationale = (
+                    f"Graph review {memory['graph_revision']}: " + result.parsed.rationale
+                )
             if output_type is ResearchWorkerReport:
                 assert self.initial_graph_review_seen
                 task_id = payload["graph_task_id"]
@@ -2568,10 +2589,7 @@ async def test_default_pool_runs_8_hierarchical_web_enabled_initial_research_wor
             if output_type is ResearchCoordinatorDecision:
                 assert payload["maximum_concurrent_workers"] == 8
                 assert (
-                    payload["research_agent_hierarchy"][
-                        "maximum_sub_subagents_per_subagent"
-                    ]
-                    == 8
+                    payload["research_agent_hierarchy"]["maximum_sub_subagents_per_subagent"] == 8
                 )
                 assert payload["worker_web_search_enabled"] is True
                 if payload["initial_portfolio"]:

@@ -2364,6 +2364,17 @@ class KnowledgeGraph:
                     new_revision=state.revision,
                     issues=["patch task belongs to a different problem"],
                 )
+            if patch.agent_role != "research-worker" and not patch.agent_role.startswith(
+                "research-auditor"
+            ):
+                return GraphMergeResult(
+                    operation_id=operation_id,
+                    status="rejected",
+                    base_revision=patch.base_graph_revision,
+                    previous_revision=state.revision,
+                    new_revision=state.revision,
+                    issues=[f"unsupported graph patch agent role: {patch.agent_role}"],
+                )
             try:
                 base_snapshot = self._snapshot_unlocked(patch.base_graph_revision)
             except GraphValidationError as exc:
@@ -2427,6 +2438,29 @@ class KnowledgeGraph:
             changed: list[str] = []
             created_ids: list[str] = []
             for item in patch.create_nodes:
+                if item.epistemic_status is EpistemicStatus.LEAN_VERIFIED:
+                    conflicts.append(
+                        "only deterministic Lean verification may create lean_verified evidence"
+                    )
+                    continue
+                if (
+                    item.epistemic_status is EpistemicStatus.AUDIT_PASSED
+                    and not patch.agent_role.startswith("research-auditor")
+                ):
+                    conflicts.append(
+                        "only a recorded independent audit may create audit_passed evidence"
+                    )
+                    continue
+                if (
+                    patch.agent_role == "research-worker"
+                    and item.node_type is NodeType.CLAIM
+                    and item.epistemic_status is EpistemicStatus.REFUTED
+                ):
+                    conflicts.append(
+                        "a research worker cannot create an already-refuted claim; preserve "
+                        "the counterexample as candidate evidence for independent review"
+                    )
+                    continue
                 node_id = item.matek_id or _new_id(item.node_type)
                 node = GraphNode(
                     matek_id=node_id,
@@ -2449,6 +2483,15 @@ class KnowledgeGraph:
                 by_id[node_id] = node
                 changed.append(node_id)
                 created_ids.append(node_id)
+            if conflicts:
+                return GraphMergeResult(
+                    operation_id=operation_id,
+                    status="rejected",
+                    base_revision=patch.base_graph_revision,
+                    previous_revision=state.revision,
+                    new_revision=state.revision,
+                    issues=list(dict.fromkeys(conflicts)),
+                )
             for update in patch.update_nodes:
                 node = by_id[update.matek_id]
                 if update.title is not None:
@@ -2534,6 +2577,15 @@ class KnowledgeGraph:
                     and not patch.agent_role.startswith("research-auditor")
                 ):
                     conflicts.append("only a recorded independent audit may set audit_passed")
+                    continue
+                if (
+                    change.epistemic_status is EpistemicStatus.REFUTED
+                    and node.node_type is NodeType.CLAIM
+                    and patch.agent_role == "research-worker"
+                ):
+                    conflicts.append(
+                        "a research worker cannot mark a claim refuted without independent review"
+                    )
                     continue
                 if change.epistemic_status is not None and not self._epistemic_transition_allowed(
                     node.epistemic_status, change.epistemic_status
@@ -2812,6 +2864,7 @@ class KnowledgeGraph:
         run_id: str,
         decision_id: int,
         assignments: Sequence[Mapping[str, Any]],
+        allow_legacy_default_targets: bool = False,
     ) -> tuple[dict[str, str], dict[str, GraphContextSlice], str]:
         """Create graph-scoped task nodes for one coordinator decision."""
 
@@ -2823,11 +2876,6 @@ class KnowledgeGraph:
             if problem_id not in by_id:
                 raise GraphValidationError(f"problem node does not exist: {problem_id}")
             run_node_id = _deterministic_id(NodeType.RUN, problem_id, run_id)
-            target_default = (
-                self.main_claim_id(problem_id)
-                if self.main_claim_id(problem_id) in by_id
-                else problem_id
-            )
             now = self._now()
             proposed: list[GraphNode] = []
             assignment_to_task: dict[str, str] = {}
@@ -2837,10 +2885,23 @@ class KnowledgeGraph:
                     raise GraphValidationError("research assignment has no stable ID")
                 task_id = _deterministic_id(NodeType.TASK, problem_id, run_id, assignment_id)
                 raw_targets = assignment.get("target_node_ids", [])
-                target_ids = (
-                    [str(item) for item in raw_targets] if isinstance(raw_targets, list) else []
+                if not isinstance(raw_targets, list):
+                    raise GraphValidationError(
+                        f"research assignment {assignment_id!r} has invalid target_node_ids"
+                    )
+                if allow_legacy_default_targets and not raw_targets:
+                    target_default = (
+                        self.main_claim_id(problem_id)
+                        if self.main_claim_id(problem_id) in by_id
+                        else problem_id
+                    )
+                    raw_targets = [target_default]
+                target_ids = self._validate_assignment_target_ids_unlocked(
+                    by_id,
+                    problem_id=problem_id,
+                    assignment_id=assignment_id,
+                    target_node_ids=[str(item) for item in raw_targets],
                 )
-                target_ids = [item for item in target_ids if item in by_id] or [target_default]
                 task_text = str(assignment.get("task") or "Research assignment").strip()
                 expected = str(assignment.get("expected_output") or "Concrete mathematical result")
                 stop = str(
@@ -2925,11 +2986,81 @@ class KnowledgeGraph:
             }
             return assignment_to_task, contexts, state.revision
 
+    @staticmethod
+    def _validate_assignment_target_ids_unlocked(
+        nodes: Mapping[str, GraphNode],
+        *,
+        problem_id: str,
+        assignment_id: str,
+        target_node_ids: Sequence[str],
+    ) -> list[str]:
+        """Bind one assignment to explicit live nodes without a silent fallback."""
+
+        normalized = [item.strip().upper() for item in target_node_ids if item.strip()]
+        if not normalized:
+            raise GraphValidationError(
+                f"research assignment {assignment_id!r} must name at least one graph target"
+            )
+        if len(normalized) != len(set(normalized)):
+            raise GraphValidationError(
+                f"research assignment {assignment_id!r} repeats a graph target"
+            )
+        issues: list[str] = []
+        for node_id in normalized:
+            node = nodes.get(node_id)
+            if node is None:
+                issues.append(f"unknown target {node_id}")
+            elif node.problem_id != problem_id and node.matek_id != problem_id:
+                issues.append(f"target {node_id} belongs to another problem")
+            elif node.tombstone:
+                issues.append(f"target {node_id} is tombstoned")
+            elif node.node_type in {NodeType.RUN, NodeType.ARTIFACT, NodeType.HUMAN_NOTE}:
+                issues.append(
+                    f"target {node_id} is a {node.node_type.value} node, not a research branch"
+                )
+        if issues:
+            raise GraphValidationError(
+                f"research assignment {assignment_id!r} has invalid graph targets: "
+                + "; ".join(issues)
+            )
+        return normalized
+
+    def validate_assignment_targets(
+        self,
+        *,
+        problem_id: str,
+        assignments: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Validate coordinator branch bindings before its decision becomes durable."""
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            self._load_state_unlocked()
+            nodes = self._load_nodes_unlocked(include_human_notes=True)
+            by_id = {node.matek_id: node for node in nodes}
+            if problem_id not in by_id:
+                raise GraphValidationError(f"problem node does not exist: {problem_id}")
+            for assignment in assignments:
+                assignment_id = str(assignment.get("id") or "").strip()
+                raw_targets = assignment.get("target_node_ids", [])
+                if not isinstance(raw_targets, list):
+                    raise GraphValidationError(
+                        f"research assignment {assignment_id!r} has invalid target_node_ids"
+                    )
+                self._validate_assignment_target_ids_unlocked(
+                    by_id,
+                    problem_id=problem_id,
+                    assignment_id=assignment_id,
+                    target_node_ids=[str(item) for item in raw_targets],
+                )
+
     def coordinator_memory(
         self,
         problem_id: str,
         *,
         current_run_id: str | None = None,
+        resume_reconstruction: bool = False,
+        previous_coordinator_revision: str | None = None,
     ) -> dict[str, object]:
         with self._locked():
             self._recover_pending_unlocked()
@@ -2947,25 +3078,49 @@ class KnowledgeGraph:
                 for node_type in NodeType
                 if any(node.node_type is node_type for node in problem_nodes)
             }
-            review_required = bool(prior_nodes)
+            branch_status_counts = {
+                status.value: sum(
+                    node.node_type is NodeType.APPROACH and node.workflow_status is status
+                    for node in problem_nodes
+                )
+                for status in WorkflowStatus
+                if any(
+                    node.node_type is NodeType.APPROACH and node.workflow_status is status
+                    for node in problem_nodes
+                )
+            }
+            review_required = bool(prior_nodes) or resume_reconstruction
             return {
                 "graph_revision": state.revision,
                 "problem_id": problem_id,
                 "review_required_before_delegation": review_required,
+                "current_frontier_review_required": True,
+                "resume_reconstruction": resume_reconstruction,
+                "previous_coordinator_graph_revision": previous_coordinator_revision,
+                "graph_changed_since_previous_coordinator_activation": (
+                    previous_coordinator_revision is not None
+                    and previous_coordinator_revision != state.revision
+                ),
                 "overview": {
                     "node_count": len(problem_nodes),
                     "edge_count": sum(len(node.relations) for node in problem_nodes),
                     "prior_node_count": len(prior_nodes),
                     "node_type_counts": node_type_counts,
+                    "approach_branch_status_counts": branch_status_counts,
                 },
                 "graph_root": self.graph_root.relative_to(self.project_root).as_posix(),
                 "index_path": self.index_path.relative_to(self.project_root).as_posix(),
                 "frontier": frontier.model_dump(mode="json"),
                 "instruction": (
-                    "Before creating initial assignments, review this graph overview and "
-                    "frontier and use prior results, failures, gaps, audits, and tasks to shape "
-                    "the portfolio. Use stable node IDs in target_node_ids. Do not reopen a "
-                    "blocked or refuted route unless new evidence is stated explicitly."
+                    "Reconstruct the current branch map from this overview and frontier before "
+                    "making the decision. On initial delegation, resume, and every later "
+                    "activation, use prior results, failures, gaps, audits, active tasks, and "
+                    "cross-branch dependencies to shape delegation and synthesis. Use stable "
+                    "node IDs in every assignment's target_node_ids. Do not reopen a blocked or "
+                    "refuted branch unless new evidence or a mechanism addressing its recorded "
+                    "failure is stated explicitly. Include this exact graph revision in the "
+                    "decision rationale as the review attestation: "
+                    f"{state.revision}."
                 ),
             }
 
@@ -2990,6 +3145,10 @@ class KnowledgeGraph:
                 proposal_issues.append("worker graph patch run_id does not match its run")
             elif proposed_patch.task_id != task_id:
                 proposal_issues.append("worker graph patch task_id does not match its assignment")
+            elif proposed_patch.agent_role != "research-worker":
+                proposal_issues.append(
+                    "worker graph patch agent_role must be exactly research-worker"
+                )
             else:
                 proposal_result = self.merge_patch(
                     proposed_patch,
@@ -3009,6 +3168,15 @@ class KnowledgeGraph:
             task = by_id.get(task_id)
             if task is None or task.node_type is not NodeType.TASK:
                 raise GraphValidationError(f"worker graph task is missing: {task_id}")
+            target_ids = [
+                edge.target_id
+                for edge in task.relations
+                if edge.relation is RelationType.TARGETS and edge.target_id in by_id
+            ]
+            if not target_ids:
+                raise GraphValidationError(
+                    f"worker graph task has no valid branch targets: {task_id}"
+                )
             now = self._now()
             assignment_id = str(assignment.get("id") or report.get("assignment_id") or "unknown")
             family = str(assignment.get("approach_family") or "unspecified")
@@ -3027,21 +3195,28 @@ class KnowledgeGraph:
             assumptions = [str(item) for item in report.get("assumptions", []) if str(item).strip()]
             classification = {
                 "blocked": "blocked_local_gap",
-                "refuted": "refuted_by_counterexample",
+                "refuted": "ruled_out_branch",
                 "candidate_complete": "candidate",
             }.get(status, "partial_progress")
-            approach_id = _deterministic_id(NodeType.APPROACH, problem_id, family.casefold())
+            # A family is a search taxonomy, not a branch identity. Distinct
+            # assignments in the same family must retain distinct outcomes.
+            approach_id = _deterministic_id(NodeType.APPROACH, problem_id, run_id, assignment_id)
             approach_workflow = {
                 "blocked": WorkflowStatus.BLOCKED,
                 "refuted": WorkflowStatus.ABANDONED,
                 "candidate_complete": WorkflowStatus.COMPLETE,
             }.get(status, WorkflowStatus.ACTIVE)
-            approach_epistemic = (
-                EpistemicStatus.REFUTED if status == "refuted" else EpistemicStatus.CANDIDATE
-            )
+            approach_epistemic = {
+                "refuted": EpistemicStatus.REFUTED,
+                "candidate_complete": EpistemicStatus.CANDIDATE,
+            }.get(status, EpistemicStatus.OPEN)
             partial = "\n".join(f"- {item}" for item in formal_results) or "_None established._"
             failure = exact_gap or (
-                "The route was refuted." if status == "refuted" else "No exact failure recorded."
+                "\n".join(f"- {item}" for item in counterexamples)
+                if status == "refuted" and counterexamples
+                else "The assigned branch was ruled out, but no sharper obstruction was recorded."
+                if status == "refuted"
+                else "No exact failure recorded."
             )
             reopen = (
                 "Reopen only if a new mechanism resolves the exact gap or defeats the recorded "
@@ -3053,7 +3228,7 @@ class KnowledgeGraph:
                 matek_id=approach_id,
                 node_type=NodeType.APPROACH,
                 problem_id=problem_id,
-                title=f"Approach: {family}",
+                title=f"Approach branch {assignment_id}: {family}",
                 epistemic_status=approach_epistemic,
                 workflow_status=approach_workflow,
                 created_in_run=run_id,
@@ -3065,6 +3240,8 @@ class KnowledgeGraph:
                     f"Approach: {family}",
                     "## Exact route attempted\n\n"
                     + mechanism
+                    + "\n\n## Stable branch targets\n\n"
+                    + "\n".join(f"- {node_id}" for node_id in target_ids)
                     + "\n\n## Proposed invariant or mechanism\n\n"
                     + mechanism
                     + "\n\n## Strongest valid partial result\n\n"
@@ -3088,14 +3265,28 @@ class KnowledgeGraph:
                         relation=RelationType.RELATED_TO,
                         target_id=task_id,
                     ),
+                    *(
+                        GraphEdge(
+                            source_id=approach_id,
+                            relation=(
+                                RelationType.SPECIALIZES
+                                if by_id[target_id].node_type is NodeType.APPROACH
+                                else RelationType.RELATED_TO
+                            ),
+                            target_id=target_id,
+                        )
+                        for target_id in target_ids
+                    ),
                 ],
                 source_artifacts=[source_artifact],
                 evidence=[*formal_results, *counterexamples],
                 metadata={
                     "matek_assignment_ids": [assignment_id],
+                    "matek_branch_target_ids": target_ids,
                     "matek_assumptions": assumptions,
                     "matek_dependencies": dependencies,
                     "matek_worker_status": status,
+                    "matek_reopen_condition": reopen,
                 },
             )
             proposed_nodes: list[GraphNode] = [approach]
@@ -3135,10 +3326,13 @@ class KnowledgeGraph:
                                 relation=RelationType.CREATED_DURING,
                                 target_id=_deterministic_id(NodeType.RUN, problem_id, run_id),
                             ),
-                            GraphEdge(
-                                source_id=claim_id,
-                                relation=RelationType.MOTIVATES,
-                                target_id=self.main_claim_id(problem_id),
+                            *(
+                                GraphEdge(
+                                    source_id=claim_id,
+                                    relation=RelationType.RELATED_TO,
+                                    target_id=target_id,
+                                )
+                                for target_id in target_ids
                             ),
                         ],
                         source_artifacts=[source_artifact],
@@ -3199,8 +3393,6 @@ class KnowledgeGraph:
                 counterexample_id = _deterministic_id(
                     NodeType.COUNTEREXAMPLE, problem_id, run_id, assignment_id, str(index)
                 )
-                relation = RelationType.REFUTES if status == "refuted" else RelationType.RELATED_TO
-                target = self.main_claim_id(problem_id) if status == "refuted" else approach_id
                 proposed_nodes.append(
                     GraphNode(
                         matek_id=counterexample_id,
@@ -3218,17 +3410,23 @@ class KnowledgeGraph:
                         updated_at=now,
                         body=new_generated_body(
                             f"Counterexample from {assignment_id} #{index}",
-                            "## Explicit counterexample\n\n" + counterexample,
+                            "## Explicit counterexample or obstruction\n\n"
+                            + counterexample
+                            + "\n\n## Scope\n\n"
+                            "This automatically distilled node rules out the assigned approach "
+                            "branch only. An explicit validated graph patch and independent "
+                            "scientific audit are required before it can refute a claim node.",
                         ),
-                        tags=["matek/counterexample"],
+                        tags=["matek/counterexample", "matek/branch-local"],
                         relations=[
                             GraphEdge(
                                 source_id=counterexample_id,
-                                relation=relation,
-                                target_id=target,
+                                relation=RelationType.RELATED_TO,
+                                target_id=approach_id,
                             )
                         ],
                         source_artifacts=[source_artifact],
+                        metadata={"matek_branch_target_ids": target_ids},
                     )
                 )
             raw_sources = report.get("sources", [])
@@ -3282,9 +3480,10 @@ class KnowledgeGraph:
             task.workflow_status = (
                 WorkflowStatus.BLOCKED if status == "blocked" else WorkflowStatus.COMPLETE
             )
-            task.epistemic_status = (
-                EpistemicStatus.REFUTED if status == "refuted" else EpistemicStatus.CANDIDATE
-            )
+            task.epistemic_status = {
+                "refuted": EpistemicStatus.REFUTED,
+                "candidate_complete": EpistemicStatus.CANDIDATE,
+            }.get(status, EpistemicStatus.OPEN)
             task.updated_at = now
             task.last_modified_run = run_id
             task.author_role = "research-worker"
