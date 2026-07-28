@@ -213,7 +213,13 @@ characters. Its immutable context manifest records the cursor, per-section measu
 and omitted artifacts, hashes, character/token estimates, and compaction reason. An exhaustive
 artifact catalog is stored once and represented in transport by a path/hash/count descriptor;
 graph transport similarly uses one root/revision/index/count descriptor plus capped selected node
-summaries. Knowledge-graph neighborhoods are retrieval indexes, not proof evidence. Provider size
+summaries. Schema-v3 graph evidence is ranked scientifically before ID tie-breaking, uses typed
+digests, caps unrequested full graph nodes at 120,000 serialized characters by default, and
+deduplicates substantive exact repeats into authenticated references. The explicit top-level
+section order and every score, position, character count, and unused-headroom value are manifest
+evidence. Consequential decisions citing omitted evidence become retrieval-only. Legacy manifests
+keep their original serialization and replay identity. Knowledge-graph neighborhoods are retrieval
+indexes, not proof evidence. Provider size
 rejection lowers the effective limit, removes an additional low-priority field, and rebuilds a
 smaller request. Compact-state overflow activates an indexed transport view where all cumulative
 sections are optional. Only the exact prompt/claim plus provider instructions, output contract,

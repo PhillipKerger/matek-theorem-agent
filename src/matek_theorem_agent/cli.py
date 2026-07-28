@@ -456,7 +456,9 @@ def _resolved_run_summary(
         "coordinator context budget": (
             f"{config.research.maximum_coordinator_context_characters:,} serialized provider "
             f"characters; up to {config.research.maximum_coordinator_requested_artifacts} "
-            "on-demand evidence requests"
+            "on-demand evidence requests; "
+            f"{config.research.maximum_unrequested_full_graph_node_characters:,} optional "
+            "full-graph characters"
         ),
         "total active time limit": _time_limit_display(config),
         "usage limit": usage_limit,

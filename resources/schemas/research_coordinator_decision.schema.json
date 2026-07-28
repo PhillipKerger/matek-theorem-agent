@@ -123,6 +123,14 @@
       "title": "Requested Graph Node Ids",
       "type": "array"
     },
+    "resolved_contradiction_node_ids": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 32,
+      "title": "Resolved Contradiction Node Ids",
+      "type": "array"
+    },
     "retire_assignment_ids": {
       "items": {
         "type": "string"
@@ -153,6 +161,14 @@
     "stop_recommended": {
       "title": "Stop Recommended",
       "type": "boolean"
+    },
+    "supporting_evidence_ids": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "title": "Supporting Evidence Ids",
+      "type": "array"
     }
   },
   "required": [
@@ -170,7 +186,9 @@
     "stop_reason",
     "stop_category",
     "requested_artifact_ids",
-    "requested_graph_node_ids"
+    "requested_graph_node_ids",
+    "supporting_evidence_ids",
+    "resolved_contradiction_node_ids"
   ],
   "title": "ResearchCoordinatorDecision",
   "type": "object"

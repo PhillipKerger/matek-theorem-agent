@@ -166,6 +166,11 @@ paths, while API coordinators request a bounded set for the next activation.
 Every context has an immutable manifest recording its event cursor, mode, inclusion reasons,
 omissions, per-section measured characters, token estimate, reserved headroom, and hash. Compact
 mode targets at most 95% of the configured ceiling and at least 40,000 characters of headroom.
+Schema-v3 contexts order the exact target and contracts first, reserve events/open work and
+explicit retrievals before current full reports and ranked summaries, and keep current deltas,
+selected evidence, and a deterministic decision brief near the end. They record scientific graph
+scores, frontier categories, section positions, unused headroom, deduplicated characters, and the
+unrequested full-graph section size. That section defaults to a 120,000-character ceiling.
 Only new/current/candidate/audit/requested catalog entries remain inline; one authenticated
 descriptor addresses the exhaustive on-disk catalog. Graph transport contains one compact
 root/revision/index/count descriptor plus capped selected node summaries. Provider
@@ -175,6 +180,11 @@ independently capped. `MANDATORY_CONTEXT_TOO_LARGE` is reserved for the exact pr
 provider instructions, output contract, and envelope; repeated provider rejection has a separate
 retriable diagnosis. `research/continuity.json` remains a derived navigation view, never a lossy
 replacement for reports or the immutable event ledger.
+
+Candidate packaging, contradiction resolution, and retirement of a promising branch cite their
+supporting artifact or graph-node IDs. If a cited item is only summarized or omitted, MATEK turns
+the activation into retrieval-only work and defers the consequential action until the hash-bound
+full evidence is visible.
 
 Each decision may add assignments, retire or redirect work, request hostile checks or lemma
 completion, recommend candidate packaging, or report an actual budget/resource boundary. The

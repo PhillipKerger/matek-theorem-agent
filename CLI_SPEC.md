@@ -163,6 +163,9 @@ serialized provider input rather than raw report text alone. Compact requests re
 or 40,000 characters, so the normal target is at most 760,000. `matek run` displays this ceiling
 and the bounded on-demand evidence-request limit. Exhaustive artifact and graph indexes stay on
 disk; transport carries high-priority entries plus authenticated descriptors and capped summaries.
+Unrequested full graph nodes have a separate configurable 120,000-character default section cap;
+explicit requests bypass that section cap while remaining subject to the 800,000-character
+provider-input ceiling.
 Every optional section is prunable. Only the exact prompt/claim plus provider instructions, output
 contract, and envelope may pause as `MANDATORY_CONTEXT_TOO_LARGE`; repeated provider rejection is
 reported separately with a smaller resumable generation.

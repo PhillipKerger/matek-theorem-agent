@@ -157,6 +157,7 @@ maximum_concurrent_agents = 8 # first-level MATEK worker ceiling
 maximum_pending_assignments = 1024 # high queued-plus-running safety ceiling
 maximum_coordinator_decisions = 100000 # high event-indexed safety ceiling
 maximum_coordinator_context_characters = 800000 # final serialized provider input ceiling
+maximum_unrequested_full_graph_node_characters = 120000 # optional full graph evidence cap
 maximum_coordinator_requested_artifacts = 32 # bounded on-demand evidence retrieval
 ```
 
@@ -210,6 +211,7 @@ These controls have different expected effects:
 | `maximum_pending_assignments` | Allows a larger total open set of queued plus running assignments | A large open set may become stale as new evidence arrives; default safety ceiling 1,024 |
 | `maximum_coordinator_decisions` | Allows more completion- and audit-driven redirects/refills | Potentially much more elapsed time and total usage; default safety ceiling 100,000 |
 | `maximum_coordinator_context_characters` | Bounds each final serialized coordinator input; default 800,000 | Lower values compact sooner and may require on-demand evidence retrieval |
+| `maximum_unrequested_full_graph_node_characters` | Caps optional unrequested full graph nodes; default 120,000 | Explicit retrievals bypass this section cap but remain under the overall input ceiling |
 | `maximum_concurrent_agents` | Sets first-level MATEK concurrency; default 8 | Nested capacity is this value times `maximum_subagents_per_agent`; high concurrency can encounter provider limits |
 | `research_coordinator_effort` | Gives global synthesis, prioritization, repair planning, and the final research judgment more reasoning effort | `max` can be slower and more allowance-intensive; stronger results are not guaranteed |
 | `research_worker_effort` | Gives each independent proof-search call more reasoning effort | Higher effort is slower and more allowance-intensive; default `xhigh` |

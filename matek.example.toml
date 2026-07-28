@@ -79,6 +79,8 @@ maximum_pending_assignments = 1024
 maximum_coordinator_decisions = 100000
 # Hard ceiling on the final serialized coordinator provider input, including framing.
 maximum_coordinator_context_characters = 800000
+# Explicit requests bypass this optional graph section cap, not the provider-input ceiling.
+maximum_unrequested_full_graph_node_characters = 120000
 # Maximum omitted artifacts or graph nodes the coordinator may request per activation.
 maximum_coordinator_requested_artifacts = 32
 require_foundational_audit = true

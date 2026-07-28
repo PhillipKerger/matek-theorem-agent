@@ -138,6 +138,11 @@ Every request is paired with an immutable context manifest recording its event c
 compact, or indexed mode, final provider-input character count, per-section serialized sizes,
 token estimate, payload hash, inclusion reasons, aggregated events, omitted state sections,
 omitted authenticated references, effective limit, packing target, and reserved headroom. Compact
+schema-v3 manifests additionally record payload/section-order versions, scientific evidence score
+components and frontier categories, full/summary selection locations, section positions, unused
+headroom, exact redundant characters removed, and the serialized unrequested `full_graph_nodes`
+size. New payloads use an intentional top-level section order; legacy manifests retain their
+original alphabetic serialization and exact replay identity. Compact
 requests include only high-priority artifact references plus a path/hash/count descriptor for the
 complete immutable catalog under `research/coordinator/artifact-catalogs/`. They similarly carry
 one compact graph descriptor and the selected bounded graph-node summaries, never a second

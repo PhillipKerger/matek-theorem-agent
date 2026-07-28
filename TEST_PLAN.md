@@ -72,6 +72,14 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   transport limit and continues. Only the exact prompt/claim plus provider instructions, output
   contract, and envelope reports `MANDATORY_CONTEXT_TOO_LARGE`; repeated provider rejection has a
   distinct retriable diagnosis and leaves a smaller request for resume.
+- Scientific graph evidence ranking is materially invariant under stable-node ID renaming;
+  explicit/new evidence precedes optional history; unrequested full graph nodes stay at or below
+  120,000 serialized characters; low-ranked irrelevant additions do not evict relevant evidence
+  or fill the provider ceiling; typed digests retain exact statements, gaps, dependencies,
+  counterexample scope, typed relations, and hash-bound provenance.
+- Schema-v3 top-level section order, exact-content deduplication, redundant-character accounting,
+  and legacy manifest replay identity are deterministic. A consequential decision citing omitted
+  evidence becomes retrieval-only until the requested full artifact or node is visible.
 - A fast worker completion can trigger a decision and refill while slower workers remain active.
 - Candidate audit pauses new admission; in-flight completions remain durable, and a failed audit
   becomes an immediate high-priority coordinator event.

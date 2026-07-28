@@ -20,11 +20,14 @@ from pydantic import (
 from ..budget import BudgetExceeded
 from ..config import ModelSettings
 from ..coordinator_context import (
+    COORDINATOR_PAYLOAD_SCHEMA_VERSION,
     CoordinatorArtifactReference,
     CoordinatorContextBudgetExhausted,
     CoordinatorContextBuilder,
     CoordinatorContextManifest,
     CoordinatorEvidenceItem,
+    graph_node_typed_digest,
+    rank_graph_evidence,
     serialize_coordinator_payload,
 )
 from ..failures import classify_failure, recovery_obligations
@@ -178,15 +181,22 @@ class ResearchCoordinatorDecision(BaseModel):
     stop_category: Literal["scientific", "refuted", "budget"] = "scientific"
     requested_artifact_ids: list[str] = Field(default_factory=list, max_length=32)
     requested_graph_node_ids: list[str] = Field(default_factory=list, max_length=32)
+    supporting_evidence_ids: list[str] = Field(default_factory=list, max_length=64)
+    resolved_contradiction_node_ids: list[str] = Field(default_factory=list, max_length=32)
 
-    @field_validator("requested_artifact_ids", "requested_graph_node_ids")
+    @field_validator(
+        "requested_artifact_ids",
+        "requested_graph_node_ids",
+        "supporting_evidence_ids",
+        "resolved_contradiction_node_ids",
+    )
     @classmethod
     def requested_evidence_ids_are_unique_and_nonblank(cls, value: list[str]) -> list[str]:
         normalized = [item.strip() for item in value]
         if any(not item for item in normalized):
-            raise ValueError("requested evidence IDs must not be blank")
+            raise ValueError("coordinator evidence IDs must not be blank")
         if len(normalized) != len(set(normalized)):
-            raise ValueError("requested evidence IDs must be unique")
+            raise ValueError("coordinator evidence IDs must be unique")
         return normalized
 
 
@@ -762,6 +772,7 @@ class ResearchWorkflowSettings(BaseModel):
     maximum_pending_assignments: int = Field(default=1_024, ge=1)
     maximum_coordinator_decisions: int = Field(default=100_000, ge=1)
     maximum_coordinator_context_characters: int = Field(default=800_000, ge=100_000)
+    maximum_unrequested_full_graph_node_characters: int = Field(default=120_000, ge=1_000)
     maximum_coordinator_requested_artifacts: int = Field(default=32, ge=1, le=32)
     maximum_model_calls: int | None = Field(default=None, ge=0)
     run_complexity_audit: bool | None = None
@@ -2950,6 +2961,19 @@ async def run_adaptive_research(
                     full_content=report.model_dump(mode="json"),
                     priority=priority,
                     inclusion_reason=reason,
+                    priority_score={
+                        "tier": priority,
+                        "completed_event_sequence": record.completed_event_sequence,
+                        "newly_completed": newly_completed,
+                        "candidate_producing": candidate,
+                        "redirected": redirected,
+                        "approach_family": record.assignment.approach_family,
+                    },
+                    selection_rank=max(
+                        scheduler.next_event_sequence - 1 - (record.completed_event_sequence or 0),
+                        0,
+                    ),
+                    approach_family=record.assignment.approach_family,
                 )
             )
         return evidence
@@ -2964,10 +2988,12 @@ async def run_adaptive_research(
             raw_catalog = replay_payload.get("artifact_catalog", [])
             raw_summaries = replay_payload.get("graph_node_summaries", [])
             raw_full_nodes = replay_payload.get("full_graph_nodes", [])
+            raw_requested_nodes = replay_payload.get("requested_graph_nodes", [])
             if (
                 not isinstance(raw_catalog, list)
                 or not isinstance(raw_summaries, list)
                 or not isinstance(raw_full_nodes, list)
+                or not isinstance(raw_requested_nodes, list)
             ):
                 raise StageValidationError("Archived coordinator graph evidence is malformed.")
             summaries = {
@@ -2977,28 +3003,85 @@ async def run_adaptive_research(
             }
             full_nodes = {
                 node["matek_id"]: item
-                for item in raw_full_nodes
+                for item in [*raw_requested_nodes, *raw_full_nodes]
                 if isinstance(item, dict)
                 and isinstance((node := item.get("node")), dict)
                 and isinstance(node.get("matek_id"), str)
             }
-            replayed: list[CoordinatorEvidenceItem] = []
+            references: dict[str, CoordinatorArtifactReference] = {}
             for raw_reference in raw_catalog:
                 if not isinstance(raw_reference, dict) or raw_reference.get("kind") != "graph_node":
                     continue
                 reference = CoordinatorArtifactReference.model_validate(raw_reference)
-                node_id = reference.graph_node_id
-                if node_id is None or node_id not in summaries or node_id not in full_nodes:
+                if reference.graph_node_id is not None:
+                    references[reference.graph_node_id] = reference
+            for node_id, summary in summaries.items():
+                if node_id in references:
+                    continue
+                path = summary.get("path")
+                digest = summary.get("sha256")
+                graph_revision = summary.get("graph_revision")
+                if not (
+                    isinstance(path, str)
+                    and isinstance(digest, str)
+                    and isinstance(graph_revision, str)
+                ):
                     raise StageValidationError(
-                        "Archived coordinator graph catalog lacks its frozen node evidence."
+                        "Archived coordinator graph summary lacks authenticated provenance."
                     )
+                references[node_id] = CoordinatorArtifactReference(
+                    artifact_id=f"graph-node:{node_id}",
+                    kind="graph_node",
+                    relative_path=path,
+                    sha256=digest,
+                    graph_node_id=node_id,
+                    graph_revision=graph_revision,
+                )
+            replayed: list[CoordinatorEvidenceItem] = []
+            ordered_node_ids = [
+                *summaries,
+                *(node_id for node_id in references if node_id not in summaries),
+            ]
+            for node_id in ordered_node_ids:
+                reference = references[node_id]
+                if node_id not in summaries:
+                    # A full-only archived node cannot be re-summarized without
+                    # changing the immutable payload. Retain it in the catalog only.
+                    continue
+                summary = dict(summaries[node_id])
+                raw_score = summary.get("priority_score", {})
+                priority_score = dict(raw_score) if isinstance(raw_score, dict) else {}
+                raw_priority = priority_score.get("tier", 8)
+                priority = (
+                    raw_priority
+                    if isinstance(raw_priority, int) and not isinstance(raw_priority, bool)
+                    else 8
+                )
+                raw_categories = summary.get("frontier_categories", [])
+                replay_frontier_categories = (
+                    [str(item) for item in raw_categories]
+                    if isinstance(raw_categories, list)
+                    else []
+                )
+                raw_rank = summary.get("selection_rank", 0)
+                selection_rank = (
+                    raw_rank if isinstance(raw_rank, int) and not isinstance(raw_rank, bool) else 0
+                )
                 replayed.append(
                     CoordinatorEvidenceItem(
                         reference=reference,
-                        summary=dict(summaries[node_id]),
-                        full_content=dict(full_nodes[node_id]),
-                        priority=8,
+                        summary=summary,
+                        full_content=dict(full_nodes.get(node_id, {})),
+                        priority=priority,
                         inclusion_reason="frozen graph evidence replay",
+                        frontier_categories=replay_frontier_categories,
+                        priority_score=priority_score,
+                        selection_rank=selection_rank,
+                        approach_family=(
+                            str(priority_score["approach_family"])
+                            if isinstance(priority_score.get("approach_family"), str)
+                            else None
+                        ),
                     )
                 )
             return replayed
@@ -3006,17 +3089,65 @@ async def run_adaptive_research(
         if not isinstance(revision, str):
             raise StageValidationError("Coordinator graph memory has no frozen revision.")
         frontier = graph_memory.get("frontier", {})
-        node_ids: set[str] = set(scheduler.requested_graph_node_ids)
+        frontier_categories: dict[str, list[str]] = {}
         if isinstance(frontier, dict):
-            for value in frontier.values():
+            for category, value in frontier.items():
                 if not isinstance(value, list):
                     continue
+                category_ids: list[str] = []
                 for summary in value:
                     if isinstance(summary, dict) and isinstance(summary.get("matek_id"), str):
-                        node_ids.add(str(summary["matek_id"]))
+                        category_ids.append(str(summary["matek_id"]))
+                frontier_categories[str(category)] = category_ids
+        assert graph_problem_id is not None
+        all_nodes = [
+            node
+            for node in knowledge_graph.load_nodes()
+            if node.problem_id == graph_problem_id or node.matek_id == graph_problem_id
+        ]
+        by_id = {node.matek_id: node for node in all_nodes}
+        requested_node_ids = list(dict.fromkeys(scheduler.requested_graph_node_ids))
+        for node_id in requested_node_ids:
+            if node_id not in by_id:
+                knowledge_graph.show(node_id)
+                raise StageValidationError(
+                    f"Requested graph node {node_id!r} does not belong to the selected problem."
+                )
+        active_records = [
+            record
+            for record in scheduler.assignments
+            if record.status in {AssignmentLifecycle.QUEUED, AssignmentLifecycle.RUNNING}
+        ]
+        focal_node_ids = [
+            knowledge_graph.main_claim_id(graph_problem_id),
+            *(
+                node_id
+                for record in active_records
+                for node_id in record.assignment.target_node_ids
+            ),
+            *(
+                record.graph_task_id
+                for record in active_records
+                if record.graph_task_id is not None
+            ),
+        ]
+        assignment_families = {
+            record.assignment.id: record.assignment.approach_family
+            for record in scheduler.assignments
+        }
+        ranked_nodes = rank_graph_evidence(
+            nodes=all_nodes,
+            frontier_categories=frontier_categories,
+            requested_node_ids=requested_node_ids,
+            focal_node_ids=focal_node_ids,
+            assignment_families=assignment_families,
+            current_run_id=run_id,
+        )
         result: list[CoordinatorEvidenceItem] = []
-        for node_id in sorted(node_ids):
-            node = knowledge_graph.show(node_id)
+        main_target_id = knowledge_graph.main_claim_id(graph_problem_id)
+        for ranked in ranked_nodes:
+            node = ranked.node
+            node_id = node.matek_id
             if not node.path:
                 raise StageValidationError(f"Graph node {node_id!r} has no validated path.")
             unresolved_node_path = knowledge_graph.vault_root / node.path
@@ -3033,15 +3164,28 @@ async def run_adaptive_research(
             if not node_path.is_file():
                 raise StageValidationError(f"Graph node path is unavailable: {node.path}")
             digest = sha256_file(node_path)
-            requested = node_id in scheduler.requested_graph_node_ids
+            relative_path = node_path.relative_to(knowledge_graph.project_root).as_posix()
+            raw_distance = ranked.priority_score.get("graph_distance", 1_000_000)
+            graph_distance = (
+                raw_distance
+                if isinstance(raw_distance, int) and not isinstance(raw_distance, bool)
+                else 1_000_000
+            )
+            typed_digest = graph_node_typed_digest(
+                node,
+                by_id=by_id,
+                graph_revision=revision,
+                relative_path=relative_path,
+                sha256=digest,
+                graph_distance=graph_distance,
+                main_target_id=main_target_id,
+            )
             result.append(
                 CoordinatorEvidenceItem(
                     reference=CoordinatorArtifactReference(
                         artifact_id=f"graph-node:{node_id}",
                         kind="graph_node",
-                        relative_path=node_path.relative_to(
-                            knowledge_graph.project_root
-                        ).as_posix(),
+                        relative_path=relative_path,
                         sha256=digest,
                         graph_node_id=node_id,
                         graph_revision=revision,
@@ -3052,7 +3196,12 @@ async def run_adaptive_research(
                         "title": node.title,
                         "epistemic_status": node.epistemic_status.value,
                         "workflow_status": node.workflow_status.value,
-                        "path": node_path.relative_to(knowledge_graph.project_root).as_posix(),
+                        "frontier_categories": list(ranked.frontier_categories),
+                        "selection_reason": ranked.inclusion_reason,
+                        "priority_score": ranked.priority_score,
+                        "selection_rank": ranked.selection_rank,
+                        "typed_digest": typed_digest,
+                        "path": relative_path,
                         "sha256": digest,
                         "graph_revision": revision,
                     },
@@ -3064,12 +3213,12 @@ async def run_adaptive_research(
                         },
                         "node": node.model_dump(mode="json"),
                     },
-                    priority=0 if requested else 8,
-                    inclusion_reason=(
-                        "explicitly requested graph node"
-                        if requested
-                        else "bounded graph frontier node fitting remaining context"
-                    ),
+                    priority=ranked.priority,
+                    inclusion_reason=ranked.inclusion_reason,
+                    frontier_categories=list(ranked.frontier_categories),
+                    priority_score=ranked.priority_score,
+                    selection_rank=ranked.selection_rank,
+                    approach_family=ranked.approach_family,
                 )
             )
         return result
@@ -3105,6 +3254,177 @@ async def run_adaptive_research(
                 return value
             raise StageValidationError("Coordinator backend returned an invalid input measure.")
         return len(coordinator_prompt) + len(serialized_payload) + 32_768
+
+    def visible_full_evidence_ids(payload: dict[str, object]) -> set[str]:
+        visible: set[str] = set()
+        for section in ("visible_worker_reports", "requested_artifacts"):
+            raw = payload.get(section, [])
+            if not isinstance(raw, list):
+                continue
+            for item in raw:
+                if isinstance(item, dict) and isinstance(item.get("assignment_id"), str):
+                    visible.add(f"worker-report:{item['assignment_id']}")
+        for section in ("full_graph_nodes", "requested_graph_nodes"):
+            raw = payload.get(section, [])
+            if not isinstance(raw, list):
+                continue
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                node = item.get("node")
+                if isinstance(node, dict) and isinstance(node.get("matek_id"), str):
+                    visible.add(f"graph-node:{node['matek_id']}")
+        return visible
+
+    def canonical_supporting_evidence_id(
+        raw_id: str,
+        *,
+        known_worker_artifact_ids: set[str],
+    ) -> str:
+        normalized = raw_id.strip()
+        if normalized in known_worker_artifact_ids:
+            return normalized
+        worker_reference = f"worker-report:{normalized}"
+        if worker_reference in known_worker_artifact_ids:
+            return worker_reference
+        graph_node_id = normalized.removeprefix("graph-node:")
+        if knowledge_graph is not None:
+            try:
+                knowledge_graph.show(graph_node_id)
+            except GraphValidationError:
+                pass
+            else:
+                return f"graph-node:{graph_node_id}"
+        raise StageValidationError(f"Coordinator cited unknown supporting evidence ID: {raw_id}")
+
+    def defer_consequential_action_for_omitted_evidence(
+        decision: ResearchCoordinatorDecision,
+        *,
+        payload: dict[str, object],
+    ) -> ResearchCoordinatorDecision:
+        """Convert a consequential v3 decision into bounded retrieval-only work."""
+
+        if payload.get("coordinator_payload_schema_version") != COORDINATOR_PAYLOAD_SCHEMA_VERSION:
+            return decision
+        known_worker_artifact_ids = {
+            f"worker-report:{record.assignment.id}"
+            for record in scheduler.assignments
+            if record.report_path is not None
+        }
+        consequential = bool(
+            decision.candidate_packaging_recommended or decision.resolved_contradiction_node_ids
+        )
+        implied_ids: list[str] = []
+        if decision.candidate_packaging_recommended:
+            implied_ids.extend(
+                f"worker-report:{assignment_id}" for assignment_id in decision.candidate_report_ids
+            )
+        implied_ids.extend(
+            f"graph-node:{node_id}" for node_id in decision.resolved_contradiction_node_ids
+        )
+
+        promising_categories = {
+            "unresolved_contradictions",
+            "missing_dependencies",
+            "high_value_tasks",
+            "candidate_proofs_awaiting_audit",
+            "unresolved_claims",
+        }
+        promising_node_ids: set[str] = set()
+        raw_memory = payload.get("knowledge_graph_memory")
+        if isinstance(raw_memory, dict):
+            raw_frontier = raw_memory.get("frontier")
+            if isinstance(raw_frontier, dict):
+                for category in promising_categories:
+                    items = raw_frontier.get(category, [])
+                    if not isinstance(items, list):
+                        continue
+                    promising_node_ids.update(
+                        str(item["matek_id"])
+                        for item in items
+                        if isinstance(item, dict) and isinstance(item.get("matek_id"), str)
+                    )
+        raw_graph_summaries = payload.get("graph_node_summaries", [])
+        if isinstance(raw_graph_summaries, list):
+            for item in raw_graph_summaries:
+                if not isinstance(item, dict) or not isinstance(item.get("matek_id"), str):
+                    continue
+                categories = item.get("frontier_categories", [])
+                if isinstance(categories, list) and promising_categories.intersection(
+                    str(category) for category in categories
+                ):
+                    promising_node_ids.add(str(item["matek_id"]))
+        for assignment_id in decision.retire_assignment_ids:
+            record = scheduler.assignment_record(assignment_id)
+            if record is None or not record.launched or knowledge_graph is None:
+                continue
+            cited_targets = [
+                node_id
+                for node_id in record.assignment.target_node_ids
+                if node_id in promising_node_ids
+            ]
+            if cited_targets:
+                consequential = True
+                implied_ids.extend(f"graph-node:{node_id}" for node_id in cited_targets)
+
+        if not consequential:
+            return decision
+        cited_ids = [
+            canonical_supporting_evidence_id(
+                raw_id, known_worker_artifact_ids=known_worker_artifact_ids
+            )
+            for raw_id in [*decision.supporting_evidence_ids, *implied_ids]
+        ]
+        cited_ids = list(dict.fromkeys(cited_ids))
+        missing = [
+            evidence_id
+            for evidence_id in cited_ids
+            if evidence_id not in visible_full_evidence_ids(payload)
+        ]
+        if not missing:
+            return decision
+
+        artifact_requests = list(decision.requested_artifact_ids)
+        graph_requests = list(decision.requested_graph_node_ids)
+        for evidence_id in missing:
+            if evidence_id.startswith("graph-node:"):
+                graph_requests.append(evidence_id.removeprefix("graph-node:"))
+            else:
+                artifact_requests.append(evidence_id)
+        request_limit = settings.maximum_coordinator_requested_artifacts
+        artifact_requests = list(dict.fromkeys(artifact_requests))[:request_limit]
+        graph_requests = list(dict.fromkeys(graph_requests))[:request_limit]
+        deferred = decision.model_copy(
+            update={
+                "assignments": [],
+                "retire_assignment_ids": [],
+                "redirect_assignment_ids": [],
+                "claims_requiring_counterexample_search": [],
+                "lemmas_requiring_proof_completion": [],
+                "candidate_packaging_recommended": False,
+                "candidate_report_ids": [],
+                "resolved_contradiction_node_ids": [],
+                "stop_recommended": False,
+                "stop_reason": None,
+                "requested_artifact_ids": artifact_requests,
+                "requested_graph_node_ids": graph_requests,
+                "rationale": (
+                    decision.rationale
+                    + " MATEK deferred the consequential action because cited full evidence "
+                    "was omitted from this activation; this is a retrieval-only decision."
+                ),
+            }
+        )
+        append_event(
+            "coordinator_evidence_retrieval_deferred",
+            decision_id=decision.decision_id,
+            detail=[
+                "A candidate, contradiction resolution, or promising-branch retirement "
+                "cited evidence that was not visible in full.",
+                "Deferred every consequential action and requested: " + ", ".join(missing),
+            ],
+        )
+        return deferred
 
     async def request_coordinator_decision(*, initial: bool) -> ResearchCoordinatorDecision:
         if len(scheduler.decisions) >= settings.maximum_coordinator_decisions:
@@ -3594,6 +3914,9 @@ async def run_adaptive_research(
                     if knowledge_graph is not None
                     else 60_000
                 ),
+                unrequested_full_graph_nodes_character_limit=(
+                    settings.maximum_unrequested_full_graph_node_characters
+                ),
             )
             built = builder.build(
                 decision_id=decision_id,
@@ -3631,26 +3954,6 @@ async def run_adaptive_research(
             decision_model_settings = pending_request.request_settings
             scheduler.pending_coordinator_request = None
             pending_request = None
-        if pending_request is not None and pending_request.context_manifest_path is not None:
-            # Manifests written before compact-index headroom could freeze a request
-            # exactly at the hard ceiling. Rebuild that activation from the same
-            # event cursor instead of replaying the already failed preflight payload.
-            prior_manifest_path = resolved_artifact(pending_request.context_manifest_path)
-            if (
-                prior_manifest_path.is_file()
-                and pending_request.context_manifest_sha256 is not None
-                and sha256_file(prior_manifest_path) == pending_request.context_manifest_sha256
-            ):
-                prior_manifest = CoordinatorContextManifest.model_validate_json(
-                    read_regular_text(prior_manifest_path)
-                )
-                if prior_manifest.reserved_headroom_characters == 0:
-                    legacy_unbounded_request = pending_request
-                    event_sequence = pending_request.after_event_sequence
-                    decision_model_settings = pending_request.request_settings
-                    payload = dict(pending_request.request_payload)
-                    scheduler.pending_coordinator_request = None
-                    pending_request = None
         if pending_request is not None:
             if pending_request.decision_id != decision_id:
                 raise StageValidationError(
@@ -3939,6 +4242,10 @@ async def run_adaptive_research(
             initial=initial,
             known_assignment_ids={record.assignment.id for record in scheduler.assignments},
             completed_assignment_ids=completed_ids,
+        )
+        decision = defer_consequential_action_for_omitted_evidence(
+            decision,
+            payload=payload,
         )
         activation_contract = payload.get("activation_context")
         graph_contract_version = (

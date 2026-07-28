@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Coordinator context schema v3 ranks graph evidence by scientific relevance, emits bounded typed
+  node digests, caps unrequested full graph evidence at 120,000 characters, deduplicates exact
+  repeated content, and uses an intentional versioned section order with expanded manifest
+  accounting. Consequential actions citing omitted evidence now defer into authenticated
+  retrieval-only activations; frozen legacy manifests retain exact replay identity.
+
 - Added explicit bootstrap/continuation/resume coordinator activation metadata with current and
   previous graph revisions. Fresh coordinator contexts now reconstruct the branch map from
   canonical scheduler, event, audit, continuity, registry, and graph state, and decisions attest

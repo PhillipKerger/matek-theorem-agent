@@ -104,11 +104,22 @@ formalization, and generates a reproducible final report.
   authenticated artifact and graph-node references with stable IDs, validated relative paths,
   revisions, and SHA-256 hashes. Codex may read those paths; backends without filesystem access
   may request a bounded evidence set for the next activation.
+- Rank graph evidence by explicit retrieval, unresolved contradictions/dependencies, active
+  high-value tasks, candidate proofs, target-near unresolved claims, recent diverse evidence, and
+  finally blocked/refuted/history. Use graph distance, status, recency, and approach diversity
+  before stable ID; retain frontier categories and score components in the context manifest.
+- Treat the provider-input bound as a ceiling rather than a fill target. Unrequested full graph
+  nodes default to a separate 120,000-character serialized section cap; explicit requests are
+  exempt from that section cap but not the unchanged overall input ceiling.
 - In compact mode inline catalog entries only for new/current/candidate/audit/requested evidence.
   Represent the exhaustive catalog by its validated relative path, SHA-256, total count, and
   artifact-kind counts. Replace the full graph memory view with graph root, revision, index path,
   node/edge counts, and retrieval instructions; inline only the already selected bounded graph
   summaries so graph state is not duplicated.
+- Use bounded typed graph digests for exact statements/results, mechanisms, assumptions,
+  dependencies, gaps, counterexample scope, target relation, typed relations, and hash-bound
+  provenance. Deduplicate substantive exact repeated content across evidence and navigation views,
+  retaining one canonical full representation and authenticated references.
 - Preflight before starting a provider process. Persist each context manifest and any omissions.
   A provider `input_too_large` result must reduce the measured budget and create a distinct compact
   request. If cumulative scheduler state cannot fit, automatically rebuild an indexed context

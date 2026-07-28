@@ -65,6 +65,9 @@
 - [x] Invalid graph proposals cannot discard validated scientific worker reports.
 - [x] Coordinator inputs are deterministically budgeted, manifest-bound, and compacted without
   truncating evidence; provider size rejection creates a smaller distinct resumable request.
+- [x] Coordinator schema v3 ranks and digests graph evidence scientifically, caps optional full
+  graph nodes, deduplicates exact repeats, records section/score/headroom evidence, and defers
+  consequential actions until cited full evidence is visible while replaying legacy manifests.
 - [x] Schema-invalid and schema-repair provider attempts are usage-accounted.
 - [x] Reductions and weaker variants cannot terminate research or pass candidate acceptance as a
   substitute for the frozen exact claim; scientific no-progress stop requests are durably

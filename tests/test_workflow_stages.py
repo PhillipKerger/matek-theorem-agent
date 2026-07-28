@@ -3080,6 +3080,116 @@ async def test_api_coordinator_can_request_and_receive_omitted_report(
 
 
 @pytest.mark.asyncio
+async def test_consequential_decision_citing_omitted_evidence_becomes_retrieval_only(
+    tmp_path: Path,
+) -> None:
+    class ConsequentialRetrievalClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.omitted_id: str | None = None
+
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                if payload["initial_portfolio"]:
+                    parsed: BaseModel = ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=[
+                            ResearchAssignment(
+                                id=f"consequential-route-{index}",
+                                approach_family=f"family-{index}",
+                                task=f"Investigate consequential route {index}",
+                                expected_output="A rigorous report",
+                            )
+                            for index in range(4)
+                        ],
+                        rationale="Launch four independent evidence-producing routes.",
+                    )
+                elif self.omitted_id is None:
+                    visible = {
+                        f"worker-report:{item['assignment_id']}"
+                        for item in payload["visible_worker_reports"]
+                    }
+                    omitted = next(
+                        item
+                        for item in payload["artifact_catalog"]
+                        if item.get("kind") == "worker_report"
+                        and item["artifact_id"] not in visible
+                    )
+                    self.omitted_id = omitted["artifact_id"]
+                    parsed = ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=[],
+                        rationale="Package the cited omitted route.",
+                        candidate_packaging_recommended=True,
+                        candidate_report_ids=[self.omitted_id.removeprefix("worker-report:")],
+                        supporting_evidence_ids=[self.omitted_id],
+                    )
+                else:
+                    assert any(
+                        item["assignment_id"] == self.omitted_id.removeprefix("worker-report:")
+                        for item in payload["requested_artifacts"]
+                    )
+                    parsed = ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=[],
+                        rationale="The retrieved evidence remains only partial.",
+                        stop_recommended=True,
+                        stop_reason="The bounded fixture has no accepted proof.",
+                        stop_category="budget",
+                    )
+            elif output_type is ResearchWorkerReport:
+                assignment = payload["assignment"]
+                parsed = ResearchWorkerReport(
+                    assignment_id=assignment["id"],
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=[f"Partial result from {assignment['id']}"],
+                    proof_content="Substantive distinct proof content. " * 6_000 + assignment["id"],
+                    exact_gap="An exact terminal lemma remains open.",
+                    sources=[],
+                    mechanism=assignment["task"],
+                )
+            else:  # pragma: no cover - the deferred action never reaches candidate packaging
+                raise AssertionError(output_type)
+            return ModelResult(parsed=parsed, response_id=f"consequential-{self.calls}")
+
+    client = ConsequentialRetrievalClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        coordinator_can_read_files=False,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_pending_assignments=4,
+            maximum_coordinator_context_characters=500_000,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert client.omitted_id is not None
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text())
+    retrieval_decision = scheduler["decisions"][1]["decision"]
+    assert retrieval_decision["candidate_packaging_recommended"] is False
+    assert retrieval_decision["candidate_report_ids"] == []
+    assert retrieval_decision["assignments"] == []
+    assert retrieval_decision["requested_artifact_ids"] == [client.omitted_id]
+    assert retrieval_decision["supporting_evidence_ids"] == [client.omitted_id]
+    assert any(
+        json.loads(path.read_text())["kind"] == "coordinator_evidence_retrieval_deferred"
+        for path in (tmp_path / "events").glob("*.json")
+    )
+    assert not (tmp_path / "candidate" / "package.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_research_coordinator_receives_durable_full_fidelity_continuity(
     tmp_path: Path,
 ) -> None:

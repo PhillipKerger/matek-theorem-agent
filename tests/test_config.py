@@ -126,6 +126,7 @@ def test_role_specific_research_defaults() -> None:
     assert config.research.maximum_pending_assignments == 1_024
     assert config.research.maximum_coordinator_decisions == 100_000
     assert config.research.maximum_coordinator_context_characters == 800_000
+    assert config.research.maximum_unrequested_full_graph_node_characters == 120_000
     assert config.research.maximum_coordinator_requested_artifacts == 32
     assert config.research.orchestration_mode == "hierarchical"
     assert config.research.maximum_subagents_per_agent == 8
@@ -513,6 +514,7 @@ def test_checked_in_example_config_loads() -> None:
     assert config.research.maximum_pending_assignments == 1_024
     assert config.research.maximum_coordinator_decisions == 100_000
     assert config.research.maximum_coordinator_context_characters == 800_000
+    assert config.research.maximum_unrequested_full_graph_node_characters == 120_000
     assert config.research.maximum_coordinator_requested_artifacts == 32
     assert config.research.maximum_assignments_per_round == 1_024
     assert config.research.maximum_rounds == 98

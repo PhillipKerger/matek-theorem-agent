@@ -284,6 +284,7 @@ class ResearchSettings(_StrictSettings):
     maximum_pending_assignments: int = Field(default=1_024, gt=0)
     maximum_coordinator_decisions: int = Field(default=100_000, gt=0)
     maximum_coordinator_context_characters: int = Field(default=800_000, ge=100_000)
+    maximum_unrequested_full_graph_node_characters: int = Field(default=120_000, ge=1_000)
     maximum_coordinator_requested_artifacts: int = Field(default=32, ge=1, le=32)
     require_foundational_audit: Literal[True] = True
     require_domain_audit: Literal[True] = True

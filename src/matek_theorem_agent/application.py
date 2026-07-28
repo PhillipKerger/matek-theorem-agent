@@ -1883,6 +1883,9 @@ class WorkflowRunner:
                         maximum_coordinator_context_characters=(
                             self.config.research.maximum_coordinator_context_characters
                         ),
+                        maximum_unrequested_full_graph_node_characters=(
+                            self.config.research.maximum_unrequested_full_graph_node_characters
+                        ),
                         maximum_coordinator_requested_artifacts=(
                             self.config.research.maximum_coordinator_requested_artifacts
                         ),
