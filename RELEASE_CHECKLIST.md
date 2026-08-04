@@ -44,6 +44,17 @@
 - [x] Existing API end-to-end fixture still passes through the explicit API backend.
 - [x] Codex end-to-end fixture passes the same stage, artifact, and gate checks.
 - [x] Resume preserves the frozen backend and records any explicit provider migration.
+- [x] Normalized source hashes reuse the exact frozen target/contract/prompt, clause alignment
+  fails closed, and confirmed `--migrate-target REASON` migrations persist across resume and
+  invalidate affected evidence.
+- [x] Legacy graph snapshots remain byte-preserving/readable while new content-addressed
+  revisions, checkpoint replay, reconstruction, and corruption rejection are covered offline.
+- [x] `matek graph migrate-legacy` defaults to an external integrity-protected plan with no graph
+  edits; confirmed `--apply-plan` rejects stale/tampered/wrong-graph input, commits idempotently,
+  preserves legacy snapshots/nodes as archive evidence, and queues fresh audits without model calls.
+- [ ] Replay the actual latest ATSP, matroid-secretary, and k-server archived worker reports when
+  those original multi-gigabyte archives are available. The checked-in sanitized corpus is
+  synthetic-derived and must not be represented as the unavailable archive replay.
 
 ## CLI and recovery
 
@@ -62,7 +73,8 @@
 - [x] Recoverable worker/provider/source failures are durable coordinator events; integrity
   failures alone hard-stop research.
 - [x] Candidate audits checkpoint independently and resume retries only missing checks.
-- [x] Invalid graph proposals cannot discard validated scientific worker reports.
+- [x] Schema-v2 workers cannot submit graph patches or persistence identities; deterministic
+  application admission cannot discard an already validated scientific report.
 - [x] Coordinator inputs are deterministically budgeted, manifest-bound, and compacted without
   truncating evidence; provider size rejection creates a smaller distinct resumable request.
 - [x] Coordinator schema v3 ranks and digests graph evidence scientifically, caps optional full
@@ -80,15 +92,47 @@
 - [x] Repairable manuscript findings consume configured revision rounds, preserve every draft,
   and do not independently block bibliography auditing or Lean statement alignment.
 - [x] Persistent typed Markdown graph extends the same problem across runs and keeps claims,
-  proofs, audits, sources, tasks, counterexamples, and formalizations separate.
+  proof attempts, derivations, obligations, audits, sources, tasks, counterexamples, and
+  formalizations separate.
+- [x] The complete Markdown archive is distinguished from the integrity-protected canonical
+  claim/derivation/obligation ledger; AND/OR trust, ambiguity quarantine, and bounded smallest-
+  known-open-cut reporting are covered offline.
+- [x] Obligation logical versions cover statement, conclusion, quantifiers, hypotheses,
+  dependency/target IDs, scope, notation version, and falsification evidence; assumption-bearing
+  and partial results remain archive-only with explicit obligations and cannot support candidates
+  or either audit lane.
+- [x] Canonical source identity, arXiv revision/alias retention, unverified-source quarantine, and
+  explicit worker-result-source `CITES` integration are covered offline.
+- [x] Durable scientific phases, duplicate/near-duplicate handling, configurable thresholds and
+  concurrency, one-obligation five-role bottleneck rotation, queued-work retirement, and audited-
+  premise synthesis survive resume.
+- [x] Private computation collection rejects unsafe files, uses application-computed CAS hashes,
+  and creates only proposed support after independent restricted-Docker replay; native replay is
+  refused, mathematical/domain audit remains required, and an unrelated replay cannot satisfy the
+  exact-main candidate gate.
+- [x] Blind intermediate-lemma verifier/falsifier transactions bind exact source/dependency
+  versions and complete target-obligation contracts, use distinct schema-v2 execution contexts and
+  optional sanitized provider sessions, resume only missing roles, archive v1 evidence byte-for-
+  byte before a mandatory two-role v2 rerun, preserve digest-addressed retry checkpoints, recover
+  only monotone gate/accounting progress, and can never accept the main target or authorize a
+  manuscript.
+- [x] Retryable exact-counterexample audits reuse their frozen nomination across unrelated graph
+  revisions, while a genuine canonical-support change durably supersedes the old audit with a
+  reason and artifacts and creates a fresh audit ID.
+- [x] Manuscript and formalization use one bounded trusted-context policy that prioritizes accepted
+  main-proof support, excludes informal/unverified/archive-only evidence, and reports explicit cap
+  and omission metadata.
 - [x] Problem filename stems select isolated default graphs; explicit existing-graph reuse,
   unknown-name rejection, frozen resume identity, listing, and multi-graph CLI selection are
   covered by offline tests.
-- [x] Coordinator frontier queries, bounded worker contexts, structured patches, atomic conflict
-  checks, partial-work retention, and dependency invalidation are covered by offline tests.
+- [x] Coordinator frontier queries, bounded worker contexts, deterministic typed-report admission,
+  application-resolved local-result DAGs, atomic commits, partial-work retention, and dependency
+  invalidation are covered by offline tests.
 - [x] Obsidian Home/dashboards/canvases are generated, while every graph command remains usable
   without Obsidian.
 - [x] Human editing ownership and exact-statement/proof invalidation fail closed on conflicts.
+- [x] The fixture end-to-end suite covers target-migration interruption/resume, scientific-phase
+  resume, blind missing-role lemma resume, and Docker-versus-native computation admission.
 
 ## Lean
 
@@ -118,4 +162,5 @@
 - [x] Contributor setup, quality gates, trust boundaries, and pull-request expectations are
   documented.
 - [x] Project integrity checks detect version drift and missing, stale, or unexpected schemas.
-- [x] Re-run all quality gates after the backend migration and rebuild wheel/sdist artifacts.
+- [x] Re-run all quality gates after the scientific-ledger/snapshot changes and rebuild/install
+  wheel and sdist artifacts.

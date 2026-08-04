@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
+from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
@@ -37,16 +38,22 @@ class AccountingModelClient:
         cache_namespace: str | None = None,
         provider: Literal["codex", "api"] | None = None,
         role: str | None = None,
+        _prepared_delegate: ModelClient | None = None,
+        _request_locks: dict[str, asyncio.Lock] | None = None,
     ) -> None:
         self._source_delegate = delegate
         stage_factory = getattr(delegate, "for_stage", None)
         self._delegate = (
-            cast(
-                ModelClient,
-                stage_factory(stage, run_root=logger.run_root, role=role),
+            _prepared_delegate
+            if _prepared_delegate is not None
+            else (
+                cast(
+                    ModelClient,
+                    stage_factory(stage, run_root=logger.run_root, role=role),
+                )
+                if callable(stage_factory)
+                else delegate
             )
-            if callable(stage_factory)
-            else delegate
         )
         self._stage = stage
         self._provider = provider
@@ -58,7 +65,7 @@ class AccountingModelClient:
         if not resolved_namespace.strip():
             raise ValueError("model cache namespace must not be blank")
         self._cache_namespace = resolved_namespace.strip()
-        self._request_locks: dict[str, asyncio.Lock] = {}
+        self._request_locks = _request_locks if _request_locks is not None else {}
 
     def for_role(self, role: str) -> AccountingModelClient:
         """Create a role-isolated model context sharing accounting and call journals."""
@@ -74,6 +81,35 @@ class AccountingModelClient:
             cache_namespace=self._cache_namespace,
             provider=self._provider,
             role=role.strip(),
+            _request_locks=self._request_locks,
+        )
+
+    def for_workspace(
+        self,
+        workspace_root: Path,
+        *,
+        writable_paths: Sequence[Path] = (),
+    ) -> AccountingModelClient:
+        """Forward a least-privilege workspace binding without changing accounting scope."""
+
+        workspace_factory = getattr(self._delegate, "for_workspace", None)
+        if not callable(workspace_factory):
+            raise TypeError("model client does not support assignment workspace binding")
+        bound_delegate = cast(
+            ModelClient,
+            workspace_factory(workspace_root, writable_paths=tuple(writable_paths)),
+        )
+        return type(self)(
+            bound_delegate,
+            stage=self._stage,
+            budget=self._budget,
+            logger=self._logger,
+            replay_completed=self._replay_completed,
+            cache_namespace=self._cache_namespace,
+            provider=self._provider,
+            role=self._role,
+            _prepared_delegate=bound_delegate,
+            _request_locks=self._request_locks,
         )
 
     def request_cache_key(
@@ -209,6 +245,7 @@ class AccountingModelClient:
                     response_id=result.response_id,
                     status=result.status,
                     usage=usage,
+                    provider_session_id=self._provider_session_id(result),
                     tool_metadata=[dict(item) for item in result.tool_metadata],
                     parsed=result.parsed,
                 )
@@ -218,6 +255,16 @@ class AccountingModelClient:
 
             # ``record.usage`` is the successful attempt already accounted above.
             return self._result_from_record(record, output_type)
+
+    @staticmethod
+    def _provider_session_id(result: ModelResult[Any]) -> str | None:
+        """Select only the provider's nonsecret session/context identity for replay."""
+
+        for key in ("session_id", "context_id"):
+            value = result.request_metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
     async def _generate_with_time_limit(
         self,
@@ -430,6 +477,11 @@ class AccountingModelClient:
             "maximum_web_search_calls": record.request.maximum_web_search_calls,
             "max_output_tokens": record.request.max_output_tokens,
         }
+        if record.provider_session_id is not None:
+            request_metadata = {
+                **request_metadata,
+                "session_id": record.provider_session_id,
+            }
         return ModelResult(
             parsed=parsed,
             response_id=record.response_id,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime
@@ -20,6 +21,7 @@ from .workspace import atomic_write_json, ensure_path_confined
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_PROVIDER_CONTEXT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 
 
 class JournalCorruptionError(RuntimeError):
@@ -75,7 +77,7 @@ class ModelCallRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     created_at: datetime
     request_key: str
     stage: str
@@ -85,6 +87,7 @@ class ModelCallRecord(BaseModel):
     response_id: str
     status: str
     usage: UsageRecord
+    provider_session_id: str | None = None
     tool_metadata: list[dict[str, Any]] = Field(default_factory=list)
     parsed: Any
 
@@ -99,6 +102,16 @@ class ModelCallRecord(BaseModel):
         if not value.strip():
             raise ValueError("model-call audit fields must not be blank")
         return value.strip()
+
+    @field_validator("provider_session_id")
+    @classmethod
+    def _provider_session_id_is_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not _PROVIDER_CONTEXT_ID.fullmatch(normalized):
+            raise ValueError("provider session ID must use bounded portable nonsecret characters")
+        return normalized
 
 
 class _UsageJournalEntry(BaseModel):
@@ -391,6 +404,7 @@ class ModelCallStore:
         response_id: str,
         status: str,
         usage: UsageRecord,
+        provider_session_id: str | None = None,
         tool_metadata: list[dict[str, Any]],
         parsed: Any,
     ) -> ModelCallRecord:
@@ -401,7 +415,7 @@ class ModelCallStore:
         if stage.strip() != identity.stage:
             raise ModelCallJournalError("model-call persistence stage does not match request key")
         raw = {
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": _timestamp(self._clock()),
             "request_key": identity.request_key,
             "stage": stage,
@@ -411,6 +425,7 @@ class ModelCallStore:
             "response_id": response_id,
             "status": status,
             "usage": usage,
+            "provider_session_id": provider_session_id,
             "tool_metadata": tool_metadata,
             "parsed": parsed,
         }

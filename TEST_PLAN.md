@@ -9,12 +9,75 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 
 - Knowledge-graph schema/type validation, stable IDs, Markdown/frontmatter round trips, and
   relation constraints.
-- Atomic graph patch merges, idempotency, likely duplicates, stale-base/hash conflicts, invalid
-  status promotions, dependency DAG cycles, and staleness propagation.
+- Deterministic schema-v2 scientific admission, idempotent application-owned graph commits,
+  `(run, assignment, local key, result schema)` collision rejection, unknown dependency/target
+  rejection, exact-statement-plus-scope claim identity, gap/obligation versus gap-free/proposed-
+  derivation classification, real relation directions, invalid status-promotion prevention,
+  stable-node and same-report local dependency resolution, unknown/self/cyclic local dependency
+  rejection, dependency DAG cycles, and staleness propagation. New worker schemas reject
+  model-authored `graph_patch` payloads.
 - Human prose/statement edits, statement version increments, proof re-audit, managed-field
   conflicts, unknown Markdown notes, crash recovery, snapshots, diffs, and SQLite rebuilds.
+- Content-addressed snapshot deltas, blob deduplication, periodic checkpoints, integrity/content
+  roots, deterministic reconstruction, corruption rejection, schema-v1 read compatibility, and
+  byte-preserving legacy-to-v2 continuation.
 - Frontier selection, graph-scoped task creation, bounded context slices, manuscript mappings,
   and exact-version Lean records.
+- Source-hash target registry create/reuse, byte-stable same-source target/contract/prompt reuse,
+  cosmetic same-contract paraphrase recording, clause-level quantifier/domain/additive-term/
+  polarity alignment failures, explicit versioned migration and invalidation, registry integrity
+  rejection, and `--migrate-target` confirmation.
+- Archive-to-ledger projection, exact-statement claim aliases, AND-premise/OR-derivation trust,
+  typed obligation logical versions covering exact statement, conclusion, quantifiers, hypotheses,
+  dependency/target claim IDs, scope, notation version, and falsification evidence; assumption-
+  contract and partial-result quarantine; derivation-local staleness; integrity-protected ledger
+  persistence; and bounded smallest-known-open-cut computation/capping.
+- Blind intermediate-lemma nomination and audit: main/computation/definition/counterexample/gapped
+  and assumption-bearing/partial exclusion, unique admission binding, exact cut relevance/leverage,
+  complete frozen obligation contracts and dependency/artifact hashes, origin-field stripping,
+  schema-v2 distinct verifier/falsifier execution contexts, optional redaction-safe provider
+  sessions and collision rejection, missing-role-only resume, persisted request/response/gate re-
+  verification, byte-preserving v1 manifest/archive migration and mandatory two-role v2 rerun,
+  forged-mapping rejection, deterministic pass/fail/blocked gates, exact-obligation `RESOLVES`
+  semantics, and the nonterminal main/manuscript flags.
+- Exact-main-counterexample nomination and terminal audit: rejection of branch, intermediate,
+  incomplete, assumption-bearing, partial, and target-mismatched results; complete worker-envelope
+  and scheduler-response binding; transitive result-DAG and unresolved-obligation closure; exact
+  dependency-version, declaration, canonical-graph, and independently replayed computation
+  support; frozen official policy/prompt/settings artifacts; distinct role contexts and
+  verifier/hostile-falsifier response
+  accounting; explicit witness, hypothesis, and failed-conclusion recomputation; frozen-`BLOCKED`
+  reuse across unrelated graph revisions and missing-role-only resume; durable supersession plus a
+  new audit ID after genuine canonical-support change; tampered/forged artifact rejection;
+  deterministic `FAIL`/`BLOCKED` precedence and gate replay before terminal rejection; and graph
+  promotion in which only the verified gate adds `REFUTES` to the main target.
+- Private computation workspaces, confinement and file quotas, symlink/hardlink/special/undeclared
+  rejection, application-computed CAS hashes, immutable manifest reuse/corruption checks, safe-
+  backend refusal, restricted-Docker replay pass/mismatch/failure, native unsafe-backend handling,
+  canonical evidence-path and declaration-hash binding, forged-mapping rejection, proposed-only
+  replay support, unreplayed-ledger exclusion, rejection of unrelated replay, exact-main transitive
+  local-result closure binding, and canonical computation derivation/manifest/replay graph support.
+- Durable scientific phase transitions, plateau/repeated-gap/cut signals, phase-specific roles and
+  concurrency, exact duplicate merge, near-duplicate redirect, complementary cut-target contracts,
+  one-obligation five-role bottleneck rotation, old-phase queued-work retirement, audited-premise
+  synthesis, current-epoch graph-recorded complementary adversarial evidence, per-transition phase
+  epochs that exclude stale signals and queued work, configurable `[research.scientific_phase]`,
+  and resume integrity.
+- Canonical source identity precedence, base-arXiv/revision handling, alias/evidence/provenance
+  merge, cross-run provisional-to-verified upgrades, conflicting stable identifiers on a shared
+  URL, distinct same-title identifiers, provisional unverified fingerprints, exact-statement-plus-
+  scope claim merging, semantic-near-match review, idempotent integration, and explicit worker-
+  result-only `CITES` edges.
+- Shared bounded trusted-context selection for manuscript and formalization, accepted-main-proof
+  prioritization, canonical trusted-closure enforcement, authenticated definition/proof-route
+  checks, verified-source/formalization role filtering, informal/unverified/archive-only exclusion,
+  deterministic cap ordering, and explicit eligible/included/omitted/truncation metadata.
+- Legacy migration planning with zero graph edits, gapped-proof classification, dependency
+  extraction, review-only derivations, branch-refutation quarantine, exact claim groups, audit-
+  nomination ranking, ambiguity/scope reports, digest verification, and vault-output refusal.
+  Reviewed application covers confirmation bypass, wrong-graph/stale/tampered rejection, archive-
+  digest/version revalidation, atomic/idempotent recovery, legacy-node/snapshot preservation,
+  proposed-only derivations, queued audit tasks, and zero model calls.
 - Bootstrap, existing-graph, continuation, and resume activation metadata; exact reviewed-revision
   attestation; and current-frontier reconstruction without provider conversation memory.
 - Explicit assignment branch-target validation, including rejection of empty, unknown,
@@ -84,7 +147,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 - Candidate audit pauses new admission; in-flight completions remain durable, and a failed audit
   becomes an immediate high-priority coordinator event.
 - A worker schema failure during candidate auditing becomes a durable issue and does not cancel
-  already-running audits. Invalid optional graph patches likewise retain valid scientific reports.
+  already-running audits. Deterministic admission failure likewise retains valid scientific
+  reports and application-owned admission records.
 - Two completed audits survive a third audit crash and restart retries only the missing audit;
   acceptance remains impossible with any missing audit or unverified imported theorem.
 - Invalid provider outputs and successful schema-repair attempts both count toward usage and call
@@ -108,8 +172,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   stable problem node, distinct run nodes, increasing revisions, and a valid shared vault.
 - Run different source files and assert separate default vaults, then explicitly reuse one vault
   for a follow-up source and assert both stable problem nodes coexist only in that selected graph.
-- Assert worker evidence precedes graph integration and graph patch artifacts/events remain
-  replayable without another paid call.
+- Assert worker evidence precedes deterministic graph admission and legacy-named application
+  admission records/events remain replayable without another paid call.
 
 1. Complete successful run to `LEAN_VERIFIED`.
 2. Research rejected: no manuscript or Lean call.
@@ -143,6 +207,44 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 17. Retriable research failure reports expose separate workflow/scientific status, completed
     workers, committed and missing audits, trace paths, and the resume action.
 18. Corrupt state, immutable hash mismatch, unsafe path, and unauthorized write still hard-stop.
+19. Same-source compiler paraphrase: exact target/contract/prompt bytes are reused; a confirmed
+    contract migration persists through interruption/resume and invalidates dependent evidence.
+20. Intermediate lemma transaction: one completed blind role survives interruption, resume calls
+    only the missing role, and a pass promotes only the intermediate claim/derivation without main
+    acceptance or manuscript authorization.
+21. Computation transaction: collection produces immutable CAS/manifests, native replay records an
+    unsafe backend, Docker replay is independently reproduced, and a pass yields only a proposed
+    derivation pending audit.
+22. Scientific plateau: persisted cut/gap signals advance phases, exact duplicates merge,
+    near-duplicates redirect, all five roles rotate against one durable bottleneck obligation,
+    phase transitions retire queued old-phase work, and resume retains the same scientific-phase
+    checkpoint.
+23. Canonical ledger integration: archive notes rebuild the same AND/OR ledger, Main Result Needs
+    shows the pre-acceptance target/cut, capped search remains explicit, and alternative derivation
+    staleness is local.
+24. Source/claim integration: exact source keys and exact-statement-plus-scope claims merge
+    idempotently, distinct identifiers and semantic near-matches remain separate, and only explicit
+    worker-result source links create result `CITES` edges.
+25. Legacy backfill: planning leaves the vault byte-identical; applying the externally reviewed
+    plan creates one new graph revision and application record, a retry is idempotent, ambiguous
+    items remain unapplied, and queued verifier/falsifier tasks grant no trust without later audits.
+26. Sanitized legacy-envelope acceptance: the synthetic-derived fixture corpus exercises the
+    historical report variants documented by the available archive notes. The corpus is explicitly
+    not represented as a replay of the unavailable original run archives.
+27. Assumption/partial trust boundary: same-statement claims with different assumption contracts do
+    not alias; assumed and partial results remain archive-only with obligations and cannot reach
+    candidate packaging, lemma nomination, or exact-counterexample nomination/support.
+28. Audit compatibility and resume: a schema-v1 lemma pass is byte-preserved under a verified
+    `legacy-v1/manifest.json` and both roles rerun in distinct v2 contexts; a frozen incomplete
+    counterexample audit survives an unrelated revision, while genuine canonical-support change
+    durably supersedes it and creates a new audit. Missing-role retries checkpoint the prior gate
+    by digest and recover only monotone response/accounting progress after scheduler lag.
+29. Downstream context isolation: manuscript and formalization share the same selection policy,
+    exclude informal claims, unverified sources, unauthenticated routes, and archive-only evidence,
+    prioritize accepted main-proof support, and report deterministic cap metadata.
+30. Prompt-only replay: an unchanged compiled target reuses the archived pre-gate graph and
+    candidate-support inputs, creates no duplicate model-call records, and retains the earlier
+    research generation as auditable history.
 
 ## Optional live tests
 

@@ -19,6 +19,9 @@ class NodeType(StrEnum):
     DEFINITION = "definition"
     CLAIM = "claim"
     PROOF = "proof"
+    PROOF_ATTEMPT = "proof_attempt"
+    DERIVATION = "derivation"
+    OBLIGATION = "obligation"
     APPROACH = "approach"
     TASK = "task"
     COUNTEREXAMPLE = "counterexample"
@@ -96,6 +99,9 @@ NODE_ID_PREFIXES: dict[NodeType, str] = {
     NodeType.DEFINITION: "DEF",
     NodeType.CLAIM: "CLM",
     NodeType.PROOF: "PRF",
+    NodeType.PROOF_ATTEMPT: "PAT",
+    NodeType.DERIVATION: "DRV",
+    NodeType.OBLIGATION: "OBL",
     NodeType.APPROACH: "APR",
     NodeType.TASK: "TSK",
     NodeType.COUNTEREXAMPLE: "CEX",
@@ -113,6 +119,9 @@ NODE_TYPE_DIRECTORIES: dict[NodeType, str] = {
     NodeType.DEFINITION: "Definitions",
     NodeType.CLAIM: "Claims",
     NodeType.PROOF: "Proofs",
+    NodeType.PROOF_ATTEMPT: "Proof Attempts",
+    NodeType.DERIVATION: "Derivations",
+    NodeType.OBLIGATION: "Obligations",
     NodeType.APPROACH: "Approaches",
     NodeType.TASK: "Tasks",
     NodeType.COUNTEREXAMPLE: "Counterexamples",
@@ -375,6 +384,12 @@ class GraphNodeSummary(_GraphModel):
 class GraphFrontier(_GraphModel):
     problem_id: str
     graph_revision: str
+    main_target: GraphNodeSummary | None = None
+    live_derivations: list[GraphNodeSummary] = Field(default_factory=list)
+    strongest_audited_results: list[GraphNodeSummary] = Field(default_factory=list)
+    open_obligations: list[GraphNodeSummary] = Field(default_factory=list)
+    smallest_known_open_cut: list[GraphNodeSummary] = Field(default_factory=list)
+    open_cut_search_capped: bool = False
     unresolved_claims: list[GraphNodeSummary] = Field(default_factory=list)
     candidate_proofs_awaiting_audit: list[GraphNodeSummary] = Field(default_factory=list)
     blocked_approaches: list[GraphNodeSummary] = Field(default_factory=list)
@@ -426,6 +441,36 @@ class GraphDiff(_GraphModel):
     removed_edges: list[GraphEdge]
 
 
+class GraphSnapshotVerification(_GraphModel):
+    """Integrity result for one immutable graph revision snapshot."""
+
+    revision: str
+    schema_version: Literal[1, 2]
+    integrity_root: str
+    node_count: int = Field(ge=0)
+    edge_count: int = Field(ge=0)
+    checkpoint_revision: str | None = None
+    legacy: bool
+    artifact_path: str
+    created_at: str
+
+    @field_validator("revision", "checkpoint_revision")
+    @classmethod
+    def snapshot_revisions_are_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"\d{8}-[0-9a-f]{16}", value):
+            raise ValueError("snapshot revision has an invalid format")
+        return value
+
+    @field_validator("integrity_root")
+    @classmethod
+    def integrity_root_is_valid(cls, value: str) -> str:
+        if not _SHA256.fullmatch(value):
+            raise ValueError("snapshot integrity root must be a lowercase SHA-256 value")
+        return value
+
+
 class GraphChangeRecord(_GraphModel):
     revision: str
     previous_revision: str
@@ -473,6 +518,7 @@ __all__ = [
     "GraphNodeSummary",
     "GraphNodeUpdate",
     "GraphPatch",
+    "GraphSnapshotVerification",
     "GraphState",
     "GraphStatus",
     "GraphStatusChange",

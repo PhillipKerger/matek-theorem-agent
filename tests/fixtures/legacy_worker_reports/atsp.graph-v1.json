@@ -1,0 +1,129 @@
+{
+  "fixture_schema_version": 1,
+  "fixture_kind": "synthetic-derived-backfill",
+  "snapshot_reference": "00000315-96a705c853a887d3",
+  "problem_id": "PRB-ATSP0001",
+  "main_target_id": "CLM-ATSPTGT1",
+  "task_id": "TSK-ATSPTSK1",
+  "approach_id": "APR-ATSPAPR1",
+  "run_id": "fixture-atsp-run",
+  "expected_backfill": {
+    "proof_attempt_reclassifications": [
+      "PRF-ATSPPRF1"
+    ],
+    "refutation_quarantines": []
+  },
+  "nodes": [
+    {
+      "matek_id": "PRB-ATSP0001",
+      "node_type": "problem",
+      "problem_id": "PRB-ATSP0001",
+      "title": "Synthetic-derived ATSP problem",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Problem\n\nSynthetic-derived fixture; not an archived snapshot."
+    },
+    {
+      "matek_id": "CLM-ATSPTGT1",
+      "node_type": "claim",
+      "problem_id": "PRB-ATSP0001",
+      "title": "ATSP main target",
+      "epistemic_status": "conjectured",
+      "claim_type": "theorem",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact statement\n\nEvery admissible ATSP instance has a tour satisfying the target approximation bound.",
+      "tags": [
+        "matek/main-target"
+      ]
+    },
+    {
+      "matek_id": "TSK-ATSPTSK1",
+      "node_type": "task",
+      "problem_id": "PRB-ATSP0001",
+      "title": "ATSP archived assignment",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Task\n\nTest the cycle-cover route."
+    },
+    {
+      "matek_id": "APR-ATSPAPR1",
+      "node_type": "approach",
+      "problem_id": "PRB-ATSP0001",
+      "title": "Cycle-cover route",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact route attempted\n\nDelete cycle representatives and repair."
+    },
+    {
+      "matek_id": "RUN-ATSPRUN1",
+      "node_type": "run",
+      "problem_id": "PRB-ATSP0001",
+      "title": "ATSP fixture run",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Run\n\nSynthetic-derived compatibility fixture."
+    },
+    {
+      "matek_id": "CLM-ATSPPRE1",
+      "node_type": "claim",
+      "problem_id": "PRB-ATSP0001",
+      "title": "ATSP archived premise",
+      "claim_type": "lemma",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact statement\n\nLaminar cycle families admit a representative-edge ledger."
+    },
+    {
+      "matek_id": "CLM-ATSPLEG1",
+      "node_type": "claim",
+      "problem_id": "PRB-ATSP0001",
+      "title": "Legacy ATSP restricted claim",
+      "epistemic_status": "candidate",
+      "claim_type": "lemma",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact statement\n\nLaminar cycle-cover instances admit the proposed deletion repair."
+    },
+    {
+      "matek_id": "PRF-ATSPPRF1",
+      "node_type": "proof",
+      "problem_id": "PRB-ATSP0001",
+      "title": "Legacy ATSP gapped proof",
+      "epistemic_status": "candidate",
+      "workflow_status": "blocked",
+      "created_in_run": "fixture-atsp-run",
+      "last_modified_run": "fixture-atsp-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Proof content\n\nThe charging argument works for a laminar family.\n\n## Exact gap\n\nRemove the laminarity hypothesis without losing the bound.",
+      "relations": [
+        {
+          "source_id": "PRF-ATSPPRF1",
+          "relation": "proves",
+          "target_id": "CLM-ATSPLEG1"
+        }
+      ],
+      "metadata": {
+        "matek_dependencies": [
+          "CLM-ATSPPRE1",
+          "an unnamed uncrossing assertion"
+        ]
+      }
+    }
+  ]
+}

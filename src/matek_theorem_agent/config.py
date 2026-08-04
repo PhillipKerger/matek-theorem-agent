@@ -276,6 +276,22 @@ class CodexSettings(_StrictSettings):
         return self.research_worker_effort
 
 
+class ScientificPhaseSettings(_StrictSettings):
+    """Durable progress thresholds and phase-specific scientific concurrency."""
+
+    no_audited_progress_assignments: int = Field(default=8, ge=1)
+    unchanged_cut_snapshots: int = Field(default=4, ge=1)
+    repeated_gap_threshold: int = Field(default=3, ge=2)
+    similarity_threshold: float = Field(default=0.86, ge=0.0, le=1.0)
+    blocked_or_refuted_ratio: float = Field(default=0.60, ge=0.0, le=1.0)
+    bottleneck_maximum_size: int = Field(default=3, ge=1)
+    bottleneck_attempts_before_audit: int = Field(default=5, ge=1)
+    explore_concurrency: int = Field(default=8, ge=1)
+    consolidate_concurrency: int = Field(default=4, ge=1)
+    bottleneck_concurrency: int = Field(default=3, ge=1)
+    adversarial_concurrency: int = Field(default=2, ge=1)
+
+
 class ResearchSettings(_StrictSettings):
     orchestration_mode: Literal["flat", "hierarchical"] = "hierarchical"
     maximum_subagents_per_agent: int = Field(default=8, ge=0, le=32)
@@ -286,6 +302,7 @@ class ResearchSettings(_StrictSettings):
     maximum_coordinator_context_characters: int = Field(default=800_000, ge=100_000)
     maximum_unrequested_full_graph_node_characters: int = Field(default=120_000, ge=1_000)
     maximum_coordinator_requested_artifacts: int = Field(default=32, ge=1, le=32)
+    scientific_phase: ScientificPhaseSettings = Field(default_factory=ScientificPhaseSettings)
     require_foundational_audit: Literal[True] = True
     require_domain_audit: Literal[True] = True
     require_hostile_audit: Literal[True] = True
@@ -1292,6 +1309,7 @@ __all__ = [
     "ModelsSettings",
     "PricingSettings",
     "ResearchSettings",
+    "ScientificPhaseSettings",
     "config_as_toml",
     "consume_config_migration_notice",
     "environment_overrides",

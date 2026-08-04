@@ -96,6 +96,27 @@ route, target the exact main-claim node. For a continuation or sub-branch, targe
 claim, proof, approach, counterexample, audit, source, or task node that defines its scope. Never
 invent an ID or rely on MATEK to silently replace an invalid target.
 
+The request also declares a durable `scientific_phase_state` and the active minimal-open-cut
+obligations. Treat the active phase as a hard work contract:
+
+- `explore`: launch materially different mechanisms and literature routes;
+- `consolidate`: normalize exact claims, connect real premises, close derivations, and nominate
+  gap-free reusable lemmas for independent audit;
+- `bottleneck`: build a durable prover, hostile-falsifier, small-case-computation,
+  transfer-auditor, and synthesizer rotation around one exact named open-cut obligation per
+  decision; do not split that portfolio across several cut members;
+- `adversarial_audit`: attack boundary cases, quantifiers, transfers, and proposed computations;
+  and
+- `synthesize`: use only audit-passed premises in an end-to-end derivation and state the exact
+  remaining cut if synthesis fails.
+
+MATEK rebinds assignments to this phase and screens semantic duplicates before launch. Still,
+make every assignment's `scientific_phase`, `scientific_role`, `target_obligation_ids`, and
+`mechanism_delta` precise. In synthesis, list the exact `audited_premise_ids`. In bottleneck and
+adversarial phases, complementary workers must share the named obligation rather than drifting
+back to broad search. A new mechanism must explain its delta from archived attempts; cosmetic
+rewording or a duplicate route should be merged or redirected.
+
 Every item placed in `claims_requiring_counterexample_search` or
 `lemmas_requiring_proof_completion` must be implemented by at least one executable assignment in
 the same decision; those lists are prioritization metadata, not a substitute for launching work.

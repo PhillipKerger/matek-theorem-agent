@@ -7,6 +7,13 @@
           "title": "Approach Family",
           "type": "string"
         },
+        "audited_premise_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Audited Premise Ids",
+          "type": "array"
+        },
         "expected_output": {
           "title": "Expected Output",
           "type": "string"
@@ -22,6 +29,16 @@
           "title": "Inputs",
           "type": "array"
         },
+        "mechanism_delta": {
+          "title": "Mechanism Delta",
+          "type": "string"
+        },
+        "scientific_phase": {
+          "$ref": "#/$defs/ScientificPhase"
+        },
+        "scientific_role": {
+          "$ref": "#/$defs/ScientificRole"
+        },
         "stopping_condition": {
           "title": "Stopping Condition",
           "type": "string"
@@ -31,6 +48,20 @@
             "type": "string"
           },
           "title": "Target Node Ids",
+          "type": "array"
+        },
+        "target_obligation_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Target Obligation Ids",
+          "type": "array"
+        },
+        "target_obligation_versions": {
+          "items": {
+            "$ref": "#/$defs/TargetObligationVersion"
+          },
+          "title": "Target Obligation Versions",
           "type": "array"
         },
         "task": {
@@ -45,9 +76,59 @@
         "expected_output",
         "inputs",
         "target_node_ids",
-        "stopping_condition"
+        "stopping_condition",
+        "scientific_phase",
+        "scientific_role",
+        "target_obligation_ids",
+        "target_obligation_versions",
+        "mechanism_delta",
+        "audited_premise_ids"
       ],
       "title": "ResearchAssignment",
+      "type": "object"
+    },
+    "ScientificPhase": {
+      "enum": [
+        "explore",
+        "consolidate",
+        "bottleneck",
+        "adversarial_audit",
+        "synthesize"
+      ],
+      "title": "ScientificPhase",
+      "type": "string"
+    },
+    "ScientificRole": {
+      "enum": [
+        "explorer",
+        "consolidator",
+        "independent_prover",
+        "hostile_falsifier",
+        "small_case_computation",
+        "transfer_auditor",
+        "synthesizer"
+      ],
+      "title": "ScientificRole",
+      "type": "string"
+    },
+    "TargetObligationVersion": {
+      "additionalProperties": false,
+      "description": "Portable typed binding from a graph target ID to its semantic contract digest.",
+      "properties": {
+        "logical_version": {
+          "title": "Logical Version",
+          "type": "string"
+        },
+        "obligation_id": {
+          "title": "Obligation Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "obligation_id",
+        "logical_version"
+      ],
+      "title": "TargetObligationVersion",
       "type": "object"
     }
   },

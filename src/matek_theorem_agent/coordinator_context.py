@@ -21,7 +21,7 @@ from .knowledge_graph.models import (
 )
 
 COORDINATOR_PAYLOAD_SCHEMA_VERSION = 3
-COORDINATOR_SECTION_ORDER_VERSION = 1
+COORDINATOR_SECTION_ORDER_VERSION = 2
 DEFAULT_UNREQUESTED_FULL_GRAPH_NODES_CHARACTER_LIMIT = 120_000
 GRAPH_NODE_DIGEST_CHARACTER_LIMIT = 16_000
 
@@ -33,12 +33,14 @@ COORDINATOR_SECTION_ORDER: tuple[str, ...] = (
     "coordinator_payload_schema_version",
     "compiled_prompt",
     "claim_contract",
+    "literature_refresh",
     "exact_target_policy",
     "context_mode",
     "context_contract",
     "coordinator_mode",
     "activation_context",
     "research_agent_hierarchy",
+    "scientific_phase_state",
     "decision_id",
     "after_event_sequence",
     "initial_portfolio",
@@ -967,7 +969,12 @@ class CoordinatorContextBuilder:
     def _mandatory_payload(source: Mapping[str, object]) -> dict[str, object]:
         return {
             key: source[key]
-            for key in ("compiled_prompt", "claim_contract", "exact_target_policy")
+            for key in (
+                "compiled_prompt",
+                "claim_contract",
+                "literature_refresh",
+                "exact_target_policy",
+            )
             if key in source
         }
 
@@ -977,6 +984,7 @@ class CoordinatorContextBuilder:
             "coordinator_mode",
             "activation_context",
             "research_agent_hierarchy",
+            "scientific_phase_state",
             "decision_id",
             "after_event_sequence",
             "initial_portfolio",

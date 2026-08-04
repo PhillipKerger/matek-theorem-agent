@@ -7,18 +7,24 @@ problem.md + CLI/environment/project configuration
   -> backend resolver
        -> Codex CLI backend (recommended/default; saved ChatGPT authentication)
        -> OpenAI Responses API backend (advanced; explicit API selection)
-  -> intake + contract extraction
+  -> intake + normalized source SHA-256 + contract extraction
   -> framework compiler (live search enabled)
        -> clarification request + final report, when no unique target can be identified
        -> compiled_research_prompt.md + compiled_problem.json, otherwise
+  -> deterministic target-clause alignment + source-hash target registry
   -> verified prior-literature classification
   -> durable event-driven research coordinator
+       -> durable explore/consolidate/bottleneck/adversarial-audit/synthesize phase state
        -> coordinator decisions + assignment lifecycle state
        -> canonical atomic scheduler checkpoint + immutable per-event evidence
        -> materialized mailbox and navigation views
        -> live pool of independent workers
-       -> full raw reports + approach registry
-       -> targeted counterexample/lemma workers
+       -> full raw schema-v2 scientific reports + approach registry
+       -> private computation collection/CAS/Docker replay (when declared)
+       -> deterministic claim/proof-attempt/derivation/obligation admission
+       -> archival Markdown + canonical proof ledger + smallest known open cut
+       -> blind intermediate-lemma verifier/falsifier lane
+       -> targeted counterexample workers
        -> candidate proof package
             -> independent audit suite + final research judge
             `-> failed-audit events return immediately to coordinator
@@ -117,6 +123,16 @@ Discover the project root, create `.matek/runs/<run-id>/`, enforce path confinem
 files atomically. Reports use relative artifact paths. Generated output and provider traces are
 untrusted input.
 
+Each research assignment also receives a private `0700` root at
+`research/workspaces/<assignment-id>/`; only its `scratch/` child is writable. A worker-capable
+Codex client is rebound to the assignment root with that single write path. Declared computation
+files are collected into
+`research/computations/blobs/sha256/`, bound by an immutable manifest, and replayed in a fresh
+workspace only through an injected backend that attests both filesystem confinement and disabled
+networking. The current trusted replay backend is restricted Docker; native replay is refused.
+Mutable scratch and replay workspaces are not proof evidence, and a passing replay supports only a
+proposed derivation pending mathematical/domain audit.
+
 ### State machine
 
 Run state includes schema version, frozen backend, backend/authentication class, stage statuses,
@@ -177,10 +193,10 @@ The event loop is:
    transition with a pending-event write-ahead record, create one monotonically sequenced immutable
    event file, clear the pending record, and refresh the mailbox view. The ordering ensures every
    visible completion points to durable evidence and an interrupted event publication can finish
-   idempotently.
-   Validate an optional graph proposal only after this scientific transaction. Stale or malformed
-   mutations are quarantined as issue events; graph precondition hashes come from the frozen
-   revision, never the worker.
+   idempotently. The provider-visible report contains only schema-v2 scientific results,
+   obligations, sources, computation declarations, and branch outcome. MATEK then injects the
+   application-owned identities and constructs any graph changes deterministically; the worker
+   neither authors a `GraphPatch` nor controls status promotion or relation directions.
 4. Wake the coordinator on useful new events. A deterministic context builder always includes the
    original main prompt and claim contract, then packs unacknowledged events, lifecycle and audit
    state, summaries, and prioritized full reports under the measured provider-input ceiling.
@@ -230,6 +246,16 @@ There is no cumulative logical-worker ceiling and no fixed-round synchronization
 Total-open-assignment, concurrent-call, coordinator-decision, model-call, cost, token, and
 wall-clock limits are separate controls.
 
+Scientific scheduling is a second, deterministic constraint on that live pool. Its integrity-
+protected checkpoint is `research/coordinator/scientific-phase.json`. Persisted frontier signals
+advance through `explore`, `consolidate`, `bottleneck`, `adversarial_audit`, and `synthesize`;
+phase-specific concurrency is the active ceiling. Exact duplicate plans merge, near-duplicate
+mechanisms redirect, and each bottleneck portfolio selects one durable smallest-open-cut
+obligation. Successive activations rotate prover, falsifier, computation, transfer-auditor, and
+synthesizer roles against that same obligation; a phase transition retires work that is still
+queued under the old contract. Synthesis is serialized and may use only audited premises.
+Thresholds and concurrency are configurable under `[research.scientific_phase]`.
+
 The frozen claim contract is the terminal scientific identity throughout this loop. Valid
 reductions and special cases remain useful graph/report evidence, but they cannot terminate
 research, satisfy candidate packaging, or pass an audit as substitutes for the original problem.
@@ -247,15 +273,64 @@ auditors, or checkpoints.
 The research engine uses a narrow deterministic `KnowledgeGraph` service, not Obsidian. Before
 each coordinator activation it queries a typed frontier from authoritative Markdown. Coordinator
 assignments become persistent task nodes; each worker receives only a bounded
-dependency/evidence slice. Worker output may contain a typed `GraphPatch`, but workers never
-write shared notes. The service serializes commits with a project lock, performs optimistic
-revision/hash conflict checks, writes a recovery intent, atomically replaces changed notes and
-state, saves a revision snapshot, then rebuilds navigation and SQLite views.
+dependency/evidence slice. A worker returns a typed `ResearchWorkerReport` v2, never a persistence
+mutation. After the report and source/computation evidence are durable, the service validates
+the acyclic same-report `dependency_result_keys` graph plus declared stable dependencies and
+targets. It resolves local keys to application-owned nodes and deterministically constructs
+canonical claims, proof attempts, derivations, obligations, counterexamples, artifacts, and real
+premise relations from server-owned run/assignment/task/approach identity. `(run_id, assignment_id,
+result.local_key,
+result.schema_version)` is the idempotency key; a payload-hash mismatch under that key is an
+admission failure. Exact normalized statement plus scope defines reusable claim identity, so exact
+matches share a claim but keep distinct proof attempts while semantic near-matches require audit or
+an equivalence derivation. A gap creates an obligation instead of a derivation; a gap-free eligible
+result creates only a proposed derivation. The service serializes commits with a project lock,
+writes a recovery intent, atomically replaces changed notes and state, saves a revision snapshot,
+then rebuilds navigation, proof-ledger, and SQLite views.
 
-Graph nodes distinguish mathematical claims from candidate proofs, audits, counterexamples,
-sources, and Lean formalizations. Status promotion and staleness are deterministic application
-rules. The manuscript and Lean stages consume accepted graph slices, and their mappings and exact
-verification records are written back only after existing gates pass.
+Candidate packaging re-establishes this mapping from persisted state. Every replay-backed
+computation in a triggering report must lie in an exact-main result's transitive local-result
+closure; the frozen graph-support slice includes that computation's claim, proof attempt,
+derivation, immutable manifest/replay nodes, resolved premise versions, and linked obligations.
+An unrelated successful replay cannot satisfy the candidate gate.
+
+The vault is a durable archive; archive membership is not trust. The integrity-protected,
+rebuildable `ledgers/<problem-id>/canonical-ledger.json` projection groups exact normalized claims,
+represents each derivation as joint AND-premises, treats multiple derivations for one conclusion as
+OR alternatives, and retains first-class versioned obligations. Gapped reports remain proof
+attempts plus obligations and cannot enter the derivation ledger. Trusted claims require an
+independent audit or Lean verification, and the frontier computes the smallest known open cut from
+the ledger. A bounded antichain search exposes `open_cut_search_capped` rather than overstating
+minimality.
+
+Before research, `prompts/target_alignment.json` conservatively checks the compiler's theorem
+against the exact claim-contract clauses; this fail-closed comparison is not a mathematical proof.
+The first aligned result for a normalized source hash is frozen in `target-registry.json`;
+same-source reruns receive those exact statement, contract, and prompt bytes while literature
+refresh stays run-local. A new aligned statement with the same contract is recorded as a cosmetic
+paraphrase and the frozen bytes remain authoritative. Contract drift fails closed unless the user
+confirms `matek run PROBLEM_FILE --migrate-target REASON`, which creates a versioned migration and
+invalidates affected proof evidence.
+
+Canonical source nodes use verified entity keys with DOI/base-arXiv/MR/ISBN/URL precedence.
+Versions, aliases, titles, evidence links, and verification provenance merge only for the same
+entity key; title similarity cannot merge distinct identifiers. Unverified title/author records
+remain open under provisional fingerprints. Worker scientific admission creates result `CITES`
+edges only for explicit result references; verified compiler literature remains separately linked
+to the frozen target.
+
+Eligible non-main, gap-free results on the current uncapped smallest open cut enter a separate
+lemma-audit transaction under `research/lemma-audits/<nomination-id>/`. Its frozen blind packet
+contains exact proof steps, source artifacts, and current dependency versions/hashes but omits
+worker confidence/status/desired-verdict metadata. Independent verifier and falsifier responses
+are immutable and individually resumable. A deterministic passing gate promotes only that
+intermediate claim/derivation to `audit_passed`; the gate hard-codes main-target acceptance and
+manuscript authorization to false.
+
+Graph nodes distinguish claims, proof attempts, derivations, obligations, audits,
+counterexamples, sources, artifacts, and Lean formalizations. Status promotion and staleness are
+deterministic application rules. The manuscript and Lean stages consume accepted graph slices,
+and their mappings and exact verification records are written back only after existing gates pass.
 
 Fresh coordinator calls carry an explicit bootstrap/continuation/resume activation context,
 current and previously observed graph revisions, and a no-hidden-memory reconstruction contract.
@@ -267,18 +342,38 @@ Approach families are labels, while assignment IDs define durable branch identit
 assignments in one family therefore create separate approach nodes and registry entries. A
 blocked or refuted branch cannot be overwritten by a later productive sibling. Conservative
 automatic distillation links counterexamples to the branch that produced them; claim-level
-refutation requires an explicit typed patch and independent scientific review.
+refutation requires an explicit typed result targeting the exact claim contract and independent
+scientific review.
 
 Each `.matek/knowledge/<graph-name>/` directory is an ordinary Obsidian-compatible vault and a
 separate portable source of truth. New runs normally derive `<graph-name>` from the source
 filename stem; `--knowledge-graph NAME` deliberately attaches related work to an already
 initialized graph. The chosen name is frozen in run state. Within each vault, `graph-state.json`
 stores its name, revision/hashes, ownership baselines, source-problem mappings, processed
-operation IDs, and change records; `snapshots/` supports diffs and safe stale rebases.
+operation IDs, and change records; `target-registry.json` freezes source-hash target identity;
+`ledgers/` holds rebuildable proof projections; and `snapshots/` supports diffs and reconstruction.
 `graph-index.sqlite` is derived and may be deleted/rebuilt. A pending transaction file plus
 `locks/graph.lock` makes each graph's multi-note commits crash-recoverable and cross-process
 serialized. This placement preserves the default no-write-outside-`.matek/` boundary and prevents
 unrelated problems from sharing memory by default.
+
+Snapshot schema v2 publishes a small manifest only after its immutable content-addressed node and
+edge blobs and optional checkpoint are durable. Each manifest binds its parent integrity root and
+a content root for the complete reconstructed blob set, plus the SHA-256 digest of the exact
+deterministic full-snapshot reconstruction. Full checkpoints bound delta replay; a checkpoint is
+mandatory at revision zero, every 64 revisions by default, and at the first v2 revision following
+a legacy schema-v1 snapshot. Schema-v1 files are never migrated or rewritten.
+
+`matek graph migrate-legacy` defaults to planning outside the commit path. It reads one stable
+archive revision and emits an integrity-protected report outside `.matek/knowledge/`, proposing
+proof-attempt reclassification, structured dependency extraction, review-only derivations,
+branch-local refutation quarantine, exact-statement aliases, and fresh lemma nominations. A later
+`--apply-plan` operation loads that exact external report, requires confirmation or `--yes`, and
+rechecks its digest, graph name, source revision, node count, archive digest, claim versions, and
+relation constraints under the graph lock. A valid plan commits atomically and idempotently,
+preserving old nodes and snapshots as archive evidence while creating proposed typed records and
+queued verifier/falsifier audit tasks. It makes no model call; ambiguities remain unapplied. The
+integrity-bound result is `ledgers/migrations/<plan-sha256>.application.json`.
 
 ### Command execution backends
 
@@ -289,8 +384,10 @@ class ExecutionBackend(Protocol):
     async def run(self, request: CommandRequest) -> CommandResult: ...
 ```
 
-The native and optional Docker command backends run Lean/LaTeX verification commands. Docker
-does not contain the host Codex CLI by default and never enables provider fallback.
+The native and optional Docker command backends run Lean/LaTeX verification commands. Computation-
+certificate replay uses the same abstraction but is trusted only when restricted Docker attests
+the assignment-stage write boundary and disabled networking; native replay is refused. Docker does
+not contain the host Codex CLI by default and never enables provider fallback.
 
 ### Deterministic verifiers
 
@@ -325,6 +422,10 @@ Domain models do not import the SDK, CLI presentation, or subprocess implementat
   views as execution continues. A missing or invalid canonical checkpoint blocks ordinary resume;
   MATEK does not infer scheduler state from the evidence files alone. Completed events are not
   redelivered after acknowledgement, and unacknowledged events are replayed idempotently.
+- Research resume also integrity-checks and reuses `research/coordinator/scientific-phase.json`,
+  immutable computation manifests/CAS blobs/replay verdicts, and lemma nomination/input/gate
+  evidence. It calls only a missing lemma-auditor role and never treats mutable scratch or replay
+  workspaces as checkpoints.
 - `resume` starts at the first incomplete stage with the frozen backend.
 - `--force-stage NAME` invalidates that boundary and downstream stages while preserving prior
   provider records as audit history.

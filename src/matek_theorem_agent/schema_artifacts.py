@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from .reporting import FinalReport
 from .stages.compile_prompt import CompiledProblem
+from .stages.counterexample_audit import CounterexampleAuditResponse
 from .stages.lean import ClaimAlignment
 from .stages.manuscript import BibliographyAudit
 from .stages.research import (
@@ -23,6 +24,7 @@ MODEL_SCHEMA_ARTIFACTS: dict[str, type[BaseModel]] = {
     "bibliography_audit.schema.json": BibliographyAudit,
     "claim_alignment.schema.json": ClaimAlignment,
     "compiled_problem.schema.json": CompiledProblem,
+    "counterexample_audit_response.schema.json": CounterexampleAuditResponse,
     "research_coordinator_decision.schema.json": ResearchCoordinatorDecision,
     "research_round_plan.schema.json": ResearchRoundPlan,
     "research_worker_report.schema.json": ResearchWorkerReport,

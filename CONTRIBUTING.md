@@ -25,7 +25,7 @@ Read the specifications affected by your change before editing implementation co
 - `WORKFLOW_SPEC.md` and `ARTIFACT_CONTRACT.md` define state transitions and durable files.
 - `CLI_SPEC.md` defines user-facing commands and recovery behavior.
 - `SECURITY.md` defines filesystem, subprocess, credential, and untrusted-input requirements.
-- `MATEK_OBSIDIAN_KNOWLEDGE_GRAPH_INSTRUCTIONS.md` defines graph storage and human-edit rules.
+- `ARCHITECTURE.md` defines graph storage, persistence, and human-edit ownership rules.
 
 Do not modify `resources/prompts/research_prompt_framework.txt`. Its exact bytes are an integrity
 boundary checked by the application and release tooling. Do not weaken a failed gate to make a

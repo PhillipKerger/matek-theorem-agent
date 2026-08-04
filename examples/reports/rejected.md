@@ -1,6 +1,8 @@
 # MATEK report — `20260719T120000Z-example-rejected-0a1b2c`
 
-This sanitized example shows a truthful scientific rejection.
+This sanitized example shows a truthful scientific rejection after an independently audited
+counterexample to the frozen exact theorem. A rejected proof candidate or coordinator declaration
+would remain partial and could not produce this status.
 
 ## Execution provenance
 
@@ -21,21 +23,26 @@ This sanitized example shows a truthful scientific rejection.
 
 ## Strongest established result
 
-The candidate's central lemma holds under the additional finite-support hypothesis, but the
-original universal claim was not established.
+The frozen target asserted `n + 1 = n` for every integer `n`. The exact instance `n = 0` satisfies
+the quantified domain, while the conclusion evaluates to `1 = 0`, which is false. Independent
+verifier and hostile-falsifier roles recomputed the hypothesis check and failed conclusion from
+the complete certificate, and the application-owned gate returned `refutation_verified`.
 
 ## Unresolved obligations
 
-- Repair or replace the false induction step exposed by the hostile audit.
-- Prove the infinite-support case required by the exact claim contract.
+None. Any missing audit role, changed request or response, mismatched target, incomplete
+certificate, or branch-local obstruction would have blocked terminal rejection.
 
 ## Representative artifacts
 
 - [`research/registry.json`](../../.matek/runs/EXAMPLE/research/registry.json)
-- [`research/candidate/package.json`](../../.matek/runs/EXAMPLE/research/candidate/package.json)
-- [`research/audits/hostile.json`](../../.matek/runs/EXAMPLE/research/audits/hostile.json)
-- [`research/verdict.json`](../../.matek/runs/EXAMPLE/research/verdict.json)
+- [`research/workers/exact-refutation.json`](../../.matek/runs/EXAMPLE/research/workers/exact-refutation.json)
+- [`research/counterexample-audits/cex-example/nomination.json`](../../.matek/runs/EXAMPLE/research/counterexample-audits/cex-example/nomination.json)
+- [`research/counterexample-audits/cex-example/requests/counterexample-verifier.json`](../../.matek/runs/EXAMPLE/research/counterexample-audits/cex-example/requests/counterexample-verifier.json)
+- [`research/counterexample-audits/cex-example/requests/counterexample-falsifier.json`](../../.matek/runs/EXAMPLE/research/counterexample-audits/cex-example/requests/counterexample-falsifier.json)
+- [`research/counterexample-audits/cex-example/gate.json`](../../.matek/runs/EXAMPLE/research/counterexample-audits/cex-example/gate.json)
 - [`report/verification_certificate.json`](../../.matek/runs/EXAMPLE/report/verification_certificate.json)
 
 No manuscript, bibliography, or Lean stage ran after rejection. The absence of those artifacts is
-part of the auditable outcome.
+part of the auditable outcome. In graph-integrated runs, only this verified gate may add a
+`REFUTES` edge from the audited counterexample to the main target.

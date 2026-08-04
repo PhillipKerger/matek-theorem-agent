@@ -262,6 +262,27 @@ class FakeCodexBackend:
         return CommandResult(argv, request.cwd, 0, stdout, "", 0.1)
 
 
+class WorkspaceWritingCodexBackend(FakeCodexBackend):
+    def __init__(self, project_root: Path, target: str) -> None:
+        super().__init__(["success"])
+        self.project_root = project_root
+        self.target = target
+
+    async def run(self, request: CommandRequest) -> CommandResult:
+        result = await super().run(request)
+        if request in self.exec_requests:
+            if self.target == "scratch":
+                target = request.cwd / "scratch" / "certificate.txt"
+            elif self.target == "sibling":
+                target = request.cwd / "sibling.txt"
+            elif self.target == "project":
+                target = self.project_root / "project-write.txt"
+            else:  # pragma: no cover - fixture construction is closed above
+                raise AssertionError(f"unknown workspace-write fixture target: {self.target}")
+            target.write_text("changed\n", encoding="utf-8")
+        return result
+
+
 def _run_root(tmp_path: Path) -> Path:
     run_root = tmp_path / ".matek" / "runs" / "test-run"
     run_root.mkdir(parents=True)
@@ -755,6 +776,117 @@ async def test_workspace_write_detects_unauthorized_change(tmp_path: Path) -> No
     assert not caught.value.retryable
     assert len(backend.exec_requests) == 1
     assert "unauthorized.txt" in caught.value.detail
+
+
+@pytest.mark.asyncio
+async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_only_scratch(
+    tmp_path: Path,
+) -> None:
+    run_root = _run_root(tmp_path)
+    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = assignment_root / "scratch"
+    scratch.mkdir(parents=True)
+    backend = WorkspaceWritingCodexBackend(tmp_path, "scratch")
+    worker = (
+        CodexCliModelClient(tmp_path, backend=backend)
+        .for_stage("research", run_root=run_root, role="research-worker")
+        .for_workspace(assignment_root, writable_paths=(scratch,))
+    )
+
+    result = await worker.generate_structured(_request(web_search=False), Answer)
+
+    assert result.parsed.answer == 42
+    assert (scratch / "certificate.txt").read_text(encoding="utf-8") == "changed\n"
+    command = backend.exec_requests[0]
+    assert command.cwd == assignment_root
+    assert command.argv[command.argv.index("-C") + 1] == str(assignment_root)
+    assert command.argv[command.argv.index("--sandbox") + 1] == "workspace-write"
+    output_path = Path(command.argv[command.argv.index("--output-last-message") + 1])
+    assert output_path.is_relative_to(run_root)
+    assert not output_path.is_relative_to(assignment_root)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["sibling", "project"])
+async def test_research_worker_workspace_binding_rejects_sibling_and_project_writes(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    run_root = _run_root(tmp_path)
+    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = assignment_root / "scratch"
+    scratch.mkdir(parents=True)
+    backend = WorkspaceWritingCodexBackend(tmp_path, target)
+    worker = (
+        CodexCliModelClient(tmp_path, backend=backend, max_attempts=1)
+        .for_stage("research", run_root=run_root, role="research-worker")
+        .for_workspace(assignment_root, writable_paths=(scratch,))
+    )
+
+    with pytest.raises(CodexUnauthorizedFileChangeError) as caught:
+        await worker.generate_structured(_request(web_search=False), Answer)
+
+    assert caught.value.kind is CodexErrorKind.UNAUTHORIZED_FILE_CHANGE
+    assert len(backend.exec_requests) == 1
+    expected = "sibling.txt" if target == "sibling" else "project-write.txt"
+    assert expected in caught.value.detail
+
+
+def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
+    tmp_path: Path,
+) -> None:
+    run_root = _run_root(tmp_path)
+    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = assignment_root / "scratch"
+    scratch.mkdir(parents=True)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    client = CodexCliModelClient(tmp_path, backend=FakeCodexBackend())
+
+    with pytest.raises(ValueError, match="research-worker"):
+        client.for_stage("audit", run_root=run_root, role="hostile").for_workspace(
+            assignment_root,
+            writable_paths=(scratch,),
+        )
+    with pytest.raises(ValueError, match="confined"):
+        client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
+            outside, writable_paths=(outside,)
+        )
+    with pytest.raises(ValueError, match="explicit writable"):
+        client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
+            assignment_root
+        )
+    with pytest.raises(ValueError, match="operation may not target"):
+        client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
+            assignment_root, writable_paths=(assignment_root,)
+        )
+    with pytest.raises(ValueError, match="does not exist"):
+        client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
+            assignment_root,
+            writable_paths=(assignment_root / "missing",),
+        )
+
+
+def test_workspace_binding_is_dropped_when_cloned_for_another_role(tmp_path: Path) -> None:
+    run_root = _run_root(tmp_path)
+    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = assignment_root / "scratch"
+    scratch.mkdir(parents=True)
+    bound = (
+        CodexCliModelClient(tmp_path, backend=FakeCodexBackend())
+        .for_stage("research", run_root=run_root, role="research-worker")
+        .for_workspace(assignment_root, writable_paths=(scratch,))
+    )
+
+    coordinator = bound.for_stage(
+        "research",
+        run_root=run_root,
+        role="research-coordinator",
+    )
+
+    policy = coordinator._resolved_policy(_request())
+    assert policy.sandbox == "read-only"
+    assert policy.allowed_write_paths == ()
 
 
 def test_error_classification_is_specific_and_redacted() -> None:

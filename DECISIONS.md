@@ -17,8 +17,9 @@ implementation reveals a concrete blocker.
 Persistent research memory uses an application-level typed knowledge graph. Obsidian is the
 recommended human view, not a runtime dependency or database. Markdown/frontmatter is
 authoritative, SQLite is derived, and the vault stays beneath `.matek/` to preserve the existing
-write boundary. The central coordinator alone creates tasks and accepts validated worker patches;
-subagents never mutate shared graph files concurrently.
+write boundary. The central coordinator alone creates tasks; validated schema-v2 worker reports
+are translated into graph mutations by deterministic application code. Workers and nested agents
+never author persistence patches or mutate shared graph files concurrently.
 
 Graphs are named and isolated beneath `.matek/knowledge/`. A run derives its default graph name
 from the problem filename stem. Users may explicitly reuse an initialized graph for related or

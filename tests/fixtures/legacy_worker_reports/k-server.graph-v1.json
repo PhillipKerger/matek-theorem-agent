@@ -1,0 +1,115 @@
+{
+  "fixture_schema_version": 1,
+  "fixture_kind": "synthetic-derived-backfill",
+  "snapshot_reference": "00000369-846a4dd539f2cac3",
+  "problem_id": "PRB-KSRV0001",
+  "main_target_id": "CLM-KSRVTGT1",
+  "task_id": "TSK-KSRVTSK1",
+  "approach_id": "APR-KSRVAPR1",
+  "run_id": "fixture-kserver-run",
+  "expected_backfill": {
+    "proof_attempt_reclassifications": [],
+    "refutation_quarantines": [
+      "CEX-KSRVCEX1"
+    ]
+  },
+  "nodes": [
+    {
+      "matek_id": "PRB-KSRV0001",
+      "node_type": "problem",
+      "problem_id": "PRB-KSRV0001",
+      "title": "Synthetic-derived k-server problem",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Problem\n\nSynthetic-derived fixture; not an archived snapshot."
+    },
+    {
+      "matek_id": "CLM-KSRVTGT1",
+      "node_type": "claim",
+      "problem_id": "PRB-KSRV0001",
+      "title": "k-server main target",
+      "epistemic_status": "conjectured",
+      "claim_type": "theorem",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact statement\n\nFor every finite metric instance, cost_ALG is at most k times OPT plus beta.",
+      "tags": [
+        "matek/main-target"
+      ]
+    },
+    {
+      "matek_id": "TSK-KSRVTSK1",
+      "node_type": "task",
+      "problem_id": "PRB-KSRV0001",
+      "title": "k-server archived assignment",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Task\n\nHostile-test the transfer route."
+    },
+    {
+      "matek_id": "APR-KSRVAPR1",
+      "node_type": "approach",
+      "problem_id": "PRB-KSRV0001",
+      "title": "Memoryless-transfer route",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact route attempted\n\nTransfer a memoryless inequality from a normalized state space."
+    },
+    {
+      "matek_id": "RUN-KSRVRUN1",
+      "node_type": "run",
+      "problem_id": "PRB-KSRV0001",
+      "title": "k-server fixture run",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Run\n\nSynthetic-derived compatibility fixture."
+    },
+    {
+      "matek_id": "CLM-KSRVPRE1",
+      "node_type": "claim",
+      "problem_id": "PRB-KSRV0001",
+      "title": "k-server archived premise",
+      "claim_type": "lemma",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Exact statement\n\nNormalized finite states admit cycle deletion."
+    },
+    {
+      "matek_id": "CEX-KSRVCEX1",
+      "node_type": "counterexample",
+      "problem_id": "PRB-KSRV0001",
+      "title": "Legacy mechanism-only counterexample",
+      "epistemic_status": "candidate",
+      "workflow_status": "complete",
+      "created_in_run": "fixture-kserver-run",
+      "last_modified_run": "fixture-kserver-run",
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-03T00:00:00Z",
+      "body": "## Scope\n\nThe three-point instance refutes only the proposed memoryless transfer mechanism; it does not refute the main theorem.",
+      "relations": [
+        {
+          "source_id": "CEX-KSRVCEX1",
+          "relation": "refutes",
+          "target_id": "CLM-KSRVTGT1"
+        },
+        {
+          "source_id": "CEX-KSRVCEX1",
+          "relation": "related_to",
+          "target_id": "APR-KSRVAPR1"
+        }
+      ]
+    }
+  ]
+}

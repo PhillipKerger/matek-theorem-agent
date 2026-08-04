@@ -1,0 +1,28 @@
+{
+  "assignment_id": "atsp-archived-route-17",
+  "status": "progress",
+  "formal_results": [
+    "For every laminar cycle-cover instance satisfying H, the cycle-deletion reduction preserves feasibility."
+  ],
+  "proof_content": "Delete one representative edge from each selected cycle and charge the repair path to the laminar parent. The charging step is valid under H.",
+  "exact_gap": "Remove the laminarity hypothesis H without losing the repair-path bound.",
+  "sources": [],
+  "assumptions": [
+    "H: the selected cycle family is laminar"
+  ],
+  "counterexamples": [],
+  "dependencies": [
+    "CLM-ATSPPRE1",
+    "Prove that uncrossing preserves the representative-edge ledger."
+  ],
+  "mechanism": "cycle-cover deletion and repair",
+  "graph_patch": {
+    "graph_task_id": "atsp-archived-route-17",
+    "proposals": [
+      {
+        "kind": "claim",
+        "status": "candidate"
+      }
+    ]
+  }
+}

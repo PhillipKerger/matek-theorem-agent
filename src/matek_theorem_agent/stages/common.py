@@ -3,12 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from ..redaction import redact_text
+
+_PROVIDER_SESSION_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 
 
 class StageError(RuntimeError):
@@ -38,6 +44,18 @@ class CallManifest(BaseModel):
     model_calls: int = 0
     codex_calls: int = 0
     response_ids: list[str] = Field(default_factory=list)
+
+
+def provider_session_id_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    """Return one bounded nonsecret provider session ID, or reject unsafe metadata."""
+
+    value = metadata.get("session_id")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if not _PROVIDER_SESSION_ID.fullmatch(normalized) or redact_text(normalized) != normalized:
+        raise StageValidationError("Provider session identity is unsafe to persist.")
+    return normalized
 
 
 def sha256_bytes(content: bytes) -> str:

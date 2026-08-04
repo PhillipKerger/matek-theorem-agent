@@ -1,9 +1,8 @@
 # MATEK: An Orchestrator for Agentic Mathematical Research using Human-Explorable Knowledge Graph Memory with Lean Verification
 
 MATEK (Multi-Agent Theorem Exploration through Knowledge-Graph Memory) is a local,
-auditable workflow for mathematical research and formal verification. Starting from a concise
-problem description, it coordinates independent research and adversarial review, writes and
-validates a LaTeX manuscript, and attempts Lean verification of the accepted main result.
+multi-agent orchestration system for mathematical research and Lean formalization. Starting from a concise
+problem description, it coordinates independent research and adversarial review, and stores results in a human-explorable persistent knowledge graph. Agents can thereby build persistent knowledge about a problem over many sessions until a result is finally achieved, and even no result is achieved the user can explore the lemmas, partial results, approaches and so on that MATEK worked through. 
 
 MATEK records progress in a **knowledge graph**. Partial results, insights, approaches, and dead
 ends are retained and linked when relevant. A useful proved lemma, for example, receives its own
@@ -21,6 +20,7 @@ knowledge graphs that can serve as starting points for future work.
 | Model access | Official Codex CLI with ChatGPT sign-in; no OpenAI API key required |
 | Run outputs | `.matek/runs/<run-id>/` inside your project |
 | Persistent memory | One typed Markdown graph per problem in `.matek/knowledge/<graph-name>/`, shared across runs |
+| Proof memory | Exact canonical claim/derivation/obligation ledger with a computed smallest known open cut |
 | Research breadth | A continuous logical coordinator starts eight diverse first-level workers and refills adaptively; there is no cumulative worker-count cap |
 | Parallelism | Hierarchical by default: eight first-level Codex workers, each with up to eight nested agents (64 nested slots) |
 | Research roles | GPT 5.6 Sol with max coordinator effort and independent xhigh workers; the API adapter also requests pro mode |
@@ -159,6 +159,19 @@ maximum_coordinator_decisions = 100000 # high event-indexed safety ceiling
 maximum_coordinator_context_characters = 800000 # final serialized provider input ceiling
 maximum_unrequested_full_graph_node_characters = 120000 # optional full graph evidence cap
 maximum_coordinator_requested_artifacts = 32 # bounded on-demand evidence retrieval
+
+[research.scientific_phase]
+no_audited_progress_assignments = 8
+unchanged_cut_snapshots = 4
+repeated_gap_threshold = 3
+similarity_threshold = 0.86
+blocked_or_refuted_ratio = 0.60
+bottleneck_maximum_size = 3
+bottleneck_attempts_before_audit = 5
+explore_concurrency = 8
+consolidate_concurrency = 4
+bottleneck_concurrency = 3
+adversarial_concurrency = 2
 ```
 
 Reasoning effort accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`, subject
@@ -266,15 +279,21 @@ The prompt flow is:
    condition, plus a bounded graph slice containing its stable task/target IDs and relevant prior
    dependencies, proofs, counterexamples, sources, and audits. The assignment narrows the route
    but cannot change the target. Workers do not see or coordinate with concurrent workers and
-   return structured graph patches instead of editing the vault. Graph assignments must name
-   explicit live targets; invalid IDs fail instead of falling back to the main claim.
+   return schema-v2 scientific results, obligations, sources, computation declarations, and a
+   branch outcome—not `GraphPatch` or persistence identities. Same-report premises use acyclic
+   `dependency_result_keys`; MATEK resolves those local keys to stable graph nodes. Graph
+   assignments must name explicit live targets; invalid IDs fail instead of falling back to the
+   main claim.
 4. When any worker finishes, MATEK saves its complete raw report and associated
    `research/source-verification/<assignment-id>.json` first, checkpoints the transition with its
    pending-event write-ahead record, creates a sequenced immutable event such as
    `research/events/00000001.json`, clears the pending record, and refreshes the derived
    `research/coordinator/mailbox.json`. It does not wait for all other workers.
-   If the optional graph proposal is malformed or stale, that mutation is recorded as a warning;
-   the already validated scientific report remains available to the coordinator.
+   MATEK validates this report, then injects run/assignment/task/approach identity and constructs
+   claims, proof attempts, derivations, obligations, and relation directions deterministically.
+   The historically named `research/graph-patches/` record states that the mutation was
+   application-authored; it is not a worker proposal. Graph-admission failure is recorded without
+   discarding the already durable scientific report.
 5. The coordinator consumes newly useful events together with the unchanged big prompt and claim
    contract, assignment lifecycle state, approach registry, and audit obligations. A deterministic
    builder measures the final provider input and, when needed, substitutes structured summaries
@@ -290,7 +309,22 @@ Approach families are broad labels, while each assignment is a durable branch or
 MATEK keeps separate registry entries and graph nodes for same-family assignments, so a later
 productive report cannot overwrite an earlier blocked or ruled-out route. Branch-local
 counterexamples stay linked to that branch. Promoting one to a refutation of a claim requires an
-explicit typed proposal and independent review.
+explicit typed main-scope result that matches the frozen theorem exactly. MATEK freezes the
+complete worker certificate, sends it to distinct verifier and hostile-falsifier roles under
+packaged audit prompts, persists and hash-binds both requests and responses, and recomputes the
+gate on resume. Only a clean two-role gate can produce `RESEARCH_REJECTED` or a main-target
+`REFUTES` edge; missing, changed, branch-local, or model-only evidence remains nonterminal.
+
+The durable scientific scheduler moves through `explore`, `consolidate`, `bottleneck`,
+`adversarial_audit`, and `synthesize`. Audited progress, repeated gaps, assignment similarity,
+blocked/refuted density, and the smallest known open cut drive transitions—not elapsed rounds.
+Exact duplicate tasks merge and near-duplicate mechanisms redirect. A bottleneck portfolio selects
+one durable exact cut obligation, then rotates prover, hostile-falsifier, small-case-computation,
+transfer-auditor, and synthesizer roles against it across activations; adversarial audit retains
+that focus for hostile-falsifier and transfer-auditor work. A phase change retires assignments still
+queued under the previous contract. Synthesis is serialized and cites only audited premises.
+`research/coordinator/scientific-phase.json` preserves those decisions across resume;
+`[research.scientific_phase]` controls thresholds and per-phase concurrency.
 
 The coordinator is “continuous” as a logical actor, not one never-ending Codex/API request. Each
 activation may use a fresh provider context. `research/coordinator/state.json` is the canonical
@@ -391,7 +425,7 @@ recognizable while separate problems and repeated attempts cannot overwrite one 
 .matek/runs/<run-id>/
 ├── input/          # preserved problem and resolved invocation/configuration
 ├── prompts/        # compiled research prompt or clarification request
-├── research/       # coordinator state/events, full worker reports, candidates, and audits
+├── research/       # phase state, typed reports, lemma audits, computations, candidates, audits
 ├── research-history/ # prior research trees archived by a forced generation/provider migration
 ├── manuscript/     # paper.tex, references.bib, paper.pdf, and build log
 ├── lean/           # challenge.lean, Main.lean, iterations, and diagnostics
@@ -411,9 +445,37 @@ write boundary:
         ├── graph-schema.json
         ├── graph-index.sqlite
         ├── graph-state.json
-        ├── snapshots/
+        ├── target-registry.json # source-hash-frozen exact target and contract
+        ├── ledgers/              # canonical claims, derivations, and obligations
+        ├── snapshots/          # v2 manifests/checkpoints/content-addressed blobs; v1 readable
         └── locks/graph.lock
 ```
+
+The main scientific evidence paths are:
+
+- `prompts/{compiled_problem.json,compiled_research_prompt.md,target_alignment.json}`;
+- `research/workers/<id>.raw.json`, `research/workers/<id>.json`,
+  `research/worker-evidence/<id>.json`, and the legacy-named but application-authored
+  `research/graph-patches/<id>.json` admission record;
+- `research/coordinator/scientific-phase.json` and
+  `research/lemma-audits/selections/<assignment>-<digest>.json`, plus
+  `research/lemma-audits/<nomination>/nomination.json`, `input.json`,
+  `responses/lemma-verifier.json`, `responses/lemma-falsifier.json`, immutable
+  `gate-checkpoints/<gate-sha>.json`, and `gate.json`; upgraded
+  audits additionally retain a byte-preserving `legacy-v1/` tree and integrity manifest;
+- `research/counterexample-audits/<audit>/nomination.json`, `policy.json`,
+  `requests/{counterexample-verifier,counterexample-falsifier}.json`, matching role responses,
+  and the deterministically replayed `gate.json`;
+- `research/workspaces/<assignment>/scratch/`, immutable
+  `research/computations/{manifests/,blobs/sha256/}`, mutable `replay-workspaces/`, immutable
+  `replays/<assignment>/<manifest-sha>/{attempts/<eight-digit-attempt>.json,verdict.json}`, and
+  `research/worker-computation/<assignment>.json`; and
+- graph `target-registry.json`, `ledgers/<problem>/canonical-ledger.json`, conditional
+  `ledgers/<problem>/migration-report.json` for ambiguous projection,
+  `ledgers/migrations/<plan-sha>.application.json` for an applied reviewed backfill, and
+  snapshot-v2 `snapshots/{manifests/,checkpoints/,blobs/{nodes,edges}/}`.
+
+See [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) for the complete tree and integrity rules.
 
 Use `matek status` for the latest run or `matek status <run-id>` for a specific run. By
 default, MATEK writes only beneath `.matek/`; editing project source requires the explicit
@@ -428,10 +490,10 @@ filename gets a separate graph. To intentionally place related or follow-up work
 graph, pass `--knowledge-graph NAME`; an unknown name is rejected rather than silently creating
 one. The selected graph is frozen in run metadata, so resume cannot drift to another graph.
 
-Claims, proofs, audits,
-counterexamples, formalizations, sources, tasks, and artifacts remain separate typed notes with
-immutable IDs. The Markdown notes and flat YAML frontmatter are authoritative; SQLite is only a
-rebuildable index, and MATEK works normally when Obsidian is not installed.
+Claims, proof attempts, derivations, obligations, proofs, audits, counterexamples, formalizations,
+sources, tasks, and artifacts remain separate typed notes with immutable IDs. The Markdown notes
+and flat YAML frontmatter are authoritative; SQLite is only a rebuildable index, and MATEK works
+normally when Obsidian is not installed.
 
 Every coordinator activation reviews the current frontier revision, including after
 `matek resume`, and records that revision in its decision rationale. Tasks point to explicit graph nodes
@@ -439,11 +501,101 @@ that define their branch scope. Blocked and ruled-out approaches retain their ex
 counterexamples, and reopen condition, while partial results from different branches remain
 available for later synthesis.
 
+The normalized source file hash freezes the theorem before research. The prompt compiler first
+writes `prompts/target_alignment.json`, which checks quantifiers, constants, additive terms,
+domains, edge cases, polarity, and conclusion against the claim contract. The graph then stores
+the aligned statement, canonical contract, and compiled prompt in `target-registry.json`. A later
+run with the same source bytes reuses them byte-for-byte while refreshing literature separately.
+An aligned same-contract rewording is recorded as a cosmetic paraphrase without replacing those
+bytes. Contract drift fails closed; use
+`matek run problem.md --migrate-target "reason"` only for an intentional versioned migration.
+MATEK asks for confirmation unless `--yes` is supplied and marks affected proof evidence stale.
+The reason and authorization persist through resume and feed the durable target-migration event;
+resume never silently invents or broadens that authorization. Alignment is a conservative contract
+check, not a proof of the theorem.
+
+The Markdown vault is the complete research archive, not a bag of trusted theorems. Its rebuildable
+`ledgers/<problem-id>/canonical-ledger.json` projection contains exact canonical claims, joint
+AND-premise derivations, OR alternative derivations, and explicit obligations with logical
+versions. An obligation version covers its exact statement, conclusion, quantifiers, hypotheses,
+dependency and target claim IDs, scope, notation-definition version, and falsification evidence.
+Gapped and partial reports stay proof attempts plus completion obligations. Claims and derivations
+with nonempty, missing, or malformed application-owned assumption contracts are quarantined from
+trusted support while their archive evidence remains intact. Assumption-bearing and partial results
+cannot become same-report premises or support a candidate, blind lemma audit, or exact-
+counterexample audit. Only audited or Lean-verified claims seed the trusted closure; an audit-passed
+derivation propagates trust only when every joint premise is trusted and every attached obligation
+is resolved. `matek graph frontier` computes the smallest known open cut from that ledger and says
+when bounded antichain search was capped. Archive
+membership, canonical identity, ledger inclusion, and snapshot integrity establish provenance—not
+mathematical truth; only an independent audit or Lean verification changes trust status.
+
+Manuscript and Lean formalization receive contexts from one shared, bounded trusted-context
+selector. It prioritizes the accepted main proof and its support, includes only canonical trusted
+mathematics and authenticated definitions/proof routes, and adds independently verified sources or
+deterministically verified formalizations only where that stage needs them. Informal/open claims,
+unverified sources, unresolved or unauthenticated derivations, experiments, and archive-only
+evidence are excluded. Each context states the policy and node cap, eligible/included/omitted
+counts, whether truncation occurred, ledger ambiguity count, and priority order.
+
+Reusable claim identity is the normalized exact statement plus scope. Exact matches share one
+claim while retaining distinct proof attempts. Semantic near-duplicates remain review proposals
+and require an audit or explicit equivalence derivation before they can share support.
+
+Verified scholarly sources are canonicalized by DOI first, then base arXiv ID, MR, ISBN, or stable
+URL. ArXiv revisions and report-local aliases are retained on one source note; same-title works
+with different identifiers remain separate. Unverified title/author fingerprints remain open, and
+fuzzy title similarity alone never merges sources. A worker result gets a `CITES` edge only when it
+explicitly references that source; separately verified compiler literature remains linked to the
+frozen target.
+
+After deterministic admission, the highest-leverage eligible non-main lemma on the current exact
+open cut may enter a live blind audit. A fresh verifier checks statement alignment and every proof
+step while an independent falsifier searches boundary and adversarial cases. They see frozen source
+artifacts and dependency versions/hashes, but not worker confidence or a desired verdict. Evidence
+lives under `research/lemma-audits/<nomination-id>/`. Schema v2 binds distinct application execution
+contexts for verifier and falsifier through the input, responses, and gate. If the provider exposes
+a safe session ID, MATEK records its sanitized bounded value and rejects reuse across the two
+roles; absence of a provider session ID does not weaken the distinct application contexts. Resume
+reuses the frozen packet and calls only a missing role. Legacy schema-v1 evidence, including a
+passing gate, grants no graph trust: MATEK archives the extant files byte-for-byte under
+`legacy-v1/`, binds them in `legacy-v1/manifest.json`, and reruns both roles as v2. A v2 pass adds a
+reusable `audit_passed` intermediate to the graph but is hard-coded not to accept the main target or
+authorize a manuscript.
+
+Before a missing role is retried, the current gate is preserved under its SHA-256 name. If MATEK
+stops after a new role response and gate are durable but before scheduler state is updated, resume
+adopts only an authenticated monotone extension of that checkpoint, repairs the saved response
+accounting, and retries only any role still absent. The exact-counterexample lane uses the same
+checkpoint protocol.
+
+An eligible exact-main counterexample enters its own verifier/hostile-falsifier transaction. A
+retryable `BLOCKED` gate reuses the frozen nomination across unrelated graph revisions and calls
+only its missing role while the bound canonical support is unchanged. A genuine support-contract
+change durably supersedes the old audit with a recorded reason, preserves its artifacts, creates a
+new audit ID and nomination, and reruns the required roles. Old responses are never relabeled as
+evidence for the changed support closure.
+
+Computation-capable workers write only in private
+`research/workspaces/<assignment-id>/scratch/` directories. MATEK collects declared regular files
+into `research/computations/blobs/sha256/`, rejects traversal, links, special/undeclared files and
+quota excess. Trusted replay currently requires `--sandbox docker`, which uses a fresh filesystem-
+confined, network-disabled workspace; native mode records an unsafe-backend verdict and does not
+replay. The API adapter has no worker filesystem authority. An unreplayed or mismatching
+computation remains an experiment outside the canonical ledger. A passing replay creates only a
+proposed derivation: it does not establish domain completeness or mathematical truth and still
+requires independent audit. Candidate use additionally requires the computation to lie in the
+declared transitive dependency closure of a separate exact-main lemma or reduction. The candidate
+gate binds that computation's canonical claim/derivation and manifest/replay artifact nodes, so an
+unrelated successful replay cannot support acceptance.
+
 Managed notes use their human-readable title as the filename, with the immutable MATEK ID kept in
 the parent directory. Obsidian therefore shows titles rather than IDs in Graph view without making
-titles the identity key. When the main result passes its acceptance gate, its explicit proof-support
-closure is tagged `MAIN_RESULT_NEEDS` and shown in the Main Result Needs dashboard and Main Proof
-Architecture canvas.
+titles the identity key. Before acceptance, the Main Result Needs dashboard shows the immutable
+target and current smallest known open cut. Consult `matek graph frontier` for
+`open_cut_search_capped`; a capped result must not be described as globally minimal. After
+acceptance, the dashboard switches to the audited proof-support closure, which is also shown in the
+Main Proof Architecture canvas.
 
 Open `.matek/knowledge/<graph-name>/` as an Obsidian vault to use `Home.md`, backlinks, typed properties,
 dashboard notes, and the four curated canvases. Human prose outside `MATEK:GENERATED` markers and
@@ -464,6 +616,13 @@ matek graph dependencies CLM-... -g problem
 matek graph downstream CLM-... -g problem
 matek graph tombstone CLM-... --reason "Superseded by the corrected statement" -g problem
 matek graph diff REVISION_A REVISION_B -g problem
+matek graph verify-snapshots -g problem
+matek graph reconstruct REVISION --output snapshot.json -g problem
+matek graph migrate-legacy -g problem --dry-run \
+  --output .matek/migration-reports/problem.json
+# Inspect and externally review the plan, then explicitly apply those exact bytes:
+matek graph migrate-legacy -g problem \
+  --apply-plan .matek/migration-reports/problem.json
 matek graph export --format mermaid -g problem
 matek graph rebuild-index -g problem
 matek graph open -g problem
@@ -473,14 +632,29 @@ The graph commands omit `-g` safely when exactly one graph exists. If several ex
 required. `matek graph init NAME` can create an empty named graph for later explicit reuse;
 ordinary `matek init` leaves graph creation to the first problem run.
 
+Graph revision storage is content-addressed: unchanged node and edge records are shared across
+small delta manifests, with full checkpoints every 64 revisions by default for bounded replay.
+`verify-snapshots` checks the integrity chain and every live blob offline. Older schema-v1 full
+snapshots remain read-only, and `reconstruct` returns their original bytes exactly.
+
+Without `--apply-plan`, `migrate-legacy` is a read-only planner and refuses report output inside
+`.matek/knowledge/`. Review its integrity-protected external report before applying it. The apply
+form verifies the digest, graph name, frozen source revision, archive digest, exact claim versions,
+and relations, then asks for confirmation (`--yes` skips the prompt). A valid plan commits once and
+idempotently: legacy nodes and prior snapshots remain archive evidence while MATEK creates typed
+proof attempts, proposed derivations, reviewed aliases, branch-local refutation quarantines, and
+queued verifier/falsifier audit tasks. It neither guesses ambiguous mappings nor makes model calls.
+The application record is
+`.matek/knowledge/<graph>/ledgers/migrations/<plan-sha>.application.json`.
+
 ## How the workflow works
 
 1. **Problem compilation:** identifies the exact target, success criterion, definitions, and
    relevant existing literature.
-2. **Research:** starts a diverse parallel portfolio, then adapts the live pool on completion and
-   audit events without waiting for fixed rounds.
-3. **Adversarial review:** checks proof steps, novelty claims, assumptions, and source metadata
-   before accepting a candidate.
+2. **Research:** starts a diverse parallel portfolio, admits typed mathematics into the proof
+   ledger, then moves through consolidation and open-cut bottleneck phases without fixed rounds.
+3. **Adversarial review:** independently audits useful intermediate lemmas and checks full-candidate
+   proof steps, novelty claims, assumptions, counterexamples, and source metadata.
 4. **Manuscript:** writes the paper only after research acceptance, checkpoints and repairs each
    draft, audits the bibliography independently, adds the required AI-usage disclosure, and
    compiles every safe draft. Publication readiness is reported separately.
@@ -608,12 +782,13 @@ run and returns an actionable error; it cannot unexpectedly create Platform API 
 | `matek resume [RUN_ID_OR_PROBLEM] [options]` | Continue a run by ID, or the newest run for a problem file |
 | `matek report [RUN_ID] [--rewrite]` | Regenerate the deterministic report, optionally rewriting prose |
 | `matek verify [RUN_ID]` | Re-run integrity, bibliography, LaTeX, and Lean checks without a model |
-| `matek graph COMMAND` | Validate, query, diff, export, rebuild, or open persistent graph memory |
+| `matek graph COMMAND` | Validate, query, diff, plan/apply reviewed migration, export, rebuild, or open graph memory |
 
 Important `run` options include `--backend codex|api`, `--max-agents`,
 `--hierarchical`, `--subagents-per-agent`, `--max-coordinator-decisions`,
 `--time-limit-minutes`, `--no-web-search`, `--no-lean`,
-`--research-only`, `--knowledge-graph NAME`, `--dry-run`, `--sandbox native|docker`, and
+`--research-only`, `--knowledge-graph NAME`, `--migrate-target REASON`, `--dry-run`,
+`--sandbox native|docker`, and
 `--allow-project-edits`.
 Deprecated `--max-rounds` is accepted only to migrate existing scripts to a decision budget; it
 does not select round-based execution.
@@ -624,8 +799,12 @@ advanced API backend and requires `OPENAI_API_KEY`; it is not needed for Codex m
 
 `resume` uses the backend recorded for the run and refuses an accidental provider change. An
 explicitly requested provider change is recorded as a provenance event. Successfully returned
-calls are checkpointed atomically. `--force-stage STAGE` starts a new call-cache generation
-while retaining prior records as audit history; resuming a completed run is a no-op.
+calls are checkpointed atomically. Most `--force-stage STAGE` requests start a new call-cache
+generation while retaining prior records as audit history. The narrower
+`--force-stage prompt_compilation` path reuses successful compiler/source work and, when the exact
+compiled target is unchanged, replays the archived pre-gate research and candidate-support context
+without duplicate model calls; only bounded prompt validation receives a new generation. Resuming
+a completed run without `--force-stage` is a no-op.
 
 Web search remains enabled by default. `matek run --no-web-search` disables search for every
 model stage and disables MATEK's separate DOI/arXiv/ISBN/URL resolver; the choice is frozen in
@@ -744,8 +923,9 @@ logging behavior.
 
 ### Optional Docker command sandbox
 
-The optional Docker execution backend applies to configured Lean and LaTeX commands, not to the
-host Codex CLI. It uses the image named by `lean.docker_image` (default
+The optional Docker execution backend applies to configured Lean and LaTeX commands and to
+computation-certificate replay, not to the host Codex CLI. It uses the image named by
+`lean.docker_image` (default
 `matek-theorem-agent:latest`) with networking disabled, a read-only container filesystem, and
 `--pull=never`. Build or load the image before selecting `--sandbox docker`; `doctor` verifies
 that it is already present.
@@ -753,7 +933,8 @@ that it is already present.
 Each command mounts its resolved working directory at `/workspace`. A concrete stage directory
 under `.matek/runs/<run-id>/` is writable; the project root and other directories are read-only.
 The image must already contain the configured LaTeX compiler, Lean/Lake toolchain, and packages.
-`matek verify` currently re-runs frozen deterministic checks natively.
+It must also contain any tools named by a computation replay manifest. `matek verify` currently
+re-runs frozen deterministic checks natively.
 
 ### Troubleshooting
 

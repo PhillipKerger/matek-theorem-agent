@@ -88,6 +88,20 @@ require_domain_audit = true
 require_hostile_audit = true
 require_source_theorem_audit = true
 
+[research.scientific_phase]
+# Phase changes are driven by accepted graph facts and the minimal open cut.
+no_audited_progress_assignments = 8
+unchanged_cut_snapshots = 4
+repeated_gap_threshold = 3
+similarity_threshold = 0.86
+blocked_or_refuted_ratio = 0.60
+bottleneck_maximum_size = 3
+bottleneck_attempts_before_audit = 5
+explore_concurrency = 8
+consolidate_concurrency = 4
+bottleneck_concurrency = 3
+adversarial_concurrency = 2
+
 [graph]
 # Context slices are bounded; workers never receive or mutate the whole vault.
 maximum_context_nodes = 40

@@ -40,6 +40,14 @@ from matek_theorem_agent.knowledge_graph import GraphNotInitializedError, Knowle
 from matek_theorem_agent.models import ScientificStatus, StageName, StageStatus
 from matek_theorem_agent.openai_client import ModelRequest, ModelResult
 from matek_theorem_agent.progress import Ascension
+from matek_theorem_agent.scientific import (
+    BranchOutcome,
+    ScientificObligationDeclaration,
+    ScientificResult,
+    ScientificResultDisposition,
+    ScientificResultKind,
+    ScientificScope,
+)
 from matek_theorem_agent.source_provenance import (
     SourceVerificationRecord,
     SourceVerificationReport,
@@ -51,6 +59,11 @@ from matek_theorem_agent.stages.compile_prompt import (
     CompiledProblem,
     PromptCompilationStatus,
     PromptPlaceholderRepair,
+)
+from matek_theorem_agent.stages.counterexample_audit import (
+    CounterexampleAuditDecision,
+    CounterexampleAuditResponse,
+    CounterexampleAuditRole,
 )
 from matek_theorem_agent.stages.lean import (
     MANDATORY_ALIGNMENT_FIELDS,
@@ -81,6 +94,7 @@ from matek_theorem_agent.stages.research import (
     ResearchCoordinatorDecision,
     ResearchWorkerReport,
     WorkerStatus,
+    adapt_research_worker_report_v1,
 )
 from matek_theorem_agent.state import StateStore
 
@@ -88,6 +102,10 @@ E2E_CLAIM_CONTRACT = {
     "quantifiers": "for every natural number n",
     "conclusion": "P(n)",
 }
+
+
+def research_worker_report_v1(**values: Any) -> ResearchWorkerReport:
+    return adapt_research_worker_report_v1(values)
 
 
 def graph_decision_contract(payload: dict[str, Any], rationale: str) -> tuple[str, str]:
@@ -168,7 +186,7 @@ def covered_compiled_prompt() -> str:
 
 def fixture_candidate_package() -> CandidateProofPackage:
     return CandidateProofPackage(
-        exact_theorem="For every natural number n, P(n).",
+        exact_theorem="Prove P(n) for every natural number n.",
         definitions=["P is the fixture predicate."],
         lemma_dependency_graph={"main": ["fixture_lemma"]},
         full_proof="First prove the fixture lemma, then apply it to arbitrary n.",
@@ -265,10 +283,10 @@ class ResearchWorkflowModel:
             )
         elif output_type is ResearchWorkerReport:
             assignment = json.loads(request.input_text)["assignment"]
-            output = ResearchWorkerReport(
+            output = research_worker_report_v1(
                 assignment_id=assignment["id"],
                 status=WorkerStatus.CANDIDATE_COMPLETE,
-                formal_results=[f"Lemma produced by {assignment['approach_family']} route."],
+                formal_results=["Prove P(n) for every natural number n."],
                 proof_content="A visible, checkable proof argument.",
                 exact_gap=None,
                 sources=[],
@@ -309,6 +327,142 @@ class ResearchWorkflowModel:
         return ModelResult(
             parsed=output,
             response_id=f"offline-response-{call_number}",
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            estimated_cost_usd=0.01,
+        )
+
+
+EXACT_FALSE_E2E_TARGET = "For every integer n, n + 1 = n."
+
+
+class ExactRefutationWorkflowModel:
+    """Drive the full application through a real audited scientific rejection."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[ModelRequest, type[BaseModel]]] = []
+
+    async def generate_structured(
+        self,
+        request: ModelRequest,
+        output_type: type[Any],
+    ) -> ModelResult[Any]:
+        self.requests.append((request, output_type))
+        if output_type is CompiledProblem:
+            output: BaseModel = CompiledProblem(
+                title="False integer identity",
+                normalized_statement=EXACT_FALSE_E2E_TARGET,
+                claim_contract={
+                    "quantifiers": "for every integer n",
+                    "domain": "integers",
+                    "conclusion": "n + 1 = n",
+                },
+                compiled_prompt=covered_compiled_prompt(),
+                source_ledger=[],
+                unresolved_ambiguities=[],
+            )
+        elif output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            target_id, rationale = graph_decision_contract(
+                payload,
+                "Audit a concrete exact-target obstruction alongside three proof routes.",
+            )
+            output = ResearchCoordinatorDecision(
+                decision_id=payload["decision_id"],
+                after_event_sequence=payload["after_event_sequence"],
+                assignments=[
+                    ResearchAssignment(
+                        id=f"refutation-route-{index}",
+                        approach_family=family,
+                        task=f"Investigate the {family} route.",
+                        expected_output="A typed proof result or complete exact obstruction.",
+                        target_node_ids=[target_id],
+                    )
+                    for index, family in enumerate(
+                        ("counterexample", "direct", "structural", "literature"),
+                        start=1,
+                    )
+                ],
+                rationale=rationale,
+            )
+        elif output_type is ResearchWorkerReport:
+            payload = json.loads(request.input_text)
+            assignment_id = payload["assignment"]["id"]
+            if assignment_id == "refutation-route-1":
+                output = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    results=[
+                        ScientificResult(
+                            local_key="exact-main-counterexample",
+                            kind=ScientificResultKind.COUNTEREXAMPLE,
+                            exact_statement=EXACT_FALSE_E2E_TARGET,
+                            scope=ScientificScope.MAIN,
+                            proof_or_certificate=(
+                                "Take n = 0. It is an integer; 0 + 1 = 1, and 1 is not equal "
+                                "to 0, so the exact universal conclusion fails."
+                            ),
+                            target_node_ids=payload["branch_work_contract"]["target_node_ids"],
+                            disposition=ScientificResultDisposition.REFUTED_MECHANISM,
+                        )
+                    ],
+                    branch_outcome=BranchOutcome.REFUTED,
+                    mechanism="The explicit integer witness n = 0.",
+                )
+            else:
+                output = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    results=[
+                        ScientificResult(
+                            local_key=f"partial-{assignment_id}",
+                            kind=ScientificResultKind.LEMMA,
+                            exact_statement=f"A nonterminal branch lemma from {assignment_id}.",
+                            scope=ScientificScope.BRANCH,
+                            proof_or_certificate="A correct but incomplete branch reduction.",
+                            exact_gap="Connect the branch lemma to the frozen theorem.",
+                            disposition=ScientificResultDisposition.PARTIAL,
+                        )
+                    ],
+                    unresolved_obligations=[
+                        ScientificObligationDeclaration(
+                            local_key=f"gap-{assignment_id}",
+                            exact_statement="Connect this route to the frozen theorem.",
+                            conclusion="The frozen theorem follows from this route.",
+                        )
+                    ],
+                    branch_outcome=BranchOutcome.BLOCKED,
+                    mechanism="A deliberately nonterminal control route.",
+                )
+        elif output_type is CounterexampleAuditResponse:
+            payload = json.loads(request.input_text)
+            role = CounterexampleAuditRole(payload["audit_role"])
+            packet = payload["exact_counterexample_packet"]
+            output = CounterexampleAuditResponse(
+                audit_role=role,
+                audit_id=packet["audit_id"],
+                target_statement_sha256=packet["target_statement_sha256"],
+                decision=CounterexampleAuditDecision.PASS,
+                statement_aligned=True,
+                every_hypothesis_satisfied=True,
+                claimed_failure_demonstrated=True,
+                certificate_valid=True,
+                witness_or_instance="n = 0",
+                hypothesis_check="0 is an integer and belongs to the quantified domain.",
+                conclusion_evaluation="0 + 1 = 1, while 1 is not equal to 0.",
+                checks_performed=["Recomputed the exact witness and failed conclusion."],
+                hostile_or_boundary_tests=(
+                    ["Attacked domain membership, quantifier order, and boundary arithmetic."]
+                    if role is CounterexampleAuditRole.FALSIFIER
+                    else []
+                ),
+                rationale="The exact-target counterexample is complete and independently valid.",
+            )
+        else:  # pragma: no cover - downstream paid stages are forbidden by this fixture
+            raise AssertionError(f"unexpected model request: {output_type.__name__}")
+        assert isinstance(output, output_type)
+        return ModelResult(
+            parsed=output,
+            response_id=f"exact-refutation-e2e-{len(self.requests)}",
             input_tokens=10,
             output_tokens=5,
             total_tokens=15,
@@ -605,14 +759,18 @@ class FullWorkflowModel(ResearchWorkflowModel):
         elif output_type is ResearchWorkerReport:
             assignment = json.loads(request.input_text)["assignment"]
             self.requests.append((request, output_type))
-            parsed = ResearchWorkerReport(
+            parsed = research_worker_report_v1(
                 assignment_id=assignment["id"],
                 status=(
                     WorkerStatus.CANDIDATE_COMPLETE
                     if assignment["approach_family"] == "synthesis"
                     else WorkerStatus.PROGRESS
                 ),
-                formal_results=[f"Lemma produced by {assignment['approach_family']} route."],
+                formal_results=[
+                    "Prove P(n) for every natural number n."
+                    if assignment["approach_family"] == "synthesis"
+                    else f"Lemma produced by {assignment['approach_family']} route."
+                ],
                 proof_content="A visible, checkable proof argument.",
                 exact_gap=(
                     None
@@ -1044,7 +1202,7 @@ async def test_prompt_placeholder_is_automatically_repaired_before_research(
     result = await runner.run_new(make_problem(project), project)
 
     assert result.state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.SUCCEEDED
-    assert result.state.scientific_status is ScientificStatus.RESEARCH_REJECTED
+    assert result.state.scientific_status is ScientificStatus.RESEARCH_PARTIAL
     assert model.compiler_calls == 1
     assert model.repair_calls == 1
     prompt = (result.state.run_root / "prompts" / "compiled_research_prompt.md").read_text(
@@ -1071,7 +1229,7 @@ async def test_optional_placeholder_downgrade_reaches_truthful_final_report(
 
     result = await runner.run_new(make_problem(project), project)
 
-    assert result.state.scientific_status is ScientificStatus.RESEARCH_REJECTED
+    assert result.state.scientific_status is ScientificStatus.RESEARCH_PARTIAL
     assert result.report.report.prompt_validation_warnings
     report = result.report.report_markdown.read_text(encoding="utf-8")
     assert "Prompt validation warnings" in report
@@ -1502,10 +1660,12 @@ async def test_resume_after_worker_events_reuses_paid_calls_and_persisted_artifa
     [run_root] = (project / ".matek" / "runs").iterdir()
     interrupted = StateStore(run_root).load()
     decision_path = run_root / "research" / "coordinator" / "decisions" / "00000001.json"
-    worker_paths = tuple(sorted((run_root / "research" / "workers").glob("*.json")))
+    all_worker_paths = tuple(sorted((run_root / "research" / "workers").glob("*.json")))
+    raw_worker_paths = tuple(path for path in all_worker_paths if path.name.endswith(".raw.json"))
+    worker_paths = tuple(path for path in all_worker_paths if path not in raw_worker_paths)
     preserved_artifacts = {
         path.relative_to(run_root).as_posix(): path.read_bytes()
-        for path in (decision_path, *worker_paths)
+        for path in (decision_path, *all_worker_paths)
     }
     record_root = run_root / "logs" / "model_calls"
     initial_records = {path.name: path.read_bytes() for path in sorted(record_root.glob("*.json"))}
@@ -1514,6 +1674,7 @@ async def test_resume_after_worker_events_reuses_paid_calls_and_persisted_artifa
     assert interrupted.stages[StageName.RESEARCH].status is StageStatus.INTERRUPTED
     assert interrupted.stages[StageName.REPORT].status is StageStatus.SUCCEEDED
     assert len(worker_paths) == 2
+    assert len(raw_worker_paths) == 2
     assert len(initial_paid_ids) == 4  # compiler, coordinator, and two visible workers
     assert len(initial_records) == 4
     assert sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests) == 1
@@ -1543,7 +1704,9 @@ async def test_resume_after_worker_events_reuses_paid_calls_and_persisted_artifa
 
 
 @pytest.mark.asyncio
-async def test_rejected_full_run_stops_before_manuscript_and_lean(tmp_path: Path) -> None:
+async def test_rejected_candidates_remain_inconclusive_without_verified_disproof(
+    tmp_path: Path,
+) -> None:
     project = tmp_path / "project"
     project.mkdir()
     problem = make_problem(project)
@@ -1553,6 +1716,88 @@ async def test_rejected_full_run_stops_before_manuscript_and_lean(tmp_path: Path
         problem,
         project,
         environment_snapshot={"fixture": "offline"},
+    )
+
+    assert result.state.scientific_status is ScientificStatus.RESEARCH_PARTIAL
+    assert result.report.report.scientific_status == ScientificStatus.RESEARCH_PARTIAL.value
+    assert result.state.stages[StageName.RESEARCH].status is StageStatus.SUCCEEDED
+    assert result.state.stages[StageName.RESEARCH_AUDIT].status is StageStatus.SUCCEEDED
+    for stage in (
+        StageName.MANUSCRIPT,
+        StageName.BIBLIOGRAPHY,
+        StageName.LEAN_FEASIBILITY,
+        StageName.LEAN_ALIGNMENT,
+        StageName.LEAN_FORMALIZATION,
+        StageName.LEAN_VERIFICATION,
+    ):
+        assert result.state.stages[stage].status is StageStatus.SKIPPED
+    # A second complete worker report races with the first candidate audit. It is
+    # independently packaged and checked. The coordinator's model-only refutation
+    # stop is declined, without purchasing a redundant third activation once the
+    # configured decision boundary is reached.
+    assert (
+        sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests)
+        == runner.config.research.maximum_coordinator_decisions
+    )
+    assert sum(output_type is ResearchWorkerReport for _, output_type in model.requests) == 2
+    assert sum(output_type is CandidateProofPackage for _, output_type in model.requests) == 2
+    assert sum(output_type is AuditVerdict for _, output_type in model.requests) == 8
+    assert sum(output_type is FinalJudgeVerdict for _, output_type in model.requests) == 2
+    assert len(model.requests) == 47
+    research_result = json.loads(
+        (result.state.run_root / "research" / "result.json").read_text(encoding="utf-8")
+    )
+    terminal_decision = research_result["coordinator_decisions"][-1]
+    assert terminal_decision["stop_recommended"] is True
+    assert terminal_decision["stop_category"] == "refuted"
+    assert terminal_decision["candidate_packaging_recommended"] is False
+    research_events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (result.state.run_root / "research" / "events").glob("*.json")
+    ]
+    assert any(
+        event["kind"] == "coordinator_unverified_refutation_stop_declined"
+        for event in research_events
+    )
+    assert backend.calls == 0
+    assert codex.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_verified_exact_counterexample_rejects_and_skips_all_downstream_stages(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    problem = project / "false.md"
+    problem.write_text(
+        "# False identity\n\nFor every integer n, prove n + 1 = n.\n",
+        encoding="utf-8",
+    )
+    model = ExactRefutationWorkflowModel()
+    backend = ForbiddenBackend()
+    codex = ForbiddenCodex()
+    runner = WorkflowRunner(
+        AppConfig(
+            project_root=project,
+            research=ResearchSettings(
+                minimum_initial_agents=4,
+                maximum_concurrent_agents=2,
+                maximum_rounds=1,
+            ),
+        ),
+        WorkflowDependencies(
+            model_client=model,
+            execution_backend=backend,
+            codex_client=codex,
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
+        ),
+    )
+
+    result = await runner.run_new(
+        problem,
+        project,
+        environment_snapshot={"fixture": "offline-exact-refutation"},
     )
 
     assert result.state.scientific_status is ScientificStatus.RESEARCH_REJECTED
@@ -1568,19 +1813,20 @@ async def test_rejected_full_run_stops_before_manuscript_and_lean(tmp_path: Path
         StageName.LEAN_VERIFICATION,
     ):
         assert result.state.stages[stage].status is StageStatus.SKIPPED
-    # A second complete worker report races with the first candidate audit. It is
-    # independently packaged and checked before the coordinator's terminal stop is
-    # honored, without purchasing a redundant third coordinator activation.
-    assert len(model.requests) == 12
-    assert sum(output_type is ResearchCoordinatorDecision for _, output_type in model.requests) == 2
-    assert sum(output_type is CandidateProofPackage for _, output_type in model.requests) == 2
     research_result = json.loads(
         (result.state.run_root / "research" / "result.json").read_text(encoding="utf-8")
     )
-    terminal_decision = research_result["coordinator_decisions"][-1]
-    assert terminal_decision["stop_recommended"] is True
-    assert terminal_decision["stop_category"] == "refuted"
-    assert terminal_decision["candidate_packaging_recommended"] is False
+    assert research_result["outcome"] == "rejected"
+    assert research_result["unresolved_obligations"] == []
+    assert research_result["refutation_gate"]["status"] == "refutation_verified"
+    assert research_result["refutation_gate"]["verified_refutation"]["terminal_main_target_refuted"]
+    assert sum(output_type is CounterexampleAuditResponse for _, output_type in model.requests) == 2
+    assert not any(
+        output_type in {ManuscriptDraft, BibliographyAudit, LeanFeasibilityAssessment}
+        for _, output_type in model.requests
+    )
+    assert not (result.state.run_root / "manuscript" / "result.json").exists()
+    assert not (result.state.run_root / "lean" / "result.json").exists()
     assert backend.calls == 0
     assert codex.calls == 0
     assert result.report.report_json.is_file()
@@ -2048,6 +2294,49 @@ def test_cli_dry_run_creates_no_workspace_and_never_constructs_live_runner(
 
     assert result.exit_code == 0, result.output
     assert "Dry run complete" in result.output
+    assert not (tmp_path / ".matek").exists()
+
+    migration = CliRunner().invoke(
+        app,
+        [
+            "run",
+            str(problem),
+            "--migrate-target",
+            "Correct the canonical domain qualifier.",
+            "--dry-run",
+        ],
+    )
+    assert migration.exit_code == 0, migration.output
+    assert "Correct the canonical domain qualifier." in migration.output
+    assert not (tmp_path / ".matek").exists()
+
+
+def test_cli_target_migration_requires_explicit_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    problem = make_problem(tmp_path)
+
+    def forbidden_live_runner(config: AppConfig) -> WorkflowRunner:
+        del config
+        raise AssertionError("declined target migration constructed a live workflow runner")
+
+    monkeypatch.setattr(cli_module, "_live_runner", forbidden_live_runner)
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            str(problem),
+            "--migrate-target",
+            "Change a material theorem clause.",
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 1
+    assert "Authorize a versioned canonical theorem migration" in result.output
     assert not (tmp_path / ".matek").exists()
 
 

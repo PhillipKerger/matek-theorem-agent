@@ -91,6 +91,7 @@ Without a backend flag, a new installation uses Codex. Important options:
 --no-lean
 --research-only
 --knowledge-graph NAME
+--migrate-target REASON
 --sandbox native|docker
 --allow-project-edits
 --dry-run
@@ -133,6 +134,16 @@ to a portable graph name (`My Problem.md` becomes `my-problem`) and the run uses
 related or follow-up work: the named graph must already exist. The choice is recorded in run state
 and resume always uses that frozen graph.
 
+The normalized source-problem SHA-256 keys the graph's canonical target. The first aligned
+statement, claim contract, and compiled prompt are frozen; later runs with unchanged source bytes
+reuse them even when a new compiler call paraphrases the target. With the contract unchanged, that
+incoming wording is recorded as a cosmetic paraphrase and does not replace the frozen bytes; a
+contract change fails closed.
+`--migrate-target REASON` is the only material-migration authorization: it appears in the resolved
+plan, requires interactive confirmation unless `--yes` is present, records a versioned reason,
+and invalidates affected proof evidence. The authorization is persisted with the new run and
+feeds its durable target-migration event; ordinary resume does not ask again.
+
 `--time-limit-minutes N` sets the total active wall-clock allowance across prompt compilation,
 research, manuscript work, and formal verification. Elapsed active time is stored in run state
 and carried into resume; time while MATEK is not running is excluded. The remaining allowance
@@ -169,6 +180,41 @@ provider-input ceiling.
 Every optional section is prunable. Only the exact prompt/claim plus provider instructions, output
 contract, and envelope may pause as `MANDATORY_CONTEXT_TOO_LARGE`; repeated provider rejection is
 reported separately with a smaller resumable generation.
+
+The worker pool is additionally bounded by the active scientific phase. MATEK persists
+`explore`, `consolidate`, `bottleneck`, `adversarial_audit`, and `synthesize` state, merges exact
+duplicate plans, redirects near-duplicate mechanisms, and selects one durable cut obligation for a
+bottleneck portfolio. Across activations it rotates independent prover, hostile falsifier, small-
+case computation, transfer auditor, and synthesizer roles against that obligation. Phase changes
+retire assignments still queued under the old contract. Thresholds and phase concurrency are
+configured under `[research.scientific_phase]`; they do not weaken the overall worker/backend
+ceilings.
+
+```toml
+[research.scientific_phase]
+no_audited_progress_assignments = 8
+unchanged_cut_snapshots = 4
+repeated_gap_threshold = 3
+similarity_threshold = 0.86
+blocked_or_refuted_ratio = 0.60
+bottleneck_maximum_size = 3
+bottleneck_attempts_before_audit = 5
+explore_concurrency = 8
+consolidate_concurrency = 4
+bottleneck_concurrency = 3
+adversarial_concurrency = 2
+```
+
+Synthesis is serialized at one active assignment so concurrent workers cannot produce competing
+terminal assemblies from the same audited premises.
+
+`--sandbox native|docker` selects the deterministic command backend used for Lean, LaTeX, and
+computation-certificate replay; it never moves the host Codex CLI into Docker. Collection and CAS
+storage are backend-independent, but trusted replay currently requires restricted Docker's
+attested filesystem confinement and disabled networking. Native mode records an unsafe-backend
+verdict and leaves the computation outside the ledger; the API adapter has no worker filesystem
+tool authority. Even a passing Docker replay yields proposed evidence pending mathematical/domain
+audit.
 
 Generated run directories use
 `run-<problem-file-stem>[-<run-name>]-<UTC-timestamp>-<random-suffix>`. The problem stem and
@@ -224,8 +270,10 @@ Shows one backend summary, a `Research roles:` line with configured coordinator/
 efforts, the stage table, aggregate usage and elapsed time, and recorded artifact paths. When the
 canonical research checkpoint exists, it also prints `Research coordinator:` with phase, decision
 count, the acknowledged-through event cursor, and queued, active, and completed assignment counts.
-API runs may show calculated dollar cost; Codex runs must not invent a dollar cost for subscription
-allowance. If the run ID is omitted, use the latest run in the current project.
+That `phase` is the coordinator scheduler lifecycle, not the separate scientific phase stored in
+`research/coordinator/scientific-phase.json`. API runs may show calculated dollar cost; Codex runs
+must not invent a dollar cost for subscription allowance. If the run ID is omitted, use the latest
+run in the current project.
 
 The status header prints `Scientific:` and `Workflow:` separately. For a paused candidate attempt
 it also shows completed and missing mandatory audits, so `CANDIDATE_AWAITING_AUDIT` is not confused
@@ -278,12 +326,27 @@ Graph commands are local and model-free:
   identity-free graph.
 - `matek graph validate` checks Markdown parsing, stable IDs, machine ownership, endpoint/type
   constraints, dependency cycles, hashes, and index revision; invalid graphs exit 6.
-- `matek graph status` and `frontier [--problem-id ID]` render typed machine-readable summaries.
+- `matek graph status` renders a typed machine-readable summary. `frontier [--problem-id ID]`
+  includes `main_target`, `live_derivations`, `strongest_audited_results`, `open_obligations`,
+  `smallest_known_open_cut`, and `open_cut_search_capped`.
 - `matek graph rebuild-index` recreates SQLite from authoritative Markdown.
 - `matek graph open` attempts Obsidian and otherwise succeeds gracefully while printing the
   vault path for manual opening.
 - `matek graph export [--format json|graphviz|mermaid] [--output PATH]` exports without Obsidian.
 - `matek graph diff REVISION_A REVISION_B` compares immutable snapshots.
+- `matek graph reconstruct REVISION [--output PATH]` integrity-checks and reconstructs one full
+  snapshot; legacy revisions preserve their exact stored bytes.
+- `matek graph verify-snapshots [REVISION]` verifies one revision or the complete snapshot history,
+  including manifest/parent roots, checkpoints, blob digests, graph records, and revision identity.
+- `matek graph migrate-legacy [--problem-id ID] [--target-claim-id ID]
+  [--audit-nomination-limit N] [--output PATH] [--dry-run] [-g NAME]` is the default read-only
+  planning form. It emits an integrity-protected report and refuses output beneath
+  `.matek/knowledge/`.
+- `matek graph migrate-legacy --apply-plan PLAN [--yes] [-g NAME]` applies the exact externally
+  reviewed plan. `PLAN` must be a nonsymlinked regular file outside `.matek/knowledge/`; `--output`
+  cannot be combined with this form. MATEK verifies integrity, graph identity, source revision,
+  archive digest/count, claim versions, and graph constraints, then asks for confirmation unless
+  `--yes` is present. A stale, wrong-graph, or tampered plan fails without mutation.
 - `show`, `dependencies`, `downstream`, `stale`, and `tasks` provide focused graph queries.
 - `tombstone NODE_ID --reason TEXT` preserves an obsolete identity and invalidates dependents;
   managed notes must not be deleted directly.
@@ -293,6 +356,11 @@ only when exactly one initialized graph exists; with multiple graphs an explicit
 required, and an unknown name is an error.
 
 The vault lives beneath `.matek/` so these commands do not imply consent to edit project source.
+Migration-plan output is user-selected, must remain outside every graph vault, and contains
+proposals rather than applied trust. Confirmed application is one recoverable/idempotent graph
+commit that preserves legacy nodes and all earlier snapshots as archive evidence. It creates only
+proposed typed derivations and queued verifier/falsifier audit tasks, makes no model call, and
+records the result at `ledgers/migrations/<plan-sha256>.application.json`.
 
 ## Exit codes
 

@@ -22,6 +22,7 @@ import unicodedata
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -29,12 +30,52 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
+from ..scientific import (
+    ScientificObligationDeclaration,
+    ScientificResult,
+    ScientificResultDisposition,
+    ScientificResultKind,
+    ScientificScope,
+    normalize_exact_statement,
+    transitive_result_dependency_keys,
+)
+from ..source_canonicalization import (
+    CanonicalSourceEntity,
+    SourceCanonicalizationError,
+    conflicting_stable_source_identifiers,
+    make_source_entity,
+    merge_source_entities,
+)
 from ..workspace import (
     atomic_write_json,
     atomic_write_text,
     ensure_path_confined,
     sha256_file,
     sha256_text,
+)
+from .admission import (
+    ScientificAdmissionError,
+    build_scientific_admission,
+    canonical_admitted_definition_scope,
+    canonical_definition_dependency_contract,
+    matches_admission_binding,
+    node_has_scientific_admission_binding,
+)
+from .ledger import (
+    CanonicalLedger,
+    DerivationStatus,
+    LedgerAmbiguity,
+    LedgerClaim,
+    LedgerError,
+    ObligationStatus,
+    logical_version,
+    project_markdown_ledger,
+    smallest_known_open_cut,
+    trusted_claim_ids,
+    write_canonical_ledger,
+)
+from .ledger import (
+    ClaimStatus as LedgerClaimStatus,
 )
 from .markdown import (
     GENERATED_END,
@@ -49,6 +90,16 @@ from .markdown import (
     replace_generated_section,
     statement_hash,
     wikilink_for,
+)
+from .migration import (
+    LegacyMigrationApplicationRecord,
+    LegacyMigrationError,
+    LegacyMigrationReport,
+    legacy_archive_sha256,
+    load_legacy_migration_application,
+    migration_report_sha256,
+    plan_legacy_graph_backfill,
+    write_legacy_migration_application,
 )
 from .models import (
     NODE_ID_PREFIXES,
@@ -65,6 +116,7 @@ from .models import (
     GraphNode,
     GraphNodeSummary,
     GraphPatch,
+    GraphSnapshotVerification,
     GraphState,
     GraphStatus,
     GraphValidationIssue,
@@ -72,6 +124,21 @@ from .models import (
     NodeType,
     RelationType,
     WorkflowStatus,
+)
+from .snapshots import (
+    DEFAULT_SNAPSHOT_CHECKPOINT_INTERVAL,
+    SnapshotIntegrityError,
+    SnapshotStore,
+)
+from .targets import (
+    FrozenTarget,
+    TargetBindingDisposition,
+    TargetRegistryError,
+    bind_frozen_target,
+    canonical_contract_json,
+    load_target_registry,
+    render_target_registry,
+    target_semantic_fingerprint,
 )
 
 GRAPH_SCHEMA_VERSION = 1
@@ -81,6 +148,9 @@ GRAPH_DIRECTORIES = (
     "Definitions",
     "Claims",
     "Proofs",
+    "Proof Attempts",
+    "Derivations",
+    "Obligations",
     "Approaches",
     "Counterexamples",
     "Experiments",
@@ -110,6 +180,9 @@ _WINDOWS_RESERVED_FILENAMES = {
 
 MAIN_RESULT_NEEDS_TAG = "MAIN_RESULT_NEEDS"
 _MAIN_RESULT_NEEDS_METADATA = "matek_main_result_needs"
+MANUSCRIPT_CONTEXT_MAXIMUM_NODES = 80
+FORMALIZATION_CONTEXT_MAXIMUM_NODES = 60
+_TRUSTED_CONTEXT_POLICY = "canonical-ledger-trusted-v1"
 
 
 class KnowledgeGraphError(RuntimeError):
@@ -128,12 +201,578 @@ class GraphValidationError(KnowledgeGraphError):
     pass
 
 
+@dataclass(frozen=True)
+class _VerifiedWorkerSourceRecord:
+    alias: str
+    entity: CanonicalSourceEntity
+    evidence_claims: tuple[tuple[str, tuple[str, ...]], ...]
+
+
+def _metadata_text_list(node: GraphNode, key: str) -> list[str]:
+    raw = node.metadata.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str) and item.strip()]
+
+
+def _source_entity_from_node(node: GraphNode) -> CanonicalSourceEntity:
+    if node.node_type is not NodeType.SOURCE:
+        raise GraphValidationError(
+            f"canonical source identity collides with non-source node {node.matek_id}"
+        )
+    source_key = str(node.metadata.get("matek_source_id") or "").strip().casefold()
+    if not source_key:
+        raise GraphValidationError(
+            f"existing source node {node.matek_id} lacks a canonical source identity"
+        )
+    identifiers = _metadata_text_list(node, "matek_identifiers")
+    verified = bool(node.metadata.get("matek_verified", False))
+    primary_value = node.metadata.get("matek_primary_identifier")
+    primary = str(primary_value).strip().casefold() if isinstance(primary_value, str) else None
+    if verified and primary is None and not source_key.startswith("provisional:"):
+        primary = source_key
+    provenance = _metadata_text_list(node, "matek_verification_provenance")
+    rendered_verification = _generated_heading_value(node.body, "Verification")
+    if rendered_verification and rendered_verification not in provenance:
+        provenance.append(rendered_verification)
+    try:
+        return CanonicalSourceEntity(
+            source_key=source_key,
+            primary_identifier=primary,
+            identifiers=identifiers,
+            identifier_revisions=_metadata_text_list(node, "matek_identifier_revisions"),
+            titles=_metadata_text_list(node, "matek_source_titles") or [node.title],
+            authors=_metadata_text_list(node, "matek_source_authors"),
+            aliases=_metadata_text_list(node, "matek_source_aliases"),
+            evidence_links=_metadata_text_list(node, "matek_evidence_links"),
+            verification_provenance=provenance,
+            verified=verified,
+        )
+    except ValueError as exc:
+        raise GraphValidationError(
+            f"existing canonical source node {node.matek_id} is malformed: {exc}"
+        ) from exc
+
+
+def _verified_worker_source_records(
+    raw_ledger: object,
+    *,
+    source_artifact: str,
+) -> list[_VerifiedWorkerSourceRecord]:
+    if not isinstance(raw_ledger, list):
+        raise GraphValidationError("typed source_ledger must be a list")
+    records: list[_VerifiedWorkerSourceRecord] = []
+    for index, raw_entry in enumerate(raw_ledger):
+        if not isinstance(raw_entry, Mapping):
+            raise GraphValidationError(
+                f"typed source ledger entry {index} must be a structured object"
+            )
+        if raw_entry.get("verified") is not True:
+            continue
+        alias = str(raw_entry.get("source_id") or "").strip()
+        title = str(raw_entry.get("title") or "").strip()
+        raw_identifiers = raw_entry.get("identifiers")
+        if (
+            not alias
+            or not title
+            or not isinstance(raw_identifiers, list)
+            or any(not isinstance(item, str) for item in raw_identifiers)
+        ):
+            raise GraphValidationError(
+                f"verified source ledger entry {index} lacks valid identity fields"
+            )
+        raw_authors = raw_entry.get("authors", [])
+        if not isinstance(raw_authors, list) or any(
+            not isinstance(item, str) for item in raw_authors
+        ):
+            raise GraphValidationError(
+                f"verified source ledger entry {alias!r} has malformed authors"
+            )
+        raw_claims = raw_entry.get("evidence_claims")
+        if not isinstance(raw_claims, list):
+            raise GraphValidationError(
+                f"verified source ledger entry {alias!r} has malformed evidence claims"
+            )
+        evidence_claims: list[tuple[str, tuple[str, ...]]] = []
+        for raw_claim in raw_claims:
+            if not isinstance(raw_claim, Mapping):
+                raise GraphValidationError(
+                    f"verified source ledger entry {alias!r} has malformed evidence claims"
+                )
+            claim = str(raw_claim.get("claim") or "").strip()
+            raw_source_ids = raw_claim.get("source_ids")
+            if (
+                not claim
+                or not isinstance(raw_source_ids, list)
+                or any(not isinstance(item, str) for item in raw_source_ids)
+            ):
+                raise GraphValidationError(
+                    f"verified source ledger entry {alias!r} has malformed evidence links"
+                )
+            source_ids = tuple(
+                dict.fromkeys(item.strip() for item in raw_source_ids if item.strip())
+            )
+            evidence_claims.append((claim, source_ids))
+        verification_detail = str(raw_entry.get("verification_detail") or "").strip()
+        identifiers = [item.strip() for item in raw_identifiers if item.strip()]
+        evidence_links = [item for item in identifiers if item.casefold().startswith("https://")]
+        try:
+            entity = make_source_entity(
+                title=title,
+                identifiers=identifiers,
+                authors=[item.strip() for item in raw_authors if item.strip()],
+                source_alias=alias,
+                evidence_links=evidence_links,
+                verification_provenance=[
+                    verification_detail,
+                    f"Verified worker ledger {source_artifact} ({alias}).",
+                ],
+                verified=True,
+            )
+        except (SourceCanonicalizationError, ValueError) as exc:
+            raise GraphValidationError(
+                f"verified source ledger entry {alias!r} has no valid stable identity: {exc}"
+            ) from exc
+        records.append(
+            _VerifiedWorkerSourceRecord(
+                alias=alias,
+                entity=entity,
+                evidence_claims=tuple(evidence_claims),
+            )
+        )
+    return sorted(records, key=lambda item: (item.entity.source_key, item.alias))
+
+
+def _group_verified_worker_sources(
+    records: Sequence[_VerifiedWorkerSourceRecord],
+) -> tuple[list[CanonicalSourceEntity], dict[str, str]]:
+    """Merge records only through exact aliases or canonical stable identifiers."""
+
+    parents = list(range(len(records)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+
+    for left, left_record in enumerate(records):
+        left_identifiers = set(left_record.entity.identifiers)
+        for right in range(left + 1, len(records)):
+            right_record = records[right]
+            overlaps = left_record.alias == right_record.alias or bool(
+                left_identifiers.intersection(right_record.entity.identifiers)
+            )
+            if not overlaps:
+                continue
+            conflicts = conflicting_stable_source_identifiers(
+                left_record.entity.identifiers,
+                right_record.entity.identifiers,
+            )
+            if conflicts:
+                schemes = ", ".join(sorted(conflicts))
+                raise GraphValidationError(
+                    "verified source records overlap through an alias or low-precedence "
+                    f"identifier but assert conflicting {schemes} identities"
+                )
+            if overlaps:
+                union(left, right)
+
+    grouped: dict[int, list[_VerifiedWorkerSourceRecord]] = defaultdict(list)
+    for index, record in enumerate(records):
+        grouped[find(index)].append(record)
+
+    entities: list[CanonicalSourceEntity] = []
+    reference_to_key: dict[str, str] = {}
+    for members in grouped.values():
+        identifiers = sorted(
+            {identifier for member in members for identifier in member.entity.identifiers}
+        )
+        revisions = sorted(
+            {revision for member in members for revision in member.entity.identifier_revisions}
+        )
+        titles = sorted(
+            {title for member in members for title in member.entity.titles},
+            key=str.casefold,
+        )
+        authors = sorted(
+            {author for member in members for author in member.entity.authors},
+            key=str.casefold,
+        )
+        aliases = sorted({member.alias for member in members}, key=str.casefold)
+        evidence_links = sorted(
+            {link for member in members for link in member.entity.evidence_links}
+        )
+        provenance = sorted(
+            {item for member in members for item in member.entity.verification_provenance}
+        )
+        seed = make_source_entity(
+            title=titles[0],
+            identifiers=identifiers,
+            authors=authors,
+            source_alias=aliases[0],
+            evidence_links=evidence_links,
+            verification_provenance=provenance,
+            verified=True,
+        )
+        entity = CanonicalSourceEntity(
+            source_key=seed.source_key,
+            primary_identifier=seed.primary_identifier,
+            identifiers=identifiers,
+            identifier_revisions=revisions,
+            titles=titles,
+            authors=authors,
+            aliases=aliases,
+            evidence_links=evidence_links,
+            verification_provenance=provenance,
+            verified=True,
+        )
+        entities.append(entity)
+        for reference in [entity.source_key, *entity.identifiers, *aliases]:
+            prior = reference_to_key.get(reference)
+            if prior is not None and prior != entity.source_key:
+                raise GraphValidationError(
+                    f"verified source reference {reference!r} resolves to multiple entities"
+                )
+            reference_to_key[reference] = entity.source_key
+    return sorted(entities, key=lambda item: item.source_key), reference_to_key
+
+
+def _explicit_result_source_keys(
+    records: Sequence[_VerifiedWorkerSourceRecord],
+    *,
+    typed_results: Sequence[ScientificResult],
+    reference_to_key: Mapping[str, str],
+) -> tuple[dict[str, set[str]], dict[str, list[str]], list[str]]:
+    by_local_key = {result.local_key: result.local_key for result in typed_results}
+    by_statement: dict[str, list[str]] = defaultdict(list)
+    for result in typed_results:
+        by_statement[normalize_exact_statement(result.exact_statement)].append(result.local_key)
+    result_sources: dict[str, set[str]] = defaultdict(set)
+    evidence_by_source: dict[str, list[str]] = defaultdict(list)
+    issues: list[str] = []
+    for record in records:
+        for claim, source_references in record.evidence_claims:
+            resolved_keys: set[str] = set()
+            for reference in source_references:
+                source_key = reference_to_key.get(reference)
+                if source_key is None:
+                    issues.append(
+                        f"verified evidence claim references unknown or unverified source "
+                        f"{reference!r}"
+                    )
+                    continue
+                resolved_keys.add(source_key)
+                evidence_by_source[source_key].append(claim)
+            if not resolved_keys:
+                continue
+            result_keys: list[str] = []
+            if claim in by_local_key:
+                result_keys = [claim]
+            elif claim.startswith("result:") and claim.removeprefix("result:") in by_local_key:
+                result_keys = [claim.removeprefix("result:")]
+            else:
+                result_keys = by_statement.get(normalize_exact_statement(claim), [])
+            for result_key in result_keys:
+                result_sources[result_key].update(resolved_keys)
+    return result_sources, evidence_by_source, list(dict.fromkeys(issues))
+
+
+def _merge_compatible_source_identities(
+    entities: Sequence[CanonicalSourceEntity],
+) -> CanonicalSourceEntity:
+    """Merge exact-identifier evidence while recomputing precedence.
+
+    This differs from ``merge_source_entities`` because a later verified record
+    may upgrade an arXiv-keyed entity to a DOI-keyed entity.  Conflicting
+    same-scheme identities are never reconciled automatically.
+    """
+
+    if not entities:
+        raise GraphValidationError("cannot merge an empty source identity set")
+    for index, left in enumerate(entities):
+        for right in entities[index + 1 :]:
+            conflicts = conflicting_stable_source_identifiers(
+                left.identifiers,
+                right.identifiers,
+            )
+            if conflicts:
+                schemes = ", ".join(sorted(conflicts))
+                raise GraphValidationError(
+                    f"source identity upgrade has conflicting {schemes} identifiers"
+                )
+    identifiers = sorted({item for entity in entities for item in entity.identifiers})
+    revisions = sorted({item for entity in entities for item in entity.identifier_revisions})
+    titles = sorted({item for entity in entities for item in entity.titles}, key=str.casefold)
+    authors = sorted({item for entity in entities for item in entity.authors}, key=str.casefold)
+    aliases = sorted({item for entity in entities for item in entity.aliases}, key=str.casefold)
+    evidence_links = sorted({item for entity in entities for item in entity.evidence_links})
+    provenance = sorted({item for entity in entities for item in entity.verification_provenance})
+    seed = make_source_entity(
+        title=titles[0],
+        identifiers=identifiers,
+        authors=authors,
+        source_alias=aliases[0] if aliases else None,
+        evidence_links=evidence_links,
+        verification_provenance=provenance,
+        verified=True,
+    )
+    return CanonicalSourceEntity(
+        source_key=seed.source_key,
+        primary_identifier=seed.primary_identifier,
+        identifiers=identifiers,
+        identifier_revisions=revisions,
+        titles=titles,
+        authors=authors,
+        aliases=aliases,
+        evidence_links=evidence_links,
+        verification_provenance=provenance,
+        verified=True,
+    )
+
+
+def _superseded_source_alias(
+    node: GraphNode,
+    *,
+    canonical_source_id: str,
+    canonical_source_key: str,
+    run_id: str,
+    now: datetime,
+) -> GraphNode:
+    alias = node.model_copy(deep=True)
+    alias.epistemic_status = EpistemicStatus.STALE
+    alias.workflow_status = WorkflowStatus.SUPERSEDED
+    alias.last_modified_run = run_id
+    alias.updated_at = now
+    alias.author_role = "canonical-source-migrator"
+    alias.invalidation_reasons = list(
+        dict.fromkeys([*alias.invalidation_reasons, "canonical_source_identity_merged"])
+    )
+    alias.tags = list(dict.fromkeys([*alias.tags, "matek/source-alias"]))
+    alias.metadata["matek_canonical_source_node_id"] = canonical_source_id
+    alias.metadata["matek_canonical_source_key"] = canonical_source_key
+    return alias
+
+
+def _verified_worker_source_nodes(
+    raw_ledger: object,
+    *,
+    typed_results: Sequence[ScientificResult],
+    existing_nodes: Mapping[str, GraphNode],
+    problem_id: str,
+    run_id: str,
+    source_artifact: str,
+    now: datetime,
+) -> tuple[list[GraphNode], dict[str, set[str]], list[str]]:
+    records = _verified_worker_source_records(
+        raw_ledger,
+        source_artifact=source_artifact,
+    )
+    entities, reference_to_key = _group_verified_worker_sources(records)
+    result_source_keys, evidence_by_source, issues = _explicit_result_source_keys(
+        records,
+        typed_results=typed_results,
+        reference_to_key=reference_to_key,
+    )
+    source_nodes: list[GraphNode] = []
+    source_ids_by_key: dict[str, str] = {}
+    run_node_id = _deterministic_id(NodeType.RUN, problem_id, run_id)
+    for incoming in entities:
+        incoming_key = incoming.source_key
+        deterministic_source_id = _deterministic_id(
+            NodeType.SOURCE,
+            problem_id,
+            incoming_key,
+        )
+        direct = existing_nodes.get(deterministic_source_id)
+        compatible_existing: list[tuple[GraphNode, CanonicalSourceEntity]] = []
+        for candidate in existing_nodes.values():
+            if candidate.node_type is not NodeType.SOURCE or candidate.problem_id != problem_id:
+                continue
+            candidate_entity = _source_entity_from_node(candidate)
+            overlaps = bool(set(candidate_entity.identifiers).intersection(incoming.identifiers))
+            if candidate.matek_id == deterministic_source_id and not overlaps:
+                raise GraphValidationError(
+                    f"canonical source ID collision at {deterministic_source_id}"
+                )
+            if not overlaps:
+                continue
+            conflicts = conflicting_stable_source_identifiers(
+                candidate_entity.identifiers,
+                incoming.identifiers,
+            )
+            if conflicts:
+                schemes = ", ".join(sorted(conflicts))
+                raise GraphValidationError(
+                    "verified source overlaps an existing low-precedence identifier "
+                    f"but asserts conflicting {schemes} identity"
+                )
+            compatible_existing.append((candidate, candidate_entity))
+        if direct is not None and not any(
+            candidate.matek_id == direct.matek_id for candidate, _ in compatible_existing
+        ):
+            direct_entity = _source_entity_from_node(direct)
+            if direct_entity.source_key != incoming_key:
+                raise GraphValidationError(
+                    f"canonical source ID collision at {deterministic_source_id}"
+                )
+            compatible_existing.append((direct, direct_entity))
+        compatible_existing.sort(
+            key=lambda item: (
+                item[0].matek_id != deterministic_source_id,
+                item[0].created_at,
+                item[0].matek_id,
+            )
+        )
+        existing = compatible_existing[0][0] if compatible_existing else None
+        source_id = existing.matek_id if existing is not None else deterministic_source_id
+        source_ids_by_key[incoming_key] = source_id
+        if compatible_existing:
+            incoming = _merge_compatible_source_identities(
+                [*(entity for _, entity in compatible_existing), incoming]
+            )
+        superseded_ids = [
+            candidate.matek_id
+            for candidate, _ in compatible_existing
+            if candidate.matek_id != source_id
+        ]
+        source_evidence = list(
+            dict.fromkeys(
+                [
+                    *(
+                        evidence
+                        for candidate, _ in compatible_existing
+                        for evidence in candidate.evidence
+                    ),
+                    *evidence_by_source.get(incoming_key, []),
+                ]
+            )
+        )
+        source_nodes.append(
+            GraphNode(
+                matek_id=source_id,
+                node_type=NodeType.SOURCE,
+                problem_id=problem_id,
+                title=incoming.titles[0],
+                epistemic_status=EpistemicStatus.AUDIT_PASSED,
+                workflow_status=WorkflowStatus.COMPLETE,
+                created_in_run=existing.created_in_run if existing is not None else run_id,
+                last_modified_run=run_id,
+                author_role="research-source-verifier",
+                created_at=existing.created_at if existing is not None else now,
+                updated_at=now,
+                body=new_generated_body(
+                    incoming.titles[0],
+                    "## Stable identifiers\n\n"
+                    + ("\n".join(f"- `{item}`" for item in incoming.identifiers) or "_None._")
+                    + "\n\n## Identifier revisions\n\n"
+                    + (
+                        "\n".join(f"- `{item}`" for item in incoming.identifier_revisions)
+                        or "_None._"
+                    )
+                    + "\n\n## Titles and aliases\n\n"
+                    + "\n".join(
+                        [
+                            *(f"- Title: {item}" for item in incoming.titles),
+                            *(f"- Alias: `{item}`" for item in incoming.aliases),
+                        ]
+                    )
+                    + "\n\n## Explicit evidence claims\n\n"
+                    + (
+                        "\n".join(f"- {item}" for item in source_evidence)
+                        or "_None linked to a scientific result._"
+                    )
+                    + "\n\n## Verification\n\n"
+                    + "\n".join(incoming.verification_provenance),
+                ),
+                tags=["matek/source", "matek/source-verified"],
+                relations=_unique_edges(
+                    [
+                        *(existing.relations if existing is not None else []),
+                        GraphEdge(
+                            source_id=source_id,
+                            relation=RelationType.CREATED_DURING,
+                            target_id=run_node_id,
+                        ),
+                        *(
+                            GraphEdge(
+                                source_id=source_id,
+                                relation=RelationType.SUPERSEDES,
+                                target_id=superseded_id,
+                            )
+                            for superseded_id in superseded_ids
+                        ),
+                    ]
+                ),
+                source_artifacts=list(
+                    dict.fromkeys(
+                        [
+                            *(
+                                artifact
+                                for candidate, _ in compatible_existing
+                                for artifact in candidate.source_artifacts
+                            ),
+                            source_artifact,
+                        ]
+                    )
+                ),
+                evidence=source_evidence,
+                metadata={
+                    "matek_source_id": incoming.source_key,
+                    "matek_primary_identifier": incoming.primary_identifier,
+                    "matek_identifiers": incoming.identifiers,
+                    "matek_identifier_revisions": incoming.identifier_revisions,
+                    "matek_source_aliases": incoming.aliases,
+                    "matek_source_titles": incoming.titles,
+                    "matek_source_authors": incoming.authors,
+                    "matek_evidence_links": incoming.evidence_links,
+                    "matek_verification_provenance": incoming.verification_provenance,
+                    "matek_source_evidence_claims": source_evidence,
+                    "matek_verified": True,
+                },
+            )
+        )
+        source_nodes.extend(
+            _superseded_source_alias(
+                candidate,
+                canonical_source_id=source_id,
+                canonical_source_key=incoming.source_key,
+                run_id=run_id,
+                now=now,
+            )
+            for candidate, _ in compatible_existing
+            if candidate.matek_id != source_id
+        )
+    result_source_ids = {
+        result_key: {
+            source_ids_by_key[source_key]
+            for source_key in source_keys
+            if source_key in source_ids_by_key
+        }
+        for result_key, source_keys in result_source_keys.items()
+    }
+    return source_nodes, result_source_ids, issues
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _generated_heading_value(body: str, heading: str) -> str | None:
+    generated = generated_section(body)
+    pattern = re.compile(rf"(?ms)^##\s+{re.escape(heading)}\s*$\n+(.*?)(?=^##\s+|\Z)")
+    match = pattern.search(generated)
+    return match.group(1).strip() if match is not None else None
 
 
 def _deterministic_id(node_type: NodeType, *parts: str) -> str:
@@ -219,6 +858,68 @@ def _node_summary(node: GraphNode) -> GraphNodeSummary:
     )
 
 
+def _context_node_is_live(node: GraphNode) -> bool:
+    return (
+        not node.tombstone
+        and not node.invalidation_reasons
+        and node.epistemic_status
+        not in {
+            EpistemicStatus.REFUTED,
+            EpistemicStatus.INCONSISTENT,
+            EpistemicStatus.STALE,
+        }
+        and node.workflow_status
+        not in {
+            WorkflowStatus.BLOCKED,
+            WorkflowStatus.ABANDONED,
+            WorkflowStatus.SUPERSEDED,
+        }
+    )
+
+
+def _verified_source_for_context(node: GraphNode) -> bool:
+    if (
+        node.node_type is not NodeType.SOURCE
+        or not _context_node_is_live(node)
+        or node.epistemic_status is not EpistemicStatus.AUDIT_PASSED
+        or node.workflow_status is not WorkflowStatus.COMPLETE
+        or node.author_role not in {"prompt-source-verifier", "research-source-verifier"}
+        or node.metadata.get("matek_verified") is not True
+    ):
+        return False
+    try:
+        return _source_entity_from_node(node).verified
+    except GraphValidationError:
+        return False
+
+
+def _verified_formalization_for_context(
+    node: GraphNode,
+    *,
+    nodes: Mapping[str, GraphNode],
+    trusted_claim_node_ids: set[str],
+) -> bool:
+    formalized_ids = [
+        edge.target_id for edge in node.relations if edge.relation is RelationType.FORMALIZES
+    ]
+    if len(formalized_ids) != 1:
+        return False
+    claim_id = formalized_ids[0]
+    claim = nodes.get(claim_id)
+    return (
+        node.node_type is NodeType.FORMALIZATION
+        and _context_node_is_live(node)
+        and node.epistemic_status is EpistemicStatus.LEAN_VERIFIED
+        and node.workflow_status is WorkflowStatus.COMPLETE
+        and node.author_role == "deterministic-lean-verifier"
+        and node.metadata.get("matek_deterministic_verification_passed") is True
+        and node.metadata.get("matek_claim_id") == claim_id
+        and claim_id in trusted_claim_node_ids
+        and claim is not None
+        and node.metadata.get("matek_statement_version") == claim.statement_version
+    )
+
+
 def _unique_edges(edges: Iterable[GraphEdge]) -> list[GraphEdge]:
     result: list[GraphEdge] = []
     seen: set[tuple[str, str, str]] = set()
@@ -248,6 +949,7 @@ class KnowledgeGraph:
         clock: Callable[[], datetime] | None = None,
         maximum_context_nodes: int = 48,
         maximum_context_characters: int = 60_000,
+        snapshot_checkpoint_interval: int = DEFAULT_SNAPSHOT_CHECKPOINT_INTERVAL,
     ) -> None:
         root = project_root.expanduser().resolve(strict=True)
         if not root.is_dir():
@@ -264,7 +966,20 @@ class KnowledgeGraph:
         self.schema_path = ensure_path_confined(root, self.graph_root / "graph-schema.json")
         self.index_path = ensure_path_confined(root, self.graph_root / "graph-index.sqlite")
         self.pending_path = ensure_path_confined(root, self.graph_root / "graph-pending.json")
-        self.snapshots_root = ensure_path_confined(root, self.graph_root / "snapshots")
+        self.target_registry_path = ensure_path_confined(
+            root, self.graph_root / "target-registry.json"
+        )
+        self.ledgers_root = ensure_path_confined(root, self.graph_root / "ledgers")
+        requested_snapshots_root = self.graph_root / "snapshots"
+        if requested_snapshots_root.is_symlink():
+            raise KnowledgeGraphError(
+                f"refusing symlinked snapshot store: {requested_snapshots_root}"
+            )
+        self.snapshots_root = ensure_path_confined(root, requested_snapshots_root)
+        self.snapshot_store = SnapshotStore(
+            self.snapshots_root,
+            checkpoint_interval=snapshot_checkpoint_interval,
+        )
         self.locks_root = ensure_path_confined(root, self.graph_root / "locks")
         self.lock_path = ensure_path_confined(root, self.locks_root / "graph.lock")
         self._clock = clock or _utc_now
@@ -306,6 +1021,7 @@ class KnowledgeGraph:
         self.collection_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.graph_root.mkdir(mode=0o700, exist_ok=True)
         self.snapshots_root.mkdir(mode=0o700, exist_ok=True)
+        self.ledgers_root.mkdir(mode=0o700, exist_ok=True)
         self.locks_root.mkdir(mode=0o700, exist_ok=True)
         for relative in GRAPH_DIRECTORIES:
             ensure_path_confined(self.vault_root, self.vault_root / relative).mkdir(
@@ -351,6 +1067,7 @@ class KnowledgeGraph:
                 self._write_snapshot_unlocked(state, [])
             nodes = self._load_nodes_unlocked(include_human_notes=True)
             state, nodes = self._migrate_legacy_paths_unlocked(state, nodes)
+            self._canonical_ledgers_unlocked(state, nodes, persist=True)
             self._write_navigation_unlocked(state, nodes)
             self._rebuild_index_unlocked(state, nodes)
             return state
@@ -445,6 +1162,7 @@ class KnowledgeGraph:
         atomic_write_json(self.state_path, state_after, confinement_root=self.graph_root)
         nodes = self._load_nodes_unlocked(include_human_notes=True)
         self._write_snapshot_unlocked(state_after, nodes)
+        self._canonical_ledgers_unlocked(state_after, nodes, persist=True)
         self._write_navigation_unlocked(state_after, nodes)
         self._rebuild_index_unlocked(state_after, nodes)
         self.pending_path.unlink(missing_ok=True)
@@ -503,6 +1221,578 @@ class KnowledgeGraph:
             self._recover_pending_unlocked()
             self._load_state_unlocked()
             return self._load_nodes_unlocked(include_human_notes=include_human_notes)
+
+    def apply_legacy_migration(
+        self,
+        report: LegacyMigrationReport,
+    ) -> LegacyMigrationApplicationRecord:
+        """Apply one externally reviewed, integrity-bound legacy migration plan.
+
+        The source revision and complete problem-local archive digest are checked while
+        holding the graph lock.  The graph commit is one normal recoverable transaction;
+        old notes and all prior snapshots remain in place.  A digest-protected application
+        record makes a retry observable and idempotent even if the first process stopped
+        after committing the graph but before writing that record.
+        """
+
+        plan_sha256 = migration_report_sha256(report)
+        operation_id = f"legacy-migration:{plan_sha256}"
+        if report.source_graph_name is None:
+            raise LegacyMigrationError(
+                "legacy migration plan lacks source_graph_name and cannot be safely applied"
+            )
+        if report.source_graph_name != self.graph_name:
+            raise LegacyMigrationError(
+                f"legacy migration plan belongs to graph {report.source_graph_name!r}, "
+                f"not {self.graph_name!r}"
+            )
+        record_path = ensure_path_confined(
+            self.graph_root,
+            self.ledgers_root / "migrations" / f"{plan_sha256}.application.json",
+        )
+
+        proof_ids = sorted(
+            {
+                *(item.proof_node_id for item in report.proof_attempt_reclassifications),
+                *(item.derivation.proof_attempt_id for item in report.derivation_proposals),
+            }
+        )
+        proof_attempt_ids = [
+            _deterministic_id(
+                NodeType.PROOF_ATTEMPT,
+                "legacy-backfill",
+                plan_sha256,
+                proof_id,
+            )
+            for proof_id in proof_ids
+        ]
+        derivation_ids = sorted(item.proposal_id for item in report.derivation_proposals)
+        recorded_alias_ids = sorted(
+            alias_id
+            for group in report.claim_alias_groups
+            if group.disposition == "ready_for_review"
+            for alias_id in group.alias_ids
+        )
+        quarantine_ids = sorted(item.refutation_node_id for item in report.refutation_quarantines)
+        retargeted_ids = sorted(
+            item.refutation_node_id
+            for item in report.refutation_quarantines
+            if len(item.candidate_branch_target_ids) == 1
+        )
+        audit_task_ids = [
+            _deterministic_id(
+                NodeType.TASK,
+                "legacy-audit-nomination",
+                plan_sha256,
+                item.claim_id,
+                item.proof_node_id,
+            )
+            for item in report.audit_nominations
+        ]
+        updated_archive_ids = sorted(
+            {
+                *proof_ids,
+                *quarantine_ids,
+                *recorded_alias_ids,
+                *(
+                    group.canonical_candidate_id
+                    for group in report.claim_alias_groups
+                    if group.disposition == "ready_for_review"
+                ),
+            }
+        )
+        unapplied_issues = [
+            *report.ambiguous_dependencies,
+            *report.scope_conflicts,
+            *report.review_notes,
+        ]
+
+        def application_record(
+            result: GraphMergeResult,
+            *,
+            applied_at: datetime,
+            status: Literal["applied", "already_applied"],
+        ) -> LegacyMigrationApplicationRecord:
+            return LegacyMigrationApplicationRecord(
+                status=status,
+                plan_sha256=plan_sha256,
+                graph_name=self.graph_name,
+                problem_id=report.problem_id,
+                target_claim_id=report.target_claim_id,
+                source_graph_revision=report.source_graph_revision,
+                source_archive_sha256=report.source_archive_sha256,
+                operation_id=operation_id,
+                previous_revision=result.previous_revision,
+                new_revision=result.new_revision,
+                applied_at=applied_at,
+                proof_attempt_node_ids=proof_attempt_ids,
+                derivation_node_ids=derivation_ids,
+                updated_archive_node_ids=updated_archive_ids,
+                recorded_alias_ids=recorded_alias_ids,
+                quarantined_refutation_node_ids=quarantine_ids,
+                retargeted_refutation_node_ids=retargeted_ids,
+                audit_task_node_ids=audit_task_ids,
+                unapplied_issues=unapplied_issues,
+            )
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            state = self._load_state_unlocked()
+            existing_operation = state.processed_operations.get(operation_id)
+            if record_path.exists():
+                existing_record = load_legacy_migration_application(record_path)
+                if (
+                    existing_record.plan_sha256 != plan_sha256
+                    or existing_record.graph_name != self.graph_name
+                    or existing_record.operation_id != operation_id
+                    or existing_operation is None
+                    or existing_operation.new_revision != existing_record.new_revision
+                ):
+                    raise LegacyMigrationError(
+                        "legacy migration application record does not match graph history"
+                    )
+                return existing_record.model_copy(update={"status": "already_applied"})
+            if existing_operation is not None:
+                change = next(
+                    (item for item in state.changes if item.operation_id == operation_id),
+                    None,
+                )
+                if change is None:
+                    raise LegacyMigrationError(
+                        "applied legacy migration is missing its graph change record"
+                    )
+                recovered = application_record(
+                    existing_operation,
+                    applied_at=change.timestamp,
+                    status="applied",
+                )
+                write_legacy_migration_application(
+                    record_path,
+                    recovered,
+                    confinement_root=self.ledgers_root,
+                )
+                return recovered.model_copy(update={"status": "already_applied"})
+
+            if state.revision != report.source_graph_revision:
+                raise LegacyMigrationError(
+                    "legacy migration plan is stale: current graph revision "
+                    f"{state.revision} differs from reviewed revision "
+                    f"{report.source_graph_revision}"
+                )
+            nodes = self._load_nodes_unlocked(include_human_notes=True)
+            selected = [node for node in nodes if node.problem_id == report.problem_id]
+            if len(selected) != report.source_node_count:
+                raise LegacyMigrationError(
+                    "legacy migration plan is stale: source node count changed"
+                )
+            current_archive_sha256 = legacy_archive_sha256(
+                selected,
+                problem_id=report.problem_id,
+            )
+            if current_archive_sha256 != report.source_archive_sha256:
+                raise LegacyMigrationError(
+                    "legacy migration plan is stale: source archive digest changed"
+                )
+            expected_report = plan_legacy_graph_backfill(
+                nodes,
+                graph_revision=state.revision,
+                problem_id=report.problem_id,
+                target_claim_id=report.target_claim_id,
+                audit_nomination_limit=report.audit_nomination_limit,
+                graph_name=self.graph_name,
+            )
+            if expected_report != report:
+                raise LegacyMigrationError(
+                    "legacy migration plan does not match the deterministic plan for its "
+                    "integrity-bound source archive"
+                )
+            by_id = {node.matek_id: node.model_copy(deep=True) for node in nodes}
+            target = by_id.get(report.target_claim_id)
+            if (
+                target is None
+                or target.node_type is not NodeType.CLAIM
+                or target.problem_id != report.problem_id
+                or (
+                    target.matek_id != self.main_claim_id(report.problem_id)
+                    and "matek/main-target" not in target.tags
+                )
+            ):
+                raise LegacyMigrationError(
+                    "legacy migration target is not the graph's current main claim"
+                )
+
+            now = self._now()
+            run_id = f"legacy-migration-{plan_sha256[:16]}"
+            changed: set[str] = set()
+            gap_by_proof = {
+                item.proof_node_id: item.exact_gap
+                for item in report.proof_attempt_reclassifications
+            }
+            proof_attempt_by_archive: dict[str, str] = {}
+            for proof_id, attempt_id in zip(proof_ids, proof_attempt_ids, strict=True):
+                proof = by_id.get(proof_id)
+                if proof is None or proof.node_type is not NodeType.PROOF:
+                    raise LegacyMigrationError(
+                        f"reviewed legacy proof node is unavailable or mistyped: {proof_id}"
+                    )
+                if attempt_id in by_id:
+                    raise LegacyMigrationError(
+                        f"deterministic proof-attempt ID collides with archive node: {attempt_id}"
+                    )
+                proof_attempt_by_archive[proof_id] = attempt_id
+                gap = gap_by_proof.get(proof_id)
+                preserved = generated_section(proof.body).strip()
+                attempt = GraphNode(
+                    matek_id=attempt_id,
+                    node_type=NodeType.PROOF_ATTEMPT,
+                    problem_id=report.problem_id,
+                    title=f"Legacy proof attempt {proof_id}",
+                    epistemic_status=EpistemicStatus.CANDIDATE,
+                    workflow_status=(
+                        WorkflowStatus.BLOCKED if gap is not None else WorkflowStatus.COMPLETE
+                    ),
+                    created_in_run=run_id,
+                    last_modified_run=run_id,
+                    author_role="matek-legacy-migrator",
+                    created_at=now,
+                    updated_at=now,
+                    body=new_generated_body(
+                        f"Legacy proof attempt {proof_id}",
+                        "## Archive source\n\n"
+                        + proof_id
+                        + "\n\n## Preserved proof content\n\n"
+                        + (preserved or "_No generated proof body was recoverable._")
+                        + "\n\n## Exact gap\n\n"
+                        + (gap or "_None declared in the reviewed legacy plan._"),
+                    ),
+                    tags=["matek/proof-attempt", "matek/legacy-backfill"],
+                    relations=[
+                        GraphEdge(
+                            source_id=attempt_id,
+                            relation=RelationType.RELATED_TO,
+                            target_id=proof_id,
+                        ),
+                        *(
+                            GraphEdge(
+                                source_id=attempt_id,
+                                relation=RelationType.RELATED_TO,
+                                target_id=edge.target_id,
+                            )
+                            for edge in proof.relations
+                            if edge.relation is RelationType.PROVES
+                        ),
+                    ],
+                    source_artifacts=list(proof.source_artifacts),
+                    evidence=list(proof.evidence),
+                    metadata={
+                        "matek_legacy_archive_node_id": proof_id,
+                        "matek_legacy_migration_plan_sha256": plan_sha256,
+                        **({"matek_exact_gap": gap} if gap is not None else {}),
+                    },
+                )
+                by_id[attempt_id] = attempt
+                proof.metadata["matek_archive_only"] = True
+                proof.metadata["matek_superseded_by"] = attempt_id
+                proof.metadata["matek_legacy_migration_plan_sha256"] = plan_sha256
+                proof.tags = list(
+                    dict.fromkeys([*proof.tags, "matek/archive-only", "matek/legacy-proof"])
+                )
+                proof.workflow_status = WorkflowStatus.SUPERSEDED
+                proof.last_modified_run = run_id
+                proof.author_role = "matek-legacy-migrator"
+                proof.updated_at = now
+                changed.update({proof_id, attempt_id})
+
+            proposal_by_proof: dict[str, str] = {}
+            for proposal in report.derivation_proposals:
+                derivation = proposal.derivation
+                proof_attempt_id = proof_attempt_by_archive.get(derivation.proof_attempt_id)
+                if proof_attempt_id is None:
+                    raise LegacyMigrationError(
+                        f"derivation {proposal.proposal_id} lacks a canonical proof attempt"
+                    )
+                conclusion = by_id.get(derivation.conclusion_claim_id)
+                premises = [by_id.get(item) for item in derivation.premise_claim_ids]
+                if (
+                    conclusion is None
+                    or conclusion.node_type is not NodeType.CLAIM
+                    or any(
+                        item is None or item.node_type is not NodeType.CLAIM for item in premises
+                    )
+                ):
+                    raise LegacyMigrationError(
+                        f"derivation {proposal.proposal_id} references a missing claim"
+                    )
+                current_target_version = logical_version(exact_statement(conclusion.body))
+                current_premise_versions = {
+                    item.matek_id: logical_version(exact_statement(item.body))
+                    for item in premises
+                    if item is not None
+                }
+                if (
+                    current_target_version != derivation.exact_target_version
+                    or current_premise_versions != derivation.premise_versions
+                ):
+                    raise LegacyMigrationError(
+                        f"derivation {proposal.proposal_id} exact claim versions are stale"
+                    )
+                if proposal.proposal_id in by_id:
+                    raise LegacyMigrationError(
+                        f"proposed derivation ID collides with archive node: {proposal.proposal_id}"
+                    )
+                proposal_by_proof[derivation.proof_attempt_id] = proposal.proposal_id
+                derivation_node = GraphNode(
+                    matek_id=proposal.proposal_id,
+                    node_type=NodeType.DERIVATION,
+                    problem_id=report.problem_id,
+                    title=f"Reviewed legacy derivation for {conclusion.title}",
+                    epistemic_status=EpistemicStatus.CANDIDATE,
+                    workflow_status=WorkflowStatus.QUEUED,
+                    created_in_run=run_id,
+                    last_modified_run=run_id,
+                    author_role="matek-legacy-migrator",
+                    created_at=now,
+                    updated_at=now,
+                    body=new_generated_body(
+                        f"Reviewed legacy derivation for {conclusion.title}",
+                        "## Exact conclusion\n\n"
+                        + exact_statement(conclusion.body)
+                        + "\n\n## Joint premises\n\n"
+                        + (
+                            "\n".join(f"- {item}" for item in derivation.premise_claim_ids)
+                            or "_No prior premises declared._"
+                        )
+                        + "\n\n## Canonical proof attempt\n\n"
+                        + proof_attempt_id
+                        + "\n\n## Review status\n\n"
+                        "Proposed only; fresh independent audit is required.",
+                    ),
+                    tags=["matek/derivation", "matek/proposed", "matek/legacy-backfill"],
+                    relations=[
+                        GraphEdge(
+                            source_id=proposal.proposal_id,
+                            relation=RelationType.PROVES,
+                            target_id=derivation.conclusion_claim_id,
+                        ),
+                        *(
+                            GraphEdge(
+                                source_id=proposal.proposal_id,
+                                relation=RelationType.DEPENDS_ON,
+                                target_id=item,
+                            )
+                            for item in derivation.premise_claim_ids
+                        ),
+                        GraphEdge(
+                            source_id=proposal.proposal_id,
+                            relation=RelationType.RELATED_TO,
+                            target_id=proof_attempt_id,
+                        ),
+                        *(
+                            GraphEdge(
+                                source_id=proposal.proposal_id,
+                                relation=RelationType.RELATED_TO,
+                                target_id=item,
+                            )
+                            for item in proposal.supporting_archive_node_ids
+                        ),
+                    ],
+                    source_artifacts=[f"legacy-migration-plan:{plan_sha256}"],
+                    metadata={
+                        "matek_conclusion_claim_id": derivation.conclusion_claim_id,
+                        "matek_premise_claim_ids": derivation.premise_claim_ids,
+                        "matek_proof_attempt_id": proof_attempt_id,
+                        "matek_exact_target_version": derivation.exact_target_version,
+                        "matek_premise_versions": [
+                            f"{item}={derivation.premise_versions[item]}"
+                            for item in derivation.premise_claim_ids
+                        ],
+                        "matek_obligation_ids": [],
+                        "matek_legacy_archive_proof_id": derivation.proof_attempt_id,
+                        "matek_legacy_migration_plan_sha256": plan_sha256,
+                    },
+                )
+                by_id[proposal.proposal_id] = derivation_node
+                changed.add(proposal.proposal_id)
+
+            for group in report.claim_alias_groups:
+                if group.disposition != "ready_for_review":
+                    continue
+                canonical = by_id.get(group.canonical_candidate_id)
+                aliases = [by_id.get(item) for item in group.alias_ids]
+                if (
+                    canonical is None
+                    or canonical.node_type is not NodeType.CLAIM
+                    or any(item is None or item.node_type is not NodeType.CLAIM for item in aliases)
+                ):
+                    raise LegacyMigrationError("reviewed claim alias group is no longer resolvable")
+                if logical_version(exact_statement(canonical.body)) != group.logical_version or any(
+                    logical_version(exact_statement(item.body)) != group.logical_version
+                    for item in aliases
+                    if item is not None
+                ):
+                    raise LegacyMigrationError("reviewed claim alias group changed exact statement")
+                canonical.metadata["matek_claim_alias_ids"] = sorted(group.alias_ids)
+                canonical.metadata["matek_legacy_migration_plan_sha256"] = plan_sha256
+                canonical.updated_at = now
+                canonical.last_modified_run = run_id
+                canonical.author_role = "matek-legacy-migrator"
+                changed.add(canonical.matek_id)
+                for alias in aliases:
+                    if alias is None:  # pragma: no cover - guarded above for type narrowing
+                        continue
+                    alias.metadata["matek_alias_of"] = canonical.matek_id
+                    alias.metadata["matek_legacy_migration_plan_sha256"] = plan_sha256
+                    alias.relations = _unique_edges(
+                        [
+                            *alias.relations,
+                            GraphEdge(
+                                source_id=alias.matek_id,
+                                relation=RelationType.EQUIVALENT_TO,
+                                target_id=canonical.matek_id,
+                            ),
+                        ]
+                    )
+                    alias.updated_at = now
+                    alias.last_modified_run = run_id
+                    alias.author_role = "matek-legacy-migrator"
+                    changed.add(alias.matek_id)
+
+            for quarantine in report.refutation_quarantines:
+                refutation = by_id.get(quarantine.refutation_node_id)
+                if refutation is None or refutation.node_type is not NodeType.COUNTEREXAMPLE:
+                    raise LegacyMigrationError(
+                        f"reviewed refutation node is unavailable: {quarantine.refutation_node_id}"
+                    )
+                refutation.relations = [
+                    edge
+                    for edge in refutation.relations
+                    if not (
+                        edge.relation is RelationType.REFUTES
+                        and edge.target_id == quarantine.main_target_id
+                    )
+                ]
+                if len(quarantine.candidate_branch_target_ids) == 1:
+                    branch_target = quarantine.candidate_branch_target_ids[0]
+                    approach = by_id.get(branch_target)
+                    if approach is None or approach.node_type is not NodeType.APPROACH:
+                        raise LegacyMigrationError(
+                            f"reviewed refutation retarget is unavailable: {branch_target}"
+                        )
+                    refutation.relations = _unique_edges(
+                        [
+                            *refutation.relations,
+                            GraphEdge(
+                                source_id=refutation.matek_id,
+                                relation=RelationType.REFUTES,
+                                target_id=branch_target,
+                            ),
+                        ]
+                    )
+                refutation.metadata["matek_quarantined_main_refutation"] = quarantine.main_target_id
+                refutation.metadata["matek_quarantine_reason"] = quarantine.reason
+                refutation.metadata["matek_legacy_migration_plan_sha256"] = plan_sha256
+                refutation.tags = list(
+                    dict.fromkeys([*refutation.tags, "matek/quarantined-refutation"])
+                )
+                refutation.updated_at = now
+                refutation.last_modified_run = run_id
+                refutation.author_role = "matek-legacy-migrator"
+                changed.add(refutation.matek_id)
+
+            for nomination, task_id in zip(report.audit_nominations, audit_task_ids, strict=True):
+                derivation_id = proposal_by_proof.get(nomination.proof_node_id)
+                if derivation_id is None:
+                    raise LegacyMigrationError(
+                        f"audit nomination for {nomination.claim_id} lacks a proposed derivation"
+                    )
+                if task_id in by_id:
+                    raise LegacyMigrationError(
+                        f"deterministic audit task ID collides with archive node: {task_id}"
+                    )
+                task = GraphNode(
+                    matek_id=task_id,
+                    node_type=NodeType.TASK,
+                    problem_id=report.problem_id,
+                    title=f"Fresh audit of legacy result {nomination.claim_id}",
+                    epistemic_status=EpistemicStatus.OPEN,
+                    workflow_status=WorkflowStatus.QUEUED,
+                    created_in_run=run_id,
+                    last_modified_run=run_id,
+                    author_role="matek-legacy-migrator",
+                    created_at=now,
+                    updated_at=now,
+                    body=new_generated_body(
+                        f"Fresh audit of legacy result {nomination.claim_id}",
+                        "## Exact statement\n\n"
+                        + nomination.exact_statement
+                        + "\n\n## Required independent lanes\n\n"
+                        "- verifier\n- falsifier\n\n"
+                        "## Admission rule\n\nBoth fresh blinded lanes must pass before promotion.",
+                    ),
+                    tags=["matek/task", "matek/audit-nomination", "matek/legacy-backfill"],
+                    relations=[
+                        GraphEdge(
+                            source_id=task_id,
+                            relation=RelationType.TARGETS,
+                            target_id=nomination.claim_id,
+                        ),
+                        GraphEdge(
+                            source_id=task_id,
+                            relation=RelationType.TARGETS,
+                            target_id=derivation_id,
+                        ),
+                    ],
+                    source_artifacts=[f"legacy-migration-plan:{plan_sha256}"],
+                    metadata={
+                        "matek_audit_lanes": list(nomination.independent_lanes),
+                        "matek_audit_status": "queued",
+                        "matek_legacy_proof_node_id": nomination.proof_node_id,
+                        "matek_logical_version": nomination.logical_version,
+                        "matek_strength_score": nomination.strength_score,
+                        "matek_legacy_migration_plan_sha256": plan_sha256,
+                    },
+                )
+                by_id[task_id] = task
+                changed.add(task_id)
+
+            relation_issues = [
+                issue
+                for node_id in sorted(changed)
+                for edge in by_id[node_id].relations
+                for issue in [
+                    (
+                        f"edge target does not exist: {edge.target_id}"
+                        if edge.target_id not in by_id
+                        else self._relation_issue(edge, by_id)
+                    )
+                ]
+                if issue is not None
+            ]
+            cycle = self._dependency_cycle(list(by_id.values()))
+            if cycle is not None:
+                relation_issues.append(
+                    "legacy migration creates dependency cycle: " + " -> ".join(cycle)
+                )
+            if relation_issues:
+                raise LegacyMigrationError("; ".join(relation_issues))
+
+            result = self._commit_nodes_unlocked(
+                state=state,
+                all_nodes=list(by_id.values()),
+                changed_node_ids=sorted(changed),
+                run_id=run_id,
+                author="matek-legacy-migrator",
+                reason="Apply an explicitly reviewed integrity-bound legacy graph migration.",
+                operation_id=operation_id,
+                source_artifacts=[f"legacy-migration-plan:{plan_sha256}"],
+            )
+            record = application_record(result, applied_at=now, status="applied")
+            write_legacy_migration_application(
+                record_path,
+                record,
+                confinement_root=self.ledgers_root,
+            )
+            return record
 
     def _node_path(self, node: GraphNode, state: GraphState) -> str:
         # A parsed node path is authoritative for an allowed human rename. Stable
@@ -578,6 +1868,7 @@ class KnowledgeGraph:
         stale_node_ids: Sequence[str] = (),
         path_overrides: Mapping[str, str] | None = None,
         removed_paths: Sequence[str] = (),
+        additional_writes: Mapping[str, str] | None = None,
     ) -> GraphMergeResult:
         if operation_id in state.processed_operations:
             previous = state.processed_operations[operation_id]
@@ -623,8 +1914,21 @@ class KnowledgeGraph:
                 if any(edge.target_id in changed_path_ids for edge in source.relations):
                     changed.append(source.matek_id)
                     planned_paths[source.matek_id] = self._node_path(source, state)
+        extra_writes = dict(additional_writes or {})
+        for relative in extra_writes:
+            requested = Path(relative)
+            if requested.is_absolute() or requested.as_posix() != relative:
+                raise GraphValidationError(
+                    f"graph transaction has an invalid additional write path: {relative!r}"
+                )
+            ensure_path_confined(self.vault_root, self.vault_root / relative)
+        duplicate_writes = sorted(set(planned_paths.values()).intersection(extra_writes))
+        if duplicate_writes:
+            raise GraphValidationError(
+                "graph transaction writes a path more than once: " + ", ".join(duplicate_writes)
+            )
         removals = list(dict.fromkeys(automatic_removals))
-        written_paths = set(planned_paths.values())
+        written_paths = {*planned_paths.values(), *extra_writes}
         overlapping = sorted(written_paths.intersection(removals))
         if overlapping:
             raise GraphValidationError(
@@ -654,6 +1958,14 @@ class KnowledgeGraph:
             next_machine[node_id] = machine_hash(node)
             next_statements[node_id] = statement_hash(node)
             writes.append({"path": relative, "contents": contents, "sha256": digest})
+        for relative, contents in sorted(extra_writes.items()):
+            writes.append(
+                {
+                    "path": relative,
+                    "contents": contents,
+                    "sha256": sha256_text(contents),
+                }
+            )
         # A human may rename an unchanged note. Preserve the discovered location in state.
         for node in nodes.values():
             if node.path and node.node_type is not NodeType.HUMAN_NOTE:
@@ -721,49 +2033,81 @@ class KnowledgeGraph:
         atomic_write_json(self.state_path, next_state, confinement_root=self.graph_root)
         committed_nodes = list(nodes.values())
         self._write_snapshot_unlocked(next_state, committed_nodes)
+        self._canonical_ledgers_unlocked(next_state, committed_nodes, persist=True)
         self._write_navigation_unlocked(next_state, committed_nodes)
         self._rebuild_index_unlocked(next_state, committed_nodes)
         self.pending_path.unlink(missing_ok=True)
         return result
 
     def _write_snapshot_unlocked(self, state: GraphState, nodes: Sequence[GraphNode]) -> None:
-        path = ensure_path_confined(
-            self.snapshots_root, self.snapshots_root / f"{state.revision}.json"
-        )
-        if path.is_file():
-            return
-        payload = {
-            "schema_version": 1,
-            "revision": state.revision,
-            "created_at": state.updated_at.isoformat(),
-            "node_hashes": dict(sorted(state.node_hashes.items())),
-            "nodes": [
-                node.model_dump(mode="json")
-                for node in sorted(nodes, key=lambda item: item.matek_id)
-                if node.node_type is not NodeType.HUMAN_NOTE or node.matek_id in state.node_paths
-            ],
-            "edges": [
-                edge.model_dump(mode="json")
-                for edge in _unique_edges(edge for node in nodes for edge in node.relations)
-            ],
-        }
-        atomic_write_json(path, payload, confinement_root=self.snapshots_root)
+        if state.revision_number == 0:
+            previous_revision = None
+        else:
+            change = next(
+                (item for item in reversed(state.changes) if item.revision == state.revision),
+                None,
+            )
+            if change is None:
+                raise GraphValidationError(
+                    f"graph revision {state.revision} has no parent change record"
+                )
+            previous_revision = change.previous_revision
+        selected = [
+            node
+            for node in nodes
+            if node.node_type is not NodeType.HUMAN_NOTE or node.matek_id in state.node_paths
+        ]
+        try:
+            self.snapshot_store.write_revision(
+                revision=state.revision,
+                revision_number=state.revision_number,
+                created_at=state.updated_at.isoformat(),
+                nodes=selected,
+                previous_revision=previous_revision,
+            )
+        except (GraphMarkdownError, SnapshotIntegrityError) as exc:
+            raise GraphValidationError(
+                f"cannot persist graph revision snapshot {state.revision}: {exc}"
+            ) from exc
 
     def _snapshot_unlocked(self, revision: str) -> dict[str, Any]:
         if not _REVISION.fullmatch(revision):
             raise GraphValidationError(f"invalid graph revision: {revision!r}")
-        path = ensure_path_confined(self.snapshots_root, self.snapshots_root / f"{revision}.json")
-        if not path.is_file():
-            raise GraphValidationError(f"graph revision snapshot does not exist: {revision}")
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise GraphValidationError(f"graph revision snapshot is invalid: {revision}") from exc
-        if not isinstance(value, dict) or value.get("revision") != revision:
+            return self.snapshot_store.load_snapshot(revision)
+        except SnapshotIntegrityError as exc:
             raise GraphValidationError(
-                f"graph revision snapshot has inconsistent identity: {revision}"
-            )
-        return value
+                f"graph revision snapshot is invalid: {revision}: {exc}"
+            ) from exc
+
+    def reconstruct_snapshot(self, revision: str) -> bytes:
+        """Reconstruct a deterministic full snapshot, preserving legacy bytes exactly."""
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            self._load_state_unlocked()
+            try:
+                return self.snapshot_store.reconstruct_bytes(revision)
+            except ValueError as exc:
+                raise GraphValidationError(
+                    f"cannot reconstruct graph revision snapshot {revision}: {exc}"
+                ) from exc
+
+    def verify_snapshots(self, revision: str | None = None) -> list[GraphSnapshotVerification]:
+        """Verify one revision or the graph's complete immutable snapshot history."""
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            self._load_state_unlocked()
+            try:
+                if revision is not None:
+                    return [self.snapshot_store.verify_revision(revision)]
+                return self.snapshot_store.verify_all()
+            except ValueError as exc:
+                target = revision or "history"
+                raise GraphValidationError(
+                    f"graph snapshot integrity verification failed for {target}: {exc}"
+                ) from exc
 
     def _rebuild_index_unlocked(
         self, state: GraphState, nodes: Sequence[GraphNode] | None = None
@@ -892,6 +2236,7 @@ class KnowledgeGraph:
             state = self._load_state_unlocked()
             nodes = self._load_nodes_unlocked(include_human_notes=True)
             state, nodes = self._migrate_legacy_paths_unlocked(state, nodes)
+            self._canonical_ledgers_unlocked(state, nodes, persist=True)
             self._write_navigation_unlocked(state, nodes)
             return self._rebuild_index_unlocked(state, nodes)
 
@@ -900,16 +2245,40 @@ class KnowledgeGraph:
         source = by_id[edge.source_id]
         target = by_id[edge.target_id]
         allowed: dict[RelationType, tuple[set[NodeType] | None, set[NodeType] | None]] = {
-            RelationType.PROVES: ({NodeType.PROOF}, {NodeType.CLAIM}),
-            RelationType.DISPROVES: ({NodeType.PROOF}, {NodeType.CLAIM}),
-            RelationType.AUDITS: ({NodeType.AUDIT}, {NodeType.PROOF, NodeType.CLAIM}),
+            RelationType.PROVES: ({NodeType.PROOF, NodeType.DERIVATION}, {NodeType.CLAIM}),
+            RelationType.DISPROVES: (
+                {NodeType.PROOF, NodeType.DERIVATION},
+                {NodeType.CLAIM},
+            ),
+            RelationType.AUDITS: (
+                {
+                    NodeType.AUDIT,
+                },
+                {
+                    NodeType.PROOF,
+                    NodeType.PROOF_ATTEMPT,
+                    NodeType.DERIVATION,
+                    NodeType.CLAIM,
+                },
+            ),
             RelationType.DEPENDS_ON: (
-                {NodeType.CLAIM, NodeType.DEFINITION, NodeType.PROOF},
-                {NodeType.CLAIM, NodeType.DEFINITION},
+                {
+                    NodeType.CLAIM,
+                    NodeType.DEFINITION,
+                    NodeType.PROOF,
+                    NodeType.PROOF_ATTEMPT,
+                    NodeType.DERIVATION,
+                    NodeType.OBLIGATION,
+                    NodeType.COUNTEREXAMPLE,
+                },
+                {NodeType.CLAIM, NodeType.DEFINITION, NodeType.OBLIGATION},
             ),
             RelationType.FORMALIZES: ({NodeType.FORMALIZATION}, {NodeType.CLAIM}),
-            RelationType.REFUTES: ({NodeType.COUNTEREXAMPLE}, {NodeType.CLAIM}),
-            RelationType.TARGETS: ({NodeType.TASK}, None),
+            RelationType.REFUTES: (
+                {NodeType.COUNTEREXAMPLE},
+                {NodeType.CLAIM, NodeType.APPROACH},
+            ),
+            RelationType.TARGETS: ({NodeType.TASK, NodeType.OBLIGATION}, None),
             RelationType.CITES: (None, {NodeType.SOURCE}),
             RelationType.CREATED_DURING: (None, {NodeType.RUN}),
         }
@@ -1078,6 +2447,19 @@ class KnowledgeGraph:
                     message="mathematical dependency cycle: " + " -> ".join(cycle),
                 )
             )
+        try:
+            snapshot = self._snapshot_unlocked(state.revision)
+            snapshot_hashes = snapshot.get("node_hashes")
+            if snapshot_hashes != dict(sorted(state.node_hashes.items())):
+                raise GraphValidationError("current snapshot node hashes do not match graph state")
+        except GraphValidationError as exc:
+            issues.append(
+                GraphValidationIssue(
+                    severity="error",
+                    code="snapshot_integrity",
+                    message=str(exc),
+                )
+            )
         if self.index_path.is_file():
             try:
                 connection = sqlite3.connect(f"file:{self.index_path}?mode=ro", uri=True)
@@ -1141,6 +2523,102 @@ class KnowledgeGraph:
                 )
             return self._validate_unlocked(state, nodes)
 
+    def _canonical_ledgers_unlocked(
+        self,
+        state: GraphState,
+        nodes: Sequence[GraphNode],
+        *,
+        persist: bool,
+    ) -> dict[str, CanonicalLedger]:
+        """Project the proof ledger without guessing through ambiguous legacy evidence."""
+
+        ledgers: dict[str, CanonicalLedger] = {}
+        problem_ids = sorted(node.matek_id for node in nodes if node.node_type is NodeType.PROBLEM)
+        for problem_id in problem_ids:
+            target_id = self.main_claim_id(problem_id)
+            if not any(node.matek_id == target_id for node in nodes):
+                continue
+            try:
+                ledger = project_markdown_ledger(
+                    nodes,
+                    graph_revision=state.revision,
+                    problem_id=problem_id,
+                    target_claim_id=target_id,
+                )
+                migration_error: str | None = None
+            except (LedgerError, ValueError) as exc:
+                # Old pairwise/prose graphs remain a searchable archive.  Build a safe
+                # claims-only ledger and report the ambiguity instead of manufacturing
+                # mathematical support or preventing graph recovery.
+                claims: dict[str, LedgerClaim] = {}
+                for node in nodes:
+                    if (
+                        node.problem_id != problem_id
+                        or node.node_type is not NodeType.CLAIM
+                        or node.tombstone
+                    ):
+                        continue
+                    statement = exact_statement(node.body)
+                    if not statement:
+                        continue
+                    status = {
+                        EpistemicStatus.AUDIT_PASSED: LedgerClaimStatus.AUDIT_PASSED,
+                        EpistemicStatus.LEAN_VERIFIED: LedgerClaimStatus.LEAN_VERIFIED,
+                        EpistemicStatus.REFUTED: LedgerClaimStatus.REFUTED,
+                        EpistemicStatus.STALE: LedgerClaimStatus.STALE,
+                        EpistemicStatus.CANDIDATE: LedgerClaimStatus.PROPOSED,
+                        EpistemicStatus.PROVED_INFORMALLY: LedgerClaimStatus.PROPOSED,
+                    }.get(node.epistemic_status, LedgerClaimStatus.OPEN)
+                    claims[node.matek_id] = LedgerClaim(
+                        claim_id=node.matek_id,
+                        exact_statement=statement,
+                        logical_version=logical_version(statement),
+                        scope=(
+                            ScientificScope.MAIN
+                            if node.matek_id == target_id
+                            else ScientificScope.BRANCH
+                        ),
+                        status=status,
+                        source_node_id=node.matek_id,
+                    )
+                if target_id not in claims:
+                    raise GraphValidationError(
+                        f"main target {target_id} has no exact statement for ledger projection"
+                    ) from exc
+                migration_error = str(exc)
+                ledger = CanonicalLedger(
+                    graph_revision=state.revision,
+                    problem_id=problem_id,
+                    target_claim_id=target_id,
+                    claims=claims,
+                    ambiguities=[
+                        LedgerAmbiguity(
+                            source_node_id=target_id,
+                            code="legacy_projection_ambiguous",
+                            detail=migration_error,
+                        )
+                    ],
+                )
+            ledgers[problem_id] = ledger
+            if persist:
+                ledger_dir = ensure_path_confined(self.graph_root, self.ledgers_root / problem_id)
+                ledger_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                write_canonical_ledger(ledger_dir / "canonical-ledger.json", ledger)
+                if migration_error is not None:
+                    atomic_write_json(
+                        ledger_dir / "migration-report.json",
+                        {
+                            "schema_version": 1,
+                            "graph_revision": state.revision,
+                            "problem_id": problem_id,
+                            "status": "ambiguous_legacy_evidence",
+                            "issues": [migration_error],
+                            "invented_support": False,
+                        },
+                        confinement_root=ledger_dir,
+                    )
+        return ledgers
+
     def _render_dashboard(self, title: str, nodes: Sequence[GraphNode], *, description: str) -> str:
         lines = [f"# {title}", "", GENERATED_START, description, ""]
         if nodes:
@@ -1154,6 +2632,12 @@ class KnowledgeGraph:
         by_problem: dict[str, list[GraphNode]] = defaultdict(list)
         for node in nodes:
             by_problem[node.problem_id].append(node)
+        ledgers = self._canonical_ledgers_unlocked(state, nodes, persist=False)
+        trusted_ledger_claim_ids: set[str] = set()
+        open_cut_ids: set[str] = set()
+        for ledger in ledgers.values():
+            trusted_ledger_claim_ids.update(trusted_claim_ids(ledger))
+            open_cut_ids.update(smallest_known_open_cut(ledger).obligation_ids)
         problems = sorted(
             (node for node in nodes if node.node_type is NodeType.PROBLEM),
             key=lambda item: item.title.casefold(),
@@ -1161,20 +2645,16 @@ class KnowledgeGraph:
         established = [
             node
             for node in nodes
-            if node.node_type is NodeType.CLAIM
-            and node.epistemic_status
-            in {
-                EpistemicStatus.PROVED_INFORMALLY,
-                EpistemicStatus.AUDIT_PASSED,
-                EpistemicStatus.LEAN_VERIFIED,
-            }
+            if node.node_type is NodeType.CLAIM and node.matek_id in trusted_ledger_claim_ids
         ]
         obligations = [
             node
             for node in nodes
-            if node.node_type is NodeType.CLAIM
-            and node.epistemic_status
-            in {EpistemicStatus.OPEN, EpistemicStatus.CONJECTURED, EpistemicStatus.CANDIDATE}
+            if (
+                node.node_type is NodeType.OBLIGATION
+                and node.workflow_status is not WorkflowStatus.COMPLETE
+            )
+            or node.matek_id in open_cut_ids
         ]
         active_tasks = [
             node
@@ -1202,7 +2682,16 @@ class KnowledgeGraph:
             reverse=True,
         )[:12]
         formalizations = [node for node in nodes if node.node_type is NodeType.FORMALIZATION]
-        main_result_needs = [node for node in nodes if MAIN_RESULT_NEEDS_TAG in node.tags]
+        accepted_main_result_needs = [node for node in nodes if MAIN_RESULT_NEEDS_TAG in node.tags]
+        main_result_needs = accepted_main_result_needs or [
+            node
+            for node in nodes
+            if node.matek_id in open_cut_ids
+            or (
+                node.node_type is NodeType.CLAIM
+                and node.matek_id == self.main_claim_id(node.problem_id)
+            )
+        ]
         home_generated: list[str] = [
             "## Exact main problem",
             "",
@@ -1277,9 +2766,11 @@ class KnowledgeGraph:
         candidate_proofs = [
             node
             for node in nodes
-            if node.node_type is NodeType.PROOF
+            if node.node_type in {NodeType.PROOF, NodeType.DERIVATION}
             and node.epistemic_status
             in {EpistemicStatus.CANDIDATE, EpistemicStatus.PROVED_INFORMALLY}
+            and node.workflow_status is not WorkflowStatus.BLOCKED
+            and not bool(node.metadata.get("matek_exact_gap"))
         ]
         audit_passed = [
             node for node in nodes if node.epistemic_status is EpistemicStatus.AUDIT_PASSED
@@ -1340,7 +2831,8 @@ class KnowledgeGraph:
                 unverified_sources,
             ),
             "Main Result Needs": (
-                "The proof, claims, definitions, and sources used by the accepted main result.",
+                "The immutable target and smallest known open cut; after acceptance, the "
+                "audited support closure.",
                 main_result_needs,
             ),
             "Recent Changes": (
@@ -1360,15 +2852,34 @@ class KnowledgeGraph:
     def _write_canvases_unlocked(self, nodes: Sequence[GraphNode]) -> None:
         specifications: dict[str, tuple[set[NodeType], set[RelationType]]] = {
             "Main Proof Architecture": (
-                {NodeType.CLAIM, NodeType.PROOF, NodeType.DEFINITION, NodeType.SOURCE},
-                {RelationType.DEPENDS_ON, RelationType.PROVES, RelationType.CITES},
+                {
+                    NodeType.CLAIM,
+                    NodeType.PROOF,
+                    NodeType.DERIVATION,
+                    NodeType.OBLIGATION,
+                    NodeType.DEFINITION,
+                    NodeType.SOURCE,
+                },
+                {
+                    RelationType.DEPENDS_ON,
+                    RelationType.PROVES,
+                    RelationType.BLOCKS,
+                    RelationType.BLOCKED_BY,
+                    RelationType.CITES,
+                },
             ),
             "Active Research Routes": (
                 {NodeType.APPROACH, NodeType.TASK, NodeType.CLAIM},
                 {RelationType.TARGETS, RelationType.MOTIVATES, RelationType.RELATED_TO},
             ),
             "Dependency Bottlenecks": (
-                {NodeType.CLAIM, NodeType.DEFINITION, NodeType.COUNTEREXAMPLE},
+                {
+                    NodeType.CLAIM,
+                    NodeType.OBLIGATION,
+                    NodeType.DERIVATION,
+                    NodeType.DEFINITION,
+                    NodeType.COUNTEREXAMPLE,
+                },
                 {RelationType.DEPENDS_ON, RelationType.BLOCKED_BY, RelationType.REFUTES},
             ),
             "Formalization Map": (
@@ -1477,10 +2988,14 @@ class KnowledgeGraph:
         self, state: GraphState, nodes: Sequence[GraphNode], problem_id: str
     ) -> GraphFrontier:
         selected = [node for node in nodes if node.problem_id == problem_id]
+        by_id = {node.matek_id: node for node in selected}
+        ledger = self._canonical_ledgers_unlocked(state, nodes, persist=False).get(problem_id)
+        trusted_ids = trusted_claim_ids(ledger) if ledger is not None else set()
+        cut = smallest_known_open_cut(ledger) if ledger is not None else None
         proof_targets = {
             edge.target_id
             for node in selected
-            if node.node_type is NodeType.PROOF
+            if node.node_type in {NodeType.PROOF, NodeType.DERIVATION}
             and node.epistemic_status
             in {EpistemicStatus.CANDIDATE, EpistemicStatus.PROVED_INFORMALLY}
             for edge in node.relations
@@ -1520,9 +3035,11 @@ class KnowledgeGraph:
         candidate_proofs = [
             node
             for node in selected
-            if node.node_type is NodeType.PROOF
+            if node.node_type in {NodeType.PROOF, NodeType.DERIVATION}
             and node.epistemic_status
             in {EpistemicStatus.CANDIDATE, EpistemicStatus.PROVED_INFORMALLY}
+            and node.workflow_status is not WorkflowStatus.BLOCKED
+            and not bool(node.metadata.get("matek_exact_gap"))
             and node.matek_id not in audited_targets
             and any(
                 edge.relation is RelationType.PROVES and edge.target_id in proof_targets
@@ -1532,6 +3049,39 @@ class KnowledgeGraph:
         return GraphFrontier(
             problem_id=problem_id,
             graph_revision=state.revision,
+            main_target=(
+                _node_summary(by_id[self.main_claim_id(problem_id)])
+                if self.main_claim_id(problem_id) in by_id
+                else None
+            ),
+            live_derivations=[
+                _node_summary(node)
+                for node in selected
+                if node.node_type is NodeType.DERIVATION
+                and node.epistemic_status
+                not in {
+                    EpistemicStatus.REFUTED,
+                    EpistemicStatus.INCONSISTENT,
+                    EpistemicStatus.STALE,
+                }
+            ],
+            strongest_audited_results=[
+                _node_summary(node)
+                for node in selected
+                if node.node_type is NodeType.CLAIM and node.matek_id in trusted_ids
+            ],
+            open_obligations=[
+                _node_summary(node)
+                for node in selected
+                if node.node_type is NodeType.OBLIGATION
+                and node.workflow_status is not WorkflowStatus.COMPLETE
+            ],
+            smallest_known_open_cut=[
+                _node_summary(by_id[node_id])
+                for node_id in (cut.obligation_ids if cut is not None else [])
+                if node_id in by_id
+            ],
+            open_cut_search_capped=cut.search_capped if cut is not None else False,
             unresolved_claims=[_node_summary(node) for node in unresolved_claims],
             candidate_proofs_awaiting_audit=[_node_summary(node) for node in candidate_proofs],
             blocked_approaches=[
@@ -1579,7 +3129,14 @@ class KnowledgeGraph:
                         WorkflowStatus.DORMANT,
                     }
                 )
-                and node.node_type in {NodeType.APPROACH, NodeType.CLAIM, NodeType.PROOF}
+                and node.node_type
+                in {
+                    NodeType.APPROACH,
+                    NodeType.CLAIM,
+                    NodeType.PROOF,
+                    NodeType.PROOF_ATTEMPT,
+                    NodeType.DERIVATION,
+                }
             ],
             unverified_sources=[
                 _node_summary(node)
@@ -1905,6 +3462,46 @@ class KnowledgeGraph:
     def _propagate_staleness(
         nodes: dict[str, GraphNode], seeds: Sequence[str], reason: str
     ) -> list[str]:
+        def has_live_audited_derivation(claim_id: str, *, excluding: str) -> bool:
+            claim = nodes.get(claim_id)
+            if claim is None or claim.node_type is not NodeType.CLAIM:
+                return False
+            # Reuse the canonical ledger rather than treating every non-refuted premise as
+            # trusted.  The transient projection excludes the invalidated route and every
+            # already-invalidated node, then applies exact-version, AND-premise, obligation,
+            # and alternative-route rules deterministically.
+            current_nodes = [
+                node
+                for node in nodes.values()
+                if node.matek_id != excluding
+                and not node.tombstone
+                and not node.invalidation_reasons
+            ]
+            try:
+                ledger = project_markdown_ledger(
+                    current_nodes,
+                    graph_revision="staleness-projection",
+                    problem_id=claim.problem_id,
+                    target_claim_id=claim_id,
+                )
+            except (LedgerError, ValueError):
+                return False
+            trusted = trusted_claim_ids(ledger)
+            for derivation in ledger.derivations.values():
+                if derivation.conclusion_claim_id != claim_id:
+                    continue
+                if derivation.status is not DerivationStatus.AUDIT_PASSED:
+                    continue
+                if not set(derivation.premise_claim_ids).issubset(trusted):
+                    continue
+                if any(
+                    ledger.obligations[obligation_id].status is not ObligationStatus.RESOLVED
+                    for obligation_id in derivation.obligation_ids
+                ):
+                    continue
+                return True
+            return False
+
         changed: list[str] = []
         queue: deque[str] = deque(seeds)
         visited = set(seeds)
@@ -1915,6 +3512,15 @@ class KnowledgeGraph:
                 continue
             affected: set[str] = set()
             for node in nodes.values():
+                if (
+                    changed_node.node_type is NodeType.PROOF_ATTEMPT
+                    and node.node_type is NodeType.DERIVATION
+                    and node.metadata.get("matek_proof_attempt_id") == changed_id
+                ):
+                    # The canonical derivation stores its proof evidence in a separate PAT
+                    # node. RELATED_TO remains intentionally non-causal in general, so follow
+                    # only this application-owned, typed identity link for invalidation.
+                    affected.add(node.matek_id)
                 for edge in node.relations:
                     if edge.relation is RelationType.DEPENDS_ON and edge.target_id == changed_id:
                         affected.add(edge.source_id)
@@ -1929,9 +3535,18 @@ class KnowledgeGraph:
                             affected.add(edge.source_id)
             for node_id in sorted(affected):
                 node = nodes[node_id]
+                if (
+                    node.node_type is NodeType.CLAIM
+                    and changed_node.node_type in {NodeType.DERIVATION, NodeType.PROOF}
+                    and has_live_audited_derivation(node_id, excluding=changed_node.matek_id)
+                ):
+                    continue
                 if node.node_type in {
                     NodeType.CLAIM,
                     NodeType.PROOF,
+                    NodeType.PROOF_ATTEMPT,
+                    NodeType.DERIVATION,
+                    NodeType.OBLIGATION,
                     NodeType.AUDIT,
                     NodeType.FORMALIZATION,
                 }:
@@ -1977,6 +3592,12 @@ class KnowledgeGraph:
                     and node.node_type is NodeType.CLAIM
                     and (statement_hash(node) != state.statement_hashes.get(node_id, ""))
                 ):
+                    if node_id == self.main_claim_id(node.problem_id):
+                        conflicts.append(
+                            f"immutable main target {node_id} was edited; use an explicit "
+                            "target migration"
+                        )
+                        continue
                     node.statement_version += 1
                     node.epistemic_status = EpistemicStatus.STALE
                     node.invalidation_reasons = list(
@@ -1990,7 +3611,10 @@ class KnowledgeGraph:
                             by_id, [node_id], "dependency_changed_requires_reaudit"
                         )
                     )
-                elif content_changed and node.node_type is NodeType.PROOF:
+                elif content_changed and node.node_type in {
+                    NodeType.PROOF,
+                    NodeType.PROOF_ATTEMPT,
+                }:
                     node.epistemic_status = EpistemicStatus.STALE
                     node.invalidation_reasons = list(
                         dict.fromkeys(
@@ -2077,6 +3701,9 @@ class KnowledgeGraph:
                     ),
                     tags=["matek/problem"],
                     source_artifacts=[f".matek/runs/{run_id}/input/problem.md"],
+                    metadata={
+                        "matek_normalized_source_sha256": sha256_text(problem_text),
+                    },
                 )
                 by_id[problem_id] = problem
                 changed.append(problem_id)
@@ -2087,6 +3714,13 @@ class KnowledgeGraph:
                         f"problem mapping {key!r} references missing node {problem_id}"
                     )
                 problem = existing_problem
+                normalized_source_sha256 = sha256_text(problem_text)
+                if (
+                    problem.metadata.get("matek_normalized_source_sha256")
+                    != normalized_source_sha256
+                ):
+                    problem.metadata["matek_normalized_source_sha256"] = normalized_source_sha256
+                    changed.append(problem_id)
                 current_problem = exact_statement(problem.body)
                 if problem_text.strip() not in current_problem:
                     problem.body = replace_generated_section(
@@ -2165,6 +3799,7 @@ class KnowledgeGraph:
         operation_id: str,
         source_artifacts: Sequence[str] = (),
         stale_node_ids: Sequence[str] = (),
+        additional_writes: Mapping[str, str] | None = None,
     ) -> GraphMergeResult:
         if operation_id in state.processed_operations:
             prior = state.processed_operations[operation_id]
@@ -2184,11 +3819,33 @@ class KnowledgeGraph:
                 nodes[incoming.matek_id] = incoming
                 changed.append(incoming.matek_id)
                 continue
-            # Preserve human prose outside the generated block and the stable creation record.
-            existing.title = incoming.title
-            existing.body = replace_generated_section(
-                existing.body, incoming.title, generated_section(incoming.body)
+            definition_merge = (
+                existing.node_type is NodeType.DEFINITION
+                or incoming.node_type is NodeType.DEFINITION
             )
+            if definition_merge:
+                if (
+                    existing.node_type is not NodeType.DEFINITION
+                    or incoming.node_type is not NodeType.DEFINITION
+                    or normalize_exact_statement(exact_statement(existing.body))
+                    != normalize_exact_statement(exact_statement(incoming.body))
+                ):
+                    raise GraphValidationError(
+                        f"canonical definition identity collision for {incoming.matek_id}"
+                    )
+                if canonical_definition_dependency_contract(
+                    existing
+                ) != canonical_definition_dependency_contract(incoming):
+                    raise GraphValidationError(
+                        f"canonical definition {incoming.matek_id} has an incompatible "
+                        "dependency contract"
+                    )
+            # Preserve human prose outside the generated block and the stable creation record.
+            if not definition_merge:
+                existing.title = incoming.title
+                existing.body = replace_generated_section(
+                    existing.body, incoming.title, generated_section(incoming.body)
+                )
             # A later workflow generation may refresh a deterministic note, but it
             # must never silently erase stronger evidence established in an earlier
             # run. Negative/invalidation states remain explicit and authoritative.
@@ -2211,7 +3868,11 @@ class KnowledgeGraph:
             existing.claim_type = incoming.claim_type
             existing.statement_version = max(existing.statement_version, incoming.statement_version)
             existing.last_modified_run = run_id
-            existing.author_role = author
+            # Preserve the typed producer identity carried by the proposed node.  In
+            # particular, replay/manifest ART nodes must not become generic
+            # ``research-worker`` records merely because an idempotent worker-report
+            # integration refreshed their deterministic notes.
+            existing.author_role = incoming.author_role
             existing.updated_at = incoming.updated_at
             existing.tags = list(dict.fromkeys([*existing.tags, *incoming.tags]))
             existing.relations = _unique_edges([*existing.relations, *incoming.relations])
@@ -2228,7 +3889,39 @@ class KnowledgeGraph:
             existing.manuscript_mappings = list(
                 dict.fromkeys([*existing.manuscript_mappings, *incoming.manuscript_mappings])
             )
-            existing.metadata.update(incoming.metadata)
+            if definition_merge:
+                raw_existing_bindings = existing.metadata.get("matek_admission_bindings")
+                existing_bindings = (
+                    [str(item) for item in raw_existing_bindings]
+                    if isinstance(raw_existing_bindings, list)
+                    else []
+                )
+                raw_incoming_bindings = incoming.metadata.get("matek_admission_bindings")
+                incoming_bindings = (
+                    [str(item) for item in raw_incoming_bindings]
+                    if isinstance(raw_incoming_bindings, list)
+                    else []
+                )
+                existing.metadata["matek_admission_bindings"] = sorted(
+                    set([*existing_bindings, *incoming_bindings])
+                )
+                raw_existing_targets = existing.metadata.get("matek_target_node_ids")
+                raw_incoming_targets = incoming.metadata.get("matek_target_node_ids")
+                existing_targets = (
+                    [str(item) for item in raw_existing_targets]
+                    if isinstance(raw_existing_targets, list)
+                    else []
+                )
+                incoming_targets = (
+                    [str(item) for item in raw_incoming_targets]
+                    if isinstance(raw_incoming_targets, list)
+                    else []
+                )
+                existing.metadata["matek_target_node_ids"] = sorted(
+                    set([*existing_targets, *incoming_targets])
+                )
+            else:
+                existing.metadata.update(incoming.metadata)
             changed.append(existing.matek_id)
         return self._commit_nodes_unlocked(
             state=state,
@@ -2240,6 +3933,7 @@ class KnowledgeGraph:
             operation_id=operation_id,
             source_artifacts=source_artifacts,
             stale_node_ids=stale_node_ids,
+            additional_writes=additional_writes,
         )
 
     @staticmethod
@@ -2394,6 +4088,15 @@ class KnowledgeGraph:
             }
             proposed_ids = [item.matek_id for item in patch.create_nodes if item.matek_id]
             conflicts: list[str] = []
+            immutable_target_id = self.main_claim_id(problem_id)
+            if any(update.matek_id == immutable_target_id for update in patch.update_nodes):
+                conflicts.append(
+                    "the main target is immutable outside an explicit target migration"
+                )
+            if any(
+                change.matek_id == immutable_target_id for change in patch.proposed_status_changes
+            ):
+                conflicts.append("worker graph patches cannot change the main target status")
             for node_id in touched:
                 current = by_id.get(node_id)
                 if current is None and node_id not in proposed_ids:
@@ -2688,14 +4391,39 @@ class KnowledgeGraph:
     def main_claim_id(problem_id: str) -> str:
         return _deterministic_id(NodeType.CLAIM, problem_id, "main-target")
 
+    def frozen_target_for_source(self, normalized_source_sha256: str) -> FrozenTarget:
+        """Return the immutable target bound to one normalized source problem.
+
+        Callers use this after :meth:`record_compiled_problem` so every downstream
+        stage receives the canonical theorem bytes rather than a fresh compiler
+        paraphrase.  Returning a deep copy keeps the registry itself immutable.
+        """
+
+        source_hash = normalized_source_sha256.strip().casefold()
+        with self._locked():
+            self._recover_pending_unlocked()
+            try:
+                registry = load_target_registry(self.target_registry_path)
+            except TargetRegistryError as exc:
+                raise GraphValidationError(f"cannot load the immutable main target: {exc}") from exc
+            target = registry.targets.get(source_hash)
+            if target is None:
+                raise GraphValidationError(
+                    f"no immutable main target is bound to normalized source hash {source_hash!r}"
+                )
+            return target.model_copy(deep=True)
+
     def record_compiled_problem(
         self,
         *,
         problem_id: str,
         run_id: str,
         compiled_problem: Mapping[str, Any],
+        normalized_source_sha256: str | None = None,
+        allow_target_migration: bool = False,
+        target_migration_reason: str | None = None,
     ) -> GraphMergeResult:
-        """Materialize the exact target, claim contract, and verified source ledger."""
+        """Freeze the exact target and materialize its canonical verified sources."""
 
         with self._locked():
             self._recover_pending_unlocked()
@@ -2707,17 +4435,77 @@ class KnowledgeGraph:
                 raise GraphValidationError(f"problem node does not exist: {problem_id}")
             now = self._now()
             title = str(compiled_problem.get("title") or problem.title).strip()
-            normalized_statement = str(
+            incoming_statement = str(
                 compiled_problem.get("normalized_statement") or generated_section(problem.body)
             ).strip()
-            raw_contract = compiled_problem.get("claim_contract", {})
-            contract = _canonical_json(raw_contract)
+            incoming_contract = compiled_problem.get("claim_contract", {})
+            incoming_prompt = str(compiled_problem.get("compiled_prompt") or "")
+            source_hash_value = normalized_source_sha256 or problem.metadata.get(
+                "matek_normalized_source_sha256"
+            )
+            source_hash = (
+                str(source_hash_value).strip().casefold()
+                if source_hash_value
+                else sha256_text(generated_section(problem.body))
+            )
+            target_id = self.main_claim_id(problem_id)
+            existing_target = by_id.get(target_id)
+            try:
+                target_registry = load_target_registry(self.target_registry_path)
+                if existing_target is not None and source_hash not in target_registry.targets:
+                    prior_contract_text = _generated_heading_value(
+                        existing_target.body, "Scope and conventions"
+                    )
+                    prior_contract: object = incoming_contract
+                    if prior_contract_text:
+                        try:
+                            prior_contract = json.loads(prior_contract_text)
+                        except json.JSONDecodeError:
+                            incoming_contract_hash = sha256_text(
+                                canonical_contract_json(incoming_contract)
+                            )
+                            recorded_contract_hash = existing_target.metadata.get(
+                                "matek_claim_contract_sha256"
+                            )
+                            if recorded_contract_hash != incoming_contract_hash:
+                                raise TargetRegistryError(
+                                    "legacy target contract cannot be reconstructed safely"
+                                ) from None
+                    target_registry, _ = bind_frozen_target(
+                        target_registry,
+                        normalized_source_sha256=source_hash,
+                        target_node_id=target_id,
+                        title=existing_target.title.removeprefix("Main target — "),
+                        exact_statement=exact_statement(existing_target.body),
+                        claim_contract=prior_contract,
+                        compiled_prompt=incoming_prompt,
+                        run_id=existing_target.created_in_run,
+                    )
+                target_registry, binding = bind_frozen_target(
+                    target_registry,
+                    normalized_source_sha256=source_hash,
+                    target_node_id=target_id,
+                    title=title,
+                    exact_statement=incoming_statement,
+                    claim_contract=incoming_contract,
+                    compiled_prompt=incoming_prompt,
+                    run_id=run_id,
+                    allow_material_migration=allow_target_migration,
+                    migration_reason=target_migration_reason,
+                )
+            except (TargetRegistryError, ValueError) as exc:
+                raise GraphValidationError(f"cannot bind the immutable main target: {exc}") from exc
+
+            frozen = binding.target
+            normalized_statement = frozen.exact_statement
+            raw_contract = json.loads(frozen.canonical_contract_json)
+            contract = frozen.canonical_contract_json
             literature_status = str(compiled_problem.get("literature_status", "unknown"))
             literature_summary = compiled_problem.get("literature_resolution_summary")
-            problem.title = title
+            problem.title = frozen.title
             problem.body = replace_generated_section(
                 problem.body,
-                title,
+                frozen.title,
                 "## Exact main problem\n\n"
                 + normalized_statement
                 + "\n\n## Claim contract\n\n```json\n"
@@ -2729,12 +4517,13 @@ class KnowledgeGraph:
             problem.last_modified_run = run_id
             problem.updated_at = now
             problem.metadata["matek_literature_status"] = literature_status
-            target_id = self.main_claim_id(problem_id)
+            problem.metadata["matek_normalized_source_sha256"] = source_hash
+            problem.metadata["matek_target_registry"] = "target-registry.json"
             target = GraphNode(
                 matek_id=target_id,
                 node_type=NodeType.CLAIM,
                 problem_id=problem_id,
-                title=f"Main target — {title}",
+                title=f"Main target — {frozen.title}",
                 epistemic_status=EpistemicStatus.CONJECTURED,
                 workflow_status=WorkflowStatus.ACTIVE,
                 claim_type=ClaimType.THEOREM,
@@ -2744,7 +4533,7 @@ class KnowledgeGraph:
                 created_at=now,
                 updated_at=now,
                 body=new_generated_body(
-                    f"Main target — {title}",
+                    f"Main target — {frozen.title}",
                     "## Exact statement\n\n"
                     + normalized_statement
                     + "\n\n## Scope and conventions\n\n"
@@ -2763,16 +4552,19 @@ class KnowledgeGraph:
                 source_artifacts=[
                     f".matek/runs/{run_id}/prompts/compiled_problem.json",
                     f".matek/runs/{run_id}/prompts/compiled_research_prompt.md",
+                    f".matek/knowledge/{self.graph_name}/target-registry.json",
                 ],
-                metadata={"matek_claim_contract_sha256": sha256_text(contract)},
+                metadata={
+                    "matek_claim_contract_sha256": frozen.contract_sha256,
+                    "matek_normalized_source_sha256": source_hash,
+                    "matek_target_semantic_sha256": target_semantic_fingerprint(frozen),
+                    "matek_target_registry_version": frozen.statement_version,
+                },
             )
-            existing_target = by_id.get(target_id)
             stale_nodes: list[str] = []
             if existing_target is not None:
-                prior_statement_hash = statement_hash(existing_target)
-                incoming_statement_hash = statement_hash(target)
-                if prior_statement_hash != incoming_statement_hash:
-                    target.statement_version = existing_target.statement_version + 1
+                target.statement_version = frozen.statement_version
+                if binding.disposition is TargetBindingDisposition.MIGRATED:
                     target.epistemic_status = EpistemicStatus.STALE
                     target.invalidation_reasons = ["statement_changed_requires_reaudit"]
                     stale_nodes = self._propagate_staleness(
@@ -2781,62 +4573,225 @@ class KnowledgeGraph:
                         "dependency_changed_requires_reaudit",
                     )
                 else:
-                    target.statement_version = existing_target.statement_version
+                    target.epistemic_status = existing_target.epistemic_status
+                    target.workflow_status = existing_target.workflow_status
+                    target.invalidation_reasons = list(existing_target.invalidation_reasons)
             proposed: list[GraphNode] = [problem, target]
             source_nodes: list[GraphNode] = []
+            source_entities: dict[str, Any] = {}
             raw_sources = compiled_problem.get("source_ledger", [])
             if isinstance(raw_sources, list):
                 for raw_source in raw_sources:
                     if not isinstance(raw_source, Mapping):
                         continue
-                    source_key = str(
-                        raw_source.get("source_id")
-                        or _canonical_json(raw_source.get("identifiers", []))
-                        or raw_source.get("title")
-                    )
-                    source_id = _deterministic_id(NodeType.SOURCE, problem_id, source_key)
                     identifiers = [
                         str(item) for item in raw_source.get("identifiers", []) if str(item).strip()
                     ]
+                    raw_authors = raw_source.get("authors", [])
+                    authors = (
+                        [str(item) for item in raw_authors if str(item).strip()]
+                        if isinstance(raw_authors, list)
+                        else []
+                    )
                     verified = bool(raw_source.get("verified", False))
+                    source_title = str(
+                        raw_source.get("title") or raw_source.get("source_id") or "Untitled source"
+                    ).strip()
+                    try:
+                        entity = make_source_entity(
+                            title=source_title,
+                            identifiers=identifiers,
+                            authors=authors,
+                            source_alias=(str(raw_source.get("source_id") or "").strip() or None),
+                            verification_provenance=[
+                                str(raw_source.get("verification_detail") or "").strip()
+                            ],
+                            verified=verified,
+                        )
+                    except (SourceCanonicalizationError, ValueError) as exc:
+                        raise GraphValidationError(
+                            f"compiled source ledger entry has invalid identity: {exc}"
+                        ) from exc
+                    previous_entity = source_entities.get(entity.source_key)
+                    source_entities[entity.source_key] = (
+                        merge_source_entities(previous_entity, entity)
+                        if previous_entity is not None
+                        else entity
+                    )
+
+                for source_key, entity in sorted(source_entities.items()):
+                    deterministic_source_id = _deterministic_id(
+                        NodeType.SOURCE,
+                        problem_id,
+                        source_key,
+                    )
+                    compatible_existing: list[tuple[GraphNode, CanonicalSourceEntity]] = []
+                    for candidate in by_id.values():
+                        if (
+                            candidate.node_type is not NodeType.SOURCE
+                            or candidate.problem_id != problem_id
+                        ):
+                            continue
+                        candidate_entity = _source_entity_from_node(candidate)
+                        if (
+                            candidate.matek_id == deterministic_source_id
+                            and candidate_entity.source_key == source_key
+                        ):
+                            compatible_existing.append((candidate, candidate_entity))
+                            continue
+                        if not entity.verified or not candidate_entity.verified:
+                            continue
+                        overlaps = bool(
+                            set(candidate_entity.identifiers).intersection(entity.identifiers)
+                        )
+                        if candidate.matek_id == deterministic_source_id and not overlaps:
+                            raise GraphValidationError(
+                                f"canonical source ID collision at {deterministic_source_id}"
+                            )
+                        if not overlaps:
+                            continue
+                        conflicts = conflicting_stable_source_identifiers(
+                            candidate_entity.identifiers,
+                            entity.identifiers,
+                        )
+                        if conflicts:
+                            schemes = ", ".join(sorted(conflicts))
+                            raise GraphValidationError(
+                                "compiled source overlaps an existing low-precedence "
+                                f"identifier but asserts conflicting {schemes} identity"
+                            )
+                        compatible_existing.append((candidate, candidate_entity))
+                    compatible_existing.sort(
+                        key=lambda item: (
+                            item[0].matek_id != deterministic_source_id,
+                            item[0].created_at,
+                            item[0].matek_id,
+                        )
+                    )
+                    existing_source = compatible_existing[0][0] if compatible_existing else None
+                    if compatible_existing:
+                        prior_entities = [
+                            *(item for _, item in compatible_existing),
+                            entity,
+                        ]
+                        if all(item.source_key == source_key for item in prior_entities):
+                            merged_entity = prior_entities[0]
+                            for next_entity in prior_entities[1:]:
+                                merged_entity = merge_source_entities(
+                                    merged_entity,
+                                    next_entity,
+                                )
+                            entity = merged_entity
+                        else:
+                            entity = _merge_compatible_source_identities(prior_entities)
+                    source_id = (
+                        existing_source.matek_id
+                        if existing_source is not None
+                        else deterministic_source_id
+                    )
+                    superseded_source_ids = [
+                        candidate.matek_id
+                        for candidate, _ in compatible_existing
+                        if candidate.matek_id != source_id
+                    ]
                     source = GraphNode(
                         matek_id=source_id,
                         node_type=NodeType.SOURCE,
                         problem_id=problem_id,
-                        title=str(raw_source.get("title") or source_key),
+                        title=entity.titles[0],
                         epistemic_status=(
-                            EpistemicStatus.AUDIT_PASSED if verified else EpistemicStatus.OPEN
+                            EpistemicStatus.AUDIT_PASSED
+                            if entity.verified
+                            else EpistemicStatus.OPEN
                         ),
                         workflow_status=(
-                            WorkflowStatus.COMPLETE if verified else WorkflowStatus.ACTIVE
+                            WorkflowStatus.COMPLETE if entity.verified else WorkflowStatus.ACTIVE
                         ),
-                        created_in_run=run_id,
+                        created_in_run=(
+                            existing_source.created_in_run
+                            if existing_source is not None
+                            else run_id
+                        ),
                         last_modified_run=run_id,
                         author_role="prompt-source-verifier",
-                        created_at=now,
+                        created_at=(
+                            existing_source.created_at if existing_source is not None else now
+                        ),
                         updated_at=now,
                         body=new_generated_body(
-                            str(raw_source.get("title") or source_key),
+                            entity.titles[0],
                             "## Stable identifiers\n\n"
-                            + ("\n".join(f"- `{item}`" for item in identifiers) or "_None._")
+                            + ("\n".join(f"- `{item}`" for item in entity.identifiers) or "_None._")
+                            + "\n\n## Identifier revisions\n\n"
+                            + (
+                                "\n".join(f"- `{item}`" for item in entity.identifier_revisions)
+                                or "_None._"
+                            )
                             + "\n\n## Verification\n\n"
-                            + str(
-                                raw_source.get("verification_detail")
-                                or ("Verified." if verified else "Not independently verified.")
+                            + (
+                                "\n".join(entity.verification_provenance)
+                                or (
+                                    "Verified."
+                                    if entity.verified
+                                    else "Not independently verified."
+                                )
                             ),
                         ),
                         tags=[
                             "matek/source",
-                            "matek/source-verified" if verified else "matek/source-open",
+                            "matek/source-verified" if entity.verified else "matek/source-open",
                         ],
-                        source_artifacts=[f".matek/runs/{run_id}/prompts/source_ledger.json"],
+                        relations=_unique_edges(
+                            [
+                                *(existing_source.relations if existing_source is not None else []),
+                                *(
+                                    GraphEdge(
+                                        source_id=source_id,
+                                        relation=RelationType.SUPERSEDES,
+                                        target_id=superseded_id,
+                                    )
+                                    for superseded_id in superseded_source_ids
+                                ),
+                            ]
+                        ),
+                        source_artifacts=list(
+                            dict.fromkeys(
+                                [
+                                    *(
+                                        existing_source.source_artifacts
+                                        if existing_source is not None
+                                        else []
+                                    ),
+                                    f".matek/runs/{run_id}/prompts/source_ledger.json",
+                                ]
+                            )
+                        ),
+                        evidence=(
+                            list(existing_source.evidence) if existing_source is not None else []
+                        ),
                         metadata={
-                            "matek_source_id": source_key,
-                            "matek_identifiers": identifiers,
-                            "matek_verified": verified,
+                            "matek_source_id": entity.source_key,
+                            "matek_primary_identifier": entity.primary_identifier,
+                            "matek_identifiers": entity.identifiers,
+                            "matek_identifier_revisions": entity.identifier_revisions,
+                            "matek_source_aliases": entity.aliases,
+                            "matek_source_titles": entity.titles,
+                            "matek_source_authors": entity.authors,
+                            "matek_verified": entity.verified,
                         },
                     )
                     source_nodes.append(source)
+                    source_nodes.extend(
+                        _superseded_source_alias(
+                            candidate,
+                            canonical_source_id=source_id,
+                            canonical_source_key=entity.source_key,
+                            run_id=run_id,
+                            now=now,
+                        )
+                        for candidate, _ in compatible_existing
+                        if candidate.matek_id != source_id
+                    )
                     target.relations.append(
                         GraphEdge(
                             source_id=target_id,
@@ -2855,6 +4810,11 @@ class KnowledgeGraph:
                 operation_id=f"prompt-compiled:{run_id}",
                 source_artifacts=[f".matek/runs/{run_id}/prompts/compiled_problem.json"],
                 stale_node_ids=[target_id, *stale_nodes] if stale_nodes else (),
+                additional_writes={
+                    self.target_registry_path.relative_to(self.vault_root).as_posix(): (
+                        render_target_registry(target_registry)
+                    )
+                },
             )
 
     def record_assignment_tasks(
@@ -3135,12 +5095,20 @@ class KnowledgeGraph:
         proposed_patch: GraphPatch | None,
         source_artifact: str,
         operation_id: str,
+        computation_evidence: Mapping[str, Any] | None = None,
     ) -> GraphMergeResult:
         """Merge an agent patch, then always preserve a distilled worker summary."""
 
         proposal_issues: list[str] = []
         proposal_result: GraphMergeResult | None = None
-        if proposed_patch is not None:
+        typed_report_v2 = report.get("schema_version") == 2 and isinstance(
+            report.get("results"), list
+        )
+        if proposed_patch is not None and typed_report_v2:
+            proposal_issues.append(
+                "typed scientific reports cannot contain model-authored graph mutations"
+            )
+        elif proposed_patch is not None:
             if proposed_patch.run_id != run_id:
                 proposal_issues.append("worker graph patch run_id does not match its run")
             elif proposed_patch.task_id != task_id:
@@ -3179,20 +5147,140 @@ class KnowledgeGraph:
                 )
             now = self._now()
             assignment_id = str(assignment.get("id") or report.get("assignment_id") or "unknown")
+            task_assignment_id = task.metadata.get("matek_assignment_id")
+            if isinstance(task_assignment_id, str) and task_assignment_id != assignment_id:
+                raise GraphValidationError(
+                    "worker report assignment does not match its server-owned graph task"
+                )
             family = str(assignment.get("approach_family") or "unspecified")
             mechanism = str(report.get("mechanism") or assignment.get("task") or family)
-            status = str(report.get("status") or "progress")
-            formal_results = [
-                str(item) for item in report.get("formal_results", []) if str(item).strip()
-            ]
-            exact_gap = str(report.get("exact_gap") or "").strip()
-            counterexamples = [
-                str(item) for item in report.get("counterexamples", []) if str(item).strip()
-            ]
-            dependencies = [
-                str(item) for item in report.get("dependencies", []) if str(item).strip()
-            ]
-            assumptions = [str(item) for item in report.get("assumptions", []) if str(item).strip()]
+            typed_results: list[ScientificResult] = []
+            typed_obligations: list[ScientificObligationDeclaration] = []
+            verified_computation_evidence: Any | None = None
+            if typed_report_v2:
+                try:
+                    # Local import avoids a module cycle while enforcing the complete
+                    # provider-visible envelope, including assignment identity and all
+                    # cross-result branch invariants.
+                    from ..stages.research import ResearchWorkerReport
+
+                    validated_report = ResearchWorkerReport.model_validate(report)
+                except ValidationError as exc:
+                    raise GraphValidationError(
+                        f"typed scientific report is invalid: {exc}"
+                    ) from exc
+                if validated_report.assignment_id != assignment_id:
+                    raise GraphValidationError(
+                        "typed scientific report assignment_id does not match its "
+                        "server-owned assignment"
+                    )
+                typed_results = list(validated_report.results)
+                typed_obligations = list(validated_report.unresolved_obligations)
+                status = validated_report.branch_outcome.value
+                formal_results = [
+                    item.exact_statement
+                    for item in typed_results
+                    if item.kind.value != "counterexample"
+                ]
+                counterexamples = [
+                    item.exact_statement
+                    for item in typed_results
+                    if item.kind.value == "counterexample"
+                ]
+                gaps = [
+                    item
+                    for item in [
+                        *(result.exact_gap for result in typed_results),
+                        *(item.exact_statement for item in typed_obligations),
+                    ]
+                    if item
+                ]
+                exact_gap = "\n".join(dict.fromkeys(gaps))
+                dependencies = list(
+                    dict.fromkeys(
+                        dependency
+                        for result in typed_results
+                        for dependency in result.dependency_node_ids
+                    )
+                )
+                assumptions = list(
+                    dict.fromkeys(
+                        assumption for result in typed_results for assumption in result.assumptions
+                    )
+                )
+                if computation_evidence is not None:
+                    expected_computation_artifact = (
+                        f".matek/runs/{run_id}/research/worker-computation/{assignment_id}.json"
+                    )
+                    if (
+                        str(computation_evidence.get("source_artifact") or "")
+                        != expected_computation_artifact
+                    ):
+                        raise GraphValidationError(
+                            "computation evidence is not bound to the canonical run artifact"
+                        )
+                    supplied_evidence = {
+                        str(key): value
+                        for key, value in computation_evidence.items()
+                        if key != "source_artifact"
+                    }
+                    try:
+                        from ..stages.common import canonical_json_bytes
+                        from ..stages.computation_artifacts import (
+                            verify_persisted_computation_evidence,
+                        )
+
+                        evidence_path = ensure_path_confined(
+                            self.project_root,
+                            self.project_root / expected_computation_artifact,
+                        )
+                        verified_computation_evidence = verify_persisted_computation_evidence(
+                            self.project_root / ".matek" / "runs" / run_id,
+                            assignment_id,
+                            evidence_path,
+                        )
+                    except (OSError, ValueError) as exc:
+                        raise GraphValidationError(
+                            f"persisted computation evidence failed verification: {exc}"
+                        ) from exc
+                    if supplied_evidence != verified_computation_evidence.model_dump(mode="json"):
+                        raise GraphValidationError(
+                            "caller computation evidence differs from its canonical run artifact"
+                        )
+                    collection = verified_computation_evidence.collection
+                    if collection is not None and collection.trusted:
+                        assert collection.manifest is not None
+                        reported_declaration_hashes = [
+                            hashlib.sha256(canonical_json_bytes(item)).hexdigest()
+                            for item in validated_report.artifact_manifest
+                        ]
+                        committed_declaration_hashes = [
+                            item.declaration_sha256 for item in collection.manifest.declarations
+                        ]
+                        if reported_declaration_hashes != committed_declaration_hashes:
+                            raise GraphValidationError(
+                                "computation manifest declarations differ from the frozen "
+                                "scientific report"
+                            )
+            else:
+                if computation_evidence is not None:
+                    raise GraphValidationError(
+                        "computation evidence requires a typed scientific report"
+                    )
+                status = str(report.get("status") or "progress")
+                formal_results = [
+                    str(item) for item in report.get("formal_results", []) if str(item).strip()
+                ]
+                exact_gap = str(report.get("exact_gap") or "").strip()
+                counterexamples = [
+                    str(item) for item in report.get("counterexamples", []) if str(item).strip()
+                ]
+                dependencies = [
+                    str(item) for item in report.get("dependencies", []) if str(item).strip()
+                ]
+                assumptions = [
+                    str(item) for item in report.get("assumptions", []) if str(item).strip()
+                ]
             classification = {
                 "blocked": "blocked_local_gap",
                 "refuted": "ruled_out_branch",
@@ -3289,6 +5377,429 @@ class KnowledgeGraph:
                     "matek_reopen_condition": reopen,
                 },
             )
+            if typed_report_v2:
+                computation_nodes: list[GraphNode] = []
+                if verified_computation_evidence is not None:
+                    raw_collection = (
+                        verified_computation_evidence.collection.model_dump(mode="json")
+                        if verified_computation_evidence.collection is not None
+                        else None
+                    )
+                    raw_replay = (
+                        verified_computation_evidence.replay.model_dump(mode="json")
+                        if verified_computation_evidence.replay is not None
+                        else None
+                    )
+                    evidence_artifact = (
+                        f".matek/runs/{run_id}/research/worker-computation/{assignment_id}.json"
+                    )
+                    if raw_collection is not None and not isinstance(raw_collection, Mapping):
+                        raise GraphValidationError(
+                            "computation collection evidence must be a structured object"
+                        )
+                    if raw_replay is not None and not isinstance(raw_replay, Mapping):
+                        raise GraphValidationError(
+                            "computation replay evidence must be a structured object"
+                        )
+                    manifest = (
+                        raw_collection.get("manifest")
+                        if isinstance(raw_collection, Mapping)
+                        else None
+                    )
+                    if manifest is not None and not isinstance(manifest, Mapping):
+                        raise GraphValidationError(
+                            "computation manifest evidence must be a structured object"
+                        )
+                    if isinstance(manifest, Mapping):
+                        collection_status = str(
+                            raw_collection.get("status")
+                            if isinstance(raw_collection, Mapping)
+                            else ""
+                        )
+                        if collection_status not in {"collected", "reused"}:
+                            raise GraphValidationError(
+                                "a computation manifest requires a successful collection status"
+                            )
+                        manifest_assignment = str(manifest.get("assignment_id") or "")
+                        manifest_sha256 = str(manifest.get("manifest_sha256") or "")
+                        if manifest_assignment != assignment_id or not re.fullmatch(
+                            r"[0-9a-f]{64}", manifest_sha256
+                        ):
+                            raise GraphValidationError(
+                                "computation manifest identity does not match its assignment"
+                            )
+                        replay_status = (
+                            str(raw_replay.get("status") or "not_collected")
+                            if isinstance(raw_replay, Mapping)
+                            else "not_collected"
+                        )
+                        replay_record_sha256 = (
+                            str(raw_replay.get("record_sha256") or "")
+                            if isinstance(raw_replay, Mapping)
+                            else ""
+                        )
+                        if isinstance(raw_replay, Mapping) and (
+                            str(raw_replay.get("assignment_id") or "") != assignment_id
+                            or str(raw_replay.get("manifest_sha256") or "") != manifest_sha256
+                        ):
+                            raise GraphValidationError(
+                                "computation replay identity does not match its manifest"
+                            )
+                        replay_passed = replay_status == "passed" and bool(
+                            re.fullmatch(r"[0-9a-f]{64}", replay_record_sha256)
+                        )
+                        raw_declarations = manifest.get("declarations", [])
+                        if not isinstance(raw_declarations, list):
+                            raise GraphValidationError(
+                                "computation manifest declarations must be a list"
+                            )
+                        declared_keys = {
+                            str(key)
+                            for declaration in raw_declarations
+                            if isinstance(declaration, Mapping)
+                            for raw_keys in [declaration.get("supporting_result_keys", [])]
+                            if isinstance(raw_keys, list)
+                            for key in raw_keys
+                        }
+                        manifest_id = _deterministic_id(
+                            NodeType.ARTIFACT,
+                            problem_id,
+                            run_id,
+                            assignment_id,
+                            manifest_sha256,
+                            "manifest",
+                        )
+                        manifest_path = str(
+                            raw_collection.get("manifest_path") or ""
+                            if isinstance(raw_collection, Mapping)
+                            else ""
+                        )
+                        manifest_node = GraphNode(
+                            matek_id=manifest_id,
+                            node_type=NodeType.ARTIFACT,
+                            problem_id=problem_id,
+                            title=f"Computation manifest {assignment_id}",
+                            epistemic_status=(
+                                EpistemicStatus.AUDIT_PASSED
+                                if replay_passed
+                                else EpistemicStatus.OPEN
+                            ),
+                            workflow_status=(
+                                WorkflowStatus.COMPLETE if replay_passed else WorkflowStatus.BLOCKED
+                            ),
+                            created_in_run=run_id,
+                            last_modified_run=run_id,
+                            author_role="computation-collector",
+                            created_at=now,
+                            updated_at=now,
+                            body=new_generated_body(
+                                f"Computation manifest {assignment_id}",
+                                "## Immutable manifest\n\n"
+                                + (f"`{manifest_path}`" if manifest_path else evidence_artifact)
+                                + "\n\n## Application-computed SHA-256\n\n"
+                                + f"`{manifest_sha256}`"
+                                + "\n\n## Retained files\n\n"
+                                + str(manifest.get("retained_file_count", 0))
+                                + " files, "
+                                + str(manifest.get("retained_total_bytes", 0))
+                                + " bytes.\n\n## Replay status\n\n"
+                                + f"`{replay_status}`",
+                            ),
+                            tags=["matek/artifact", "matek/computation", "matek/immutable"],
+                            relations=[
+                                GraphEdge(
+                                    source_id=manifest_id,
+                                    relation=RelationType.RELATED_TO,
+                                    target_id=task_id,
+                                ),
+                                GraphEdge(
+                                    source_id=manifest_id,
+                                    relation=RelationType.CREATED_DURING,
+                                    target_id=_deterministic_id(NodeType.RUN, problem_id, run_id),
+                                ),
+                            ],
+                            source_artifacts=list(
+                                dict.fromkeys(
+                                    [
+                                        evidence_artifact,
+                                        *([manifest_path] if manifest_path else []),
+                                    ]
+                                )
+                            ),
+                            metadata={
+                                "matek_assignment_id": assignment_id,
+                                "matek_computation_manifest_sha256": manifest_sha256,
+                                "matek_computation_replay_status": replay_status,
+                                "matek_replay_passed": replay_passed,
+                                "matek_supporting_result_keys": sorted(declared_keys),
+                            },
+                        )
+                        computation_nodes.append(manifest_node)
+                        replay_id: str | None = None
+                        if isinstance(raw_replay, Mapping) and replay_record_sha256:
+                            if not re.fullmatch(r"[0-9a-f]{64}", replay_record_sha256):
+                                raise GraphValidationError(
+                                    "computation replay evidence has an invalid record digest"
+                                )
+                            replay_id = _deterministic_id(
+                                NodeType.ARTIFACT,
+                                problem_id,
+                                run_id,
+                                assignment_id,
+                                replay_record_sha256,
+                                "replay",
+                            )
+                            replay_node = GraphNode(
+                                matek_id=replay_id,
+                                node_type=NodeType.ARTIFACT,
+                                problem_id=problem_id,
+                                title=f"Independent computation replay {assignment_id}",
+                                epistemic_status=(
+                                    EpistemicStatus.AUDIT_PASSED
+                                    if replay_passed
+                                    else EpistemicStatus.REFUTED
+                                    if replay_status == "mismatch"
+                                    else EpistemicStatus.OPEN
+                                ),
+                                workflow_status=(
+                                    WorkflowStatus.COMPLETE
+                                    if replay_passed
+                                    else WorkflowStatus.BLOCKED
+                                ),
+                                created_in_run=run_id,
+                                last_modified_run=run_id,
+                                author_role="computation-replayer",
+                                created_at=now,
+                                updated_at=now,
+                                body=new_generated_body(
+                                    f"Independent computation replay {assignment_id}",
+                                    "## Replay verdict\n\n"
+                                    + f"`{replay_status}`"
+                                    + "\n\n## Replay record SHA-256\n\n"
+                                    + f"`{replay_record_sha256}`"
+                                    + "\n\n## Isolation attestation\n\n```json\n"
+                                    + json.dumps(
+                                        raw_replay.get("isolation", {}),
+                                        ensure_ascii=False,
+                                        indent=2,
+                                        sort_keys=True,
+                                    )
+                                    + "\n```",
+                                ),
+                                tags=[
+                                    "matek/artifact",
+                                    "matek/computation-replay",
+                                    (
+                                        "matek/replay-passed"
+                                        if replay_passed
+                                        else "matek/replay-not-passed"
+                                    ),
+                                ],
+                                relations=[
+                                    GraphEdge(
+                                        source_id=replay_id,
+                                        relation=RelationType.RELATED_TO,
+                                        target_id=manifest_id,
+                                    ),
+                                    GraphEdge(
+                                        source_id=replay_id,
+                                        relation=RelationType.CREATED_DURING,
+                                        target_id=_deterministic_id(
+                                            NodeType.RUN, problem_id, run_id
+                                        ),
+                                    ),
+                                ],
+                                source_artifacts=[evidence_artifact],
+                                metadata={
+                                    "matek_assignment_id": assignment_id,
+                                    "matek_computation_manifest_sha256": manifest_sha256,
+                                    "matek_computation_replay_record_sha256": (
+                                        replay_record_sha256
+                                    ),
+                                    "matek_computation_replay_status": replay_status,
+                                    "matek_replay_passed": replay_passed,
+                                    "matek_supporting_result_keys": sorted(declared_keys),
+                                },
+                            )
+                            computation_nodes.append(replay_node)
+                try:
+                    admission = build_scientific_admission(
+                        existing_nodes=[*nodes_list, approach, *computation_nodes],
+                        problem_id=problem_id,
+                        main_target_id=self.main_claim_id(problem_id),
+                        run_id=run_id,
+                        assignment_id=assignment_id,
+                        task_id=task_id,
+                        approach_id=approach_id,
+                        results=typed_results,
+                        unresolved_obligations=typed_obligations,
+                        source_artifact=source_artifact,
+                        now=now,
+                    )
+                except ScientificAdmissionError as exc:
+                    raise GraphValidationError(
+                        f"deterministic scientific admission failed: {exc}"
+                    ) from exc
+                exact_main_counterexamples = [
+                    result
+                    for result in typed_results
+                    if result.kind is ScientificResultKind.COUNTEREXAMPLE
+                    and result.scope is ScientificScope.MAIN
+                    and result.disposition is ScientificResultDisposition.REFUTED_MECHANISM
+                    and result.exact_gap is None
+                    and normalize_exact_statement(result.exact_statement)
+                    == normalize_exact_statement(
+                        exact_statement(by_id[self.main_claim_id(problem_id)].body)
+                    )
+                ]
+                refutation_support_keys = {
+                    key
+                    for counterexample in exact_main_counterexamples
+                    for key in {
+                        counterexample.local_key,
+                        *transitive_result_dependency_keys(
+                            typed_results,
+                            [counterexample.local_key],
+                        ),
+                    }
+                }
+                if status == "refuted":
+                    for admitted_node in admission.nodes:
+                        if admitted_node.node_type not in {
+                            NodeType.CLAIM,
+                            NodeType.PROOF_ATTEMPT,
+                            NodeType.DERIVATION,
+                        }:
+                            continue
+                        if (
+                            admitted_node.metadata.get("matek_result_local_key")
+                            in refutation_support_keys
+                        ):
+                            # A branch-level ``refuted`` status normally invalidates its
+                            # proposed route.  Exact-main counterexample premises instead remain
+                            # live but untrusted until the independent refutation gate verifies
+                            # this closed support bundle.
+                            continue
+                        admitted_node.epistemic_status = EpistemicStatus.STALE
+                        admitted_node.workflow_status = WorkflowStatus.ABANDONED
+                        admitted_node.invalidation_reasons = list(
+                            dict.fromkeys(
+                                [
+                                    *admitted_node.invalidation_reasons,
+                                    "originating_approach_refuted",
+                                ]
+                            )
+                        )
+                        admitted_node.metadata["matek_originating_approach_refuted"] = approach_id
+                source_nodes, result_source_ids, source_issues = _verified_worker_source_nodes(
+                    report.get("source_ledger", []),
+                    typed_results=typed_results,
+                    existing_nodes=by_id,
+                    problem_id=problem_id,
+                    run_id=run_id,
+                    source_artifact=source_artifact,
+                    now=now,
+                )
+                admitted_by_id = {node.matek_id: node for node in admission.nodes}
+                existing_citation_updates: dict[str, GraphNode] = {}
+                for result_key, explicit_source_ids in sorted(result_source_ids.items()):
+                    if not explicit_source_ids:
+                        continue
+                    result_nodes = [
+                        node
+                        for node in admission.nodes
+                        if node.metadata.get("matek_result_local_key") == result_key
+                    ]
+                    attempts = [
+                        node for node in result_nodes if node.node_type is NodeType.PROOF_ATTEMPT
+                    ]
+                    citation_targets = [
+                        node for node in result_nodes if node.node_type is NodeType.CLAIM
+                    ]
+                    for attempt in attempts:
+                        citation_targets.append(attempt)
+                        for edge in attempt.relations:
+                            if edge.relation is not RelationType.RELATED_TO:
+                                continue
+                            claim = admitted_by_id.get(edge.target_id) or by_id.get(edge.target_id)
+                            if claim is None or claim.node_type is not NodeType.CLAIM:
+                                continue
+                            if claim.matek_id in admitted_by_id:
+                                citation_targets.append(admitted_by_id[claim.matek_id])
+                            else:
+                                update = existing_citation_updates.setdefault(
+                                    claim.matek_id, claim.model_copy(deep=True)
+                                )
+                                citation_targets.append(update)
+                    for node in citation_targets:
+                        node.relations = _unique_edges(
+                            [
+                                *node.relations,
+                                *(
+                                    GraphEdge(
+                                        source_id=node.matek_id,
+                                        relation=RelationType.CITES,
+                                        target_id=source_id,
+                                    )
+                                    for source_id in sorted(explicit_source_ids)
+                                ),
+                            ]
+                        )
+                typed_proposed_nodes = [
+                    approach,
+                    *computation_nodes,
+                    *source_nodes,
+                    *admission.nodes,
+                    *existing_citation_updates.values(),
+                ]
+                combined = {
+                    **by_id,
+                    **{node.matek_id: node for node in typed_proposed_nodes},
+                }
+                relation_issues = [
+                    issue
+                    for node in typed_proposed_nodes
+                    for edge in node.relations
+                    for issue in [
+                        (
+                            f"edge target does not exist: {edge.target_id}"
+                            if edge.target_id not in combined
+                            else self._relation_issue(edge, combined)
+                        )
+                    ]
+                    if issue is not None
+                ]
+                cycle = self._dependency_cycle(list(combined.values()))
+                if cycle is not None:
+                    relation_issues.append(
+                        "scientific admission creates dependency cycle: " + " -> ".join(cycle)
+                    )
+                if relation_issues:
+                    raise GraphValidationError("; ".join(relation_issues))
+                merged = self._upsert_generated_nodes_unlocked(
+                    state=state,
+                    nodes=by_id,
+                    proposed=typed_proposed_nodes,
+                    run_id=run_id,
+                    author="matek-scientific-admission",
+                    reason=(f"Admit typed scientific report {assignment_id} deterministically."),
+                    operation_id=operation_id,
+                    source_artifacts=[source_artifact],
+                )
+                return merged.model_copy(
+                    update={
+                        "issues": list(
+                            dict.fromkeys(
+                                [
+                                    *merged.issues,
+                                    *proposal_issues,
+                                    *admission.issues,
+                                    *source_issues,
+                                ]
+                            )
+                        )
+                    }
+                )
             proposed_nodes: list[GraphNode] = [approach]
             result_claim_ids: list[str] = []
             for index, result_text in enumerate(formal_results, start=1):
@@ -3633,7 +6144,6 @@ class KnowledgeGraph:
                 changed = True
             if changed:
                 node.last_modified_run = run_id
-                node.author_role = "research-acceptance-gate"
                 node.updated_at = now
                 proposed_by_id[node.matek_id] = node
         return list(proposed_by_id.values())
@@ -3671,45 +6181,28 @@ class KnowledgeGraph:
             if candidate_map is not None:
                 exact_theorem = str(candidate_map.get("exact_theorem") or "").strip()
                 full_proof = str(candidate_map.get("full_proof") or "").strip()
-                if exact_theorem:
-                    old_statement = exact_statement(target.body)
-                    if exact_theorem != old_statement:
-                        target.statement_version += 1
-                    target.body = replace_generated_section(
-                        target.body,
-                        target.title,
-                        "## Exact statement\n\n"
-                        + exact_theorem
-                        + "\n\n## Scope and conventions\n\n"
-                        + "Frozen by the accepted candidate package and the original "
-                        "claim contract."
-                        + "\n\n## Current significance\n\n"
-                        + (
-                            "Every mandatory independent research audit passed."
-                            if accepted
-                            else (
-                                "A candidate package exists but has not passed the acceptance gate."
-                            )
-                        ),
+                frozen_statement = exact_statement(target.body)
+                if normalize_exact_statement(exact_theorem) != normalize_exact_statement(
+                    frozen_statement
+                ):
+                    raise GraphValidationError(
+                        "candidate exact theorem does not match the immutable main target"
                     )
-                target.epistemic_status = (
-                    EpistemicStatus.AUDIT_PASSED if accepted else EpistemicStatus.CANDIDATE
-                )
-                target.workflow_status = (
-                    WorkflowStatus.COMPLETE if accepted else WorkflowStatus.ACTIVE
-                )
-                target.last_modified_run = run_id
-                target.updated_at = now
-                target.author_role = "research-acceptance-gate"
-                target.source_artifacts = list(
-                    dict.fromkeys(
-                        [
-                            *target.source_artifacts,
-                            f".matek/runs/{run_id}/research/candidate/package.json",
-                            f".matek/runs/{run_id}/research/verdict.json",
-                        ]
+                if accepted:
+                    target.epistemic_status = EpistemicStatus.AUDIT_PASSED
+                    target.workflow_status = WorkflowStatus.COMPLETE
+                    target.last_modified_run = run_id
+                    target.updated_at = now
+                    target.author_role = "research-acceptance-gate"
+                    target.source_artifacts = list(
+                        dict.fromkeys(
+                            [
+                                *target.source_artifacts,
+                                f".matek/runs/{run_id}/research/candidate/package.json",
+                                f".matek/runs/{run_id}/research/verdict.json",
+                            ]
+                        )
                     )
-                )
                 proof_id = _deterministic_id(
                     NodeType.PROOF, problem_id, run_id, "accepted-candidate"
                 )
@@ -3771,7 +6264,8 @@ class KnowledgeGraph:
                     },
                 )
                 proposed.append(accepted_proof)
-            proposed.append(target)
+            if accepted:
+                proposed.append(target)
             audits = research_result.get("audits", {})
             if isinstance(audits, Mapping):
                 for name, raw_audit in audits.items():
@@ -3857,43 +6351,1234 @@ class KnowledgeGraph:
                 source_artifacts=[f".matek/runs/{run_id}/research/result.json"],
             )
 
+    def record_lemma_audit(
+        self,
+        *,
+        problem_id: str,
+        run_id: str,
+        nomination: Mapping[str, Any],
+        gate: Mapping[str, Any],
+        source_artifact: str,
+    ) -> GraphMergeResult:
+        """Apply an independent intermediate-lemma gate to its exact derivation.
+
+        This lane can promote a reusable restricted theorem and its audited proof
+        route, but it is structurally forbidden from authorizing the main target or
+        manuscript generation.
+        """
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            state = self._load_state_unlocked()
+            nodes = self._load_nodes_unlocked(include_human_notes=True)
+            by_id = {node.matek_id: node for node in nodes}
+            provisional_audit_id = str(nomination.get("nomination_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", provisional_audit_id):
+                raise GraphValidationError("lemma audit has an invalid nomination identity")
+            expected_source_artifact = (
+                f".matek/runs/{run_id}/research/lemma-audits/{provisional_audit_id}/gate.json"
+            )
+            if source_artifact != expected_source_artifact:
+                raise GraphValidationError("lemma audit is not bound to its canonical run artifact")
+            try:
+                from ..stages.lemma_audit import verify_persisted_lemma_audit
+
+                gate_path = ensure_path_confined(
+                    self.project_root,
+                    self.project_root / expected_source_artifact,
+                )
+                persisted_nomination, persisted_gate = verify_persisted_lemma_audit(
+                    gate_path.parent / "nomination.json",
+                    gate_path,
+                )
+            except (OSError, ValueError) as exc:
+                raise GraphValidationError(
+                    f"persisted lemma-audit evidence failed verification: {exc}"
+                ) from exc
+            if nomination != persisted_nomination.model_dump(mode="json"):
+                raise GraphValidationError(
+                    "caller nomination differs from its canonical run artifact"
+                )
+            if gate != persisted_gate.model_dump(mode="json"):
+                raise GraphValidationError(
+                    "caller lemma gate differs from its canonical run artifact"
+                )
+            nomination = persisted_nomination.model_dump(mode="json")
+            gate = persisted_gate.model_dump(mode="json")
+            statement_id = str(nomination.get("statement_id") or "").strip().upper()
+            claim = by_id.get(statement_id)
+            if claim is None or claim.node_type is not NodeType.CLAIM:
+                raise GraphValidationError(
+                    "lemma audit does not identify an admitted canonical claim"
+                )
+            if statement_id == self.main_claim_id(problem_id):
+                raise GraphValidationError(
+                    "the intermediate lemma-audit lane cannot authorize the main target"
+                )
+            if claim.problem_id != problem_id:
+                raise GraphValidationError("lemma audit claim belongs to another problem")
+            if (
+                claim.tombstone
+                or claim.invalidation_reasons
+                or claim.epistemic_status
+                in {
+                    EpistemicStatus.STALE,
+                    EpistemicStatus.INCONSISTENT,
+                    EpistemicStatus.REFUTED,
+                }
+            ):
+                raise GraphValidationError("nominated canonical claim is no longer live")
+            scope = str(nomination.get("scope") or "")
+            if scope not in {ScientificScope.REDUCTION.value, ScientificScope.BRANCH.value}:
+                raise GraphValidationError(
+                    "lemma audits are restricted to branch or reduction theorems"
+                )
+            exact_claim = normalize_exact_statement(exact_statement(claim.body))
+            nominated_statement = normalize_exact_statement(
+                str(nomination.get("exact_statement") or "")
+            )
+            if not exact_claim or exact_claim != nominated_statement:
+                raise GraphValidationError(
+                    "lemma audit statement does not match the canonical exact claim"
+                )
+            expected_statement_sha256 = sha256_text(" ".join(exact_claim.split()))
+            if str(gate.get("statement_sha256") or "") != expected_statement_sha256:
+                raise GraphValidationError(
+                    "lemma audit gate is bound to a different exact statement"
+                )
+            audit_id_text = str(gate.get("audit_id") or "").strip()
+            if audit_id_text != str(nomination.get("nomination_id") or "").strip():
+                raise GraphValidationError(
+                    "lemma audit gate identity does not match its nomination"
+                )
+            if bool(gate.get("main_target_acceptance_authorized")) or bool(
+                gate.get("manuscript_authorized")
+            ):
+                raise GraphValidationError(
+                    "an intermediate lemma audit cannot authorize a terminal stage"
+                )
+            status = str(gate.get("status") or "")
+            if status not in {"audit_passed", "audit_failed", "blocked"}:
+                raise GraphValidationError("lemma audit gate has an unknown status")
+            accepted_intermediate = gate.get("accepted_intermediate")
+            if status == "audit_passed":
+                if not isinstance(accepted_intermediate, Mapping) or (
+                    str(accepted_intermediate.get("statement_id") or "").upper() != statement_id
+                    or bool(accepted_intermediate.get("terminal_main_target_satisfied"))
+                    or bool(accepted_intermediate.get("manuscript_authorized"))
+                ):
+                    raise GraphValidationError(
+                        "passing lemma audit lacks a nonterminal accepted theorem record"
+                    )
+            elif accepted_intermediate is not None:
+                raise GraphValidationError(
+                    "only a passing lemma audit may carry an accepted theorem"
+                )
+            origin_assignment = str(nomination.get("origin_worker_id") or "").strip()
+            canonical_derivation_id = (
+                str(nomination.get("canonical_derivation_id") or "").strip().upper()
+            )
+            operation_id = f"lemma-audit:{run_id}:{audit_id_text}"
+            prior_operation = state.processed_operations.get(operation_id)
+            audit_node_id = _deterministic_id(
+                NodeType.AUDIT,
+                problem_id,
+                run_id,
+                audit_id_text,
+                expected_statement_sha256,
+            )
+            existing_audit = by_id.get(audit_node_id)
+            expected_response_bindings = sorted(
+                f"{key}:{value}"
+                for key, value in cast(
+                    Mapping[str, object], gate.get("response_sha256", {})
+                ).items()
+            )
+            same_committed_audit = bool(
+                prior_operation is not None
+                and existing_audit is not None
+                and existing_audit.node_type is NodeType.AUDIT
+                and existing_audit.problem_id == problem_id
+                and existing_audit.created_in_run == run_id
+                and existing_audit.source_artifacts == [source_artifact]
+                and existing_audit.metadata.get("matek_audit_id") == audit_id_text
+                and existing_audit.metadata.get("matek_audit_status") == status
+                and existing_audit.metadata.get("matek_statement_sha256")
+                == expected_statement_sha256
+                and existing_audit.metadata.get("matek_origin_assignment_id")
+                == (origin_assignment or None)
+                and existing_audit.metadata.get("matek_gate_input_sha256")
+                == gate.get("input_sha256")
+                and existing_audit.metadata.get("matek_response_sha256")
+                == expected_response_bindings
+                and any(
+                    edge.relation is RelationType.AUDITS and edge.target_id == statement_id
+                    for edge in existing_audit.relations
+                )
+                and any(
+                    edge.relation is RelationType.AUDITS
+                    and edge.target_id == canonical_derivation_id
+                    for edge in existing_audit.relations
+                )
+            )
+            if prior_operation is not None and not same_committed_audit:
+                raise GraphValidationError(
+                    "processed lemma-audit operation differs from its committed audit binding"
+                )
+            derivation = by_id.get(canonical_derivation_id)
+            if derivation is None or derivation.node_type is not NodeType.DERIVATION:
+                raise GraphValidationError(
+                    "lemma audit does not identify its frozen canonical derivation"
+                )
+            admission_identity_value = derivation.metadata.get("matek_admission_identity")
+            admission_payload_value = derivation.metadata.get("matek_admission_payload_sha256")
+            admission_identity_parts = (
+                admission_identity_value.split("\0")
+                if isinstance(admission_identity_value, str)
+                else []
+            )
+            if (
+                derivation.problem_id != problem_id
+                or not any(
+                    edge.relation is RelationType.PROVES and edge.target_id == statement_id
+                    for edge in derivation.relations
+                )
+                or not origin_assignment
+                or derivation.metadata.get("matek_assignment_id") != origin_assignment
+                or not isinstance(admission_identity_value, str)
+                or not isinstance(admission_payload_value, str)
+                or not matches_admission_binding(
+                    derivation,
+                    admission_identity_value,
+                    admission_payload_value,
+                )
+                or admission_identity_parts
+                != [
+                    run_id,
+                    origin_assignment,
+                    str(derivation.metadata.get("matek_result_local_key") or ""),
+                    str(derivation.metadata.get("matek_scientific_schema_version") or ""),
+                ]
+                or derivation.created_in_run != run_id
+            ):
+                raise GraphValidationError(
+                    "frozen lemma derivation lacks its exact application admission binding"
+                )
+            exact_failed_gate_replay = bool(
+                same_committed_audit
+                and status == "audit_failed"
+                and derivation.epistemic_status is EpistemicStatus.REFUTED
+                and derivation.workflow_status is WorkflowStatus.BLOCKED
+                and derivation.invalidation_reasons == ["independent_lemma_audit_failed"]
+                and derivation.last_modified_run == run_id
+            )
+            if (
+                derivation.tombstone
+                or derivation.epistemic_status
+                in {
+                    EpistemicStatus.STALE,
+                    EpistemicStatus.INCONSISTENT,
+                    EpistemicStatus.REFUTED,
+                }
+                or derivation.invalidation_reasons
+            ) and not exact_failed_gate_replay:
+                raise GraphValidationError("nominated derivation is no longer live and promotable")
+            if derivation.metadata.get("matek_conclusion_claim_id") != statement_id or (
+                derivation.metadata.get("matek_exact_target_version")
+                != logical_version(exact_claim)
+            ):
+                raise GraphValidationError(
+                    "nominated derivation is no longer bound to the exact claim version"
+                )
+            attempt_id = derivation.metadata.get("matek_proof_attempt_id")
+            proof_attempt = by_id.get(attempt_id) if isinstance(attempt_id, str) else None
+            if (
+                proof_attempt is None
+                or proof_attempt.node_type is not NodeType.PROOF_ATTEMPT
+                or proof_attempt.tombstone
+                or proof_attempt.invalidation_reasons
+                or proof_attempt.epistemic_status
+                in {
+                    EpistemicStatus.STALE,
+                    EpistemicStatus.INCONSISTENT,
+                    EpistemicStatus.REFUTED,
+                }
+            ):
+                raise GraphValidationError(
+                    "nominated derivation has lost its canonical proof attempt"
+                )
+            source_artifacts_by_id = {
+                item.artifact_id: item for item in persisted_nomination.source_artifacts
+            }
+            frozen_attempt = source_artifacts_by_id.get(proof_attempt.matek_id)
+            frozen_derivation = source_artifacts_by_id.get(derivation.matek_id)
+            if (
+                frozen_attempt is None
+                or frozen_attempt.content not in proof_attempt.evidence
+                or sha256_text(frozen_attempt.content) != frozen_attempt.content_sha256
+                or frozen_derivation is None
+                or frozen_derivation.content != derivation.body
+                or sha256_text(derivation.body) != frozen_derivation.content_sha256
+            ):
+                raise GraphValidationError(
+                    "nominated proof route changed after the audit packet was frozen"
+                )
+            nominated_dependencies = {
+                item.dependency_id: item for item in persisted_nomination.dependencies
+            }
+            current_dependency_ids = sorted(
+                edge.target_id
+                for edge in derivation.relations
+                if edge.relation is RelationType.DEPENDS_ON
+            )
+            if current_dependency_ids != sorted(nominated_dependencies):
+                raise GraphValidationError("nominated derivation premises changed after audit")
+            current_ledger = project_markdown_ledger(
+                [node for node in nodes if node.problem_id == problem_id],
+                graph_revision=state.revision,
+                problem_id=problem_id,
+                target_claim_id=self.main_claim_id(problem_id),
+            )
+            frozen_obligations = {
+                item.obligation_id: item
+                for item in persisted_nomination.target_obligation_contracts
+            }
+            if set(frozen_obligations) != set(persisted_nomination.target_obligation_ids):
+                raise GraphValidationError(
+                    "lemma nomination lacks a complete frozen target-obligation contract"
+                )
+            for obligation_id, frozen_obligation in frozen_obligations.items():
+                current_obligation_node = by_id.get(obligation_id)
+                if frozen_obligation.target_kind == "claim":
+                    current_claim = current_ledger.claims.get(obligation_id)
+                    if (
+                        current_claim is None
+                        or current_obligation_node is None
+                        or current_obligation_node.node_type is not NodeType.CLAIM
+                        or current_obligation_node.problem_id != problem_id
+                        or current_obligation_node.tombstone
+                        or current_obligation_node.invalidation_reasons
+                        or current_obligation_node.epistemic_status
+                        in {
+                            EpistemicStatus.STALE,
+                            EpistemicStatus.INCONSISTENT,
+                            EpistemicStatus.REFUTED,
+                        }
+                        or current_claim.exact_statement != frozen_obligation.exact_statement
+                        or current_claim.scope is not frozen_obligation.scope
+                        or current_claim.logical_version != frozen_obligation.logical_version
+                        or current_obligation_node.statement_version
+                        != frozen_obligation.statement_version
+                        or current_obligation_node.content_hash != frozen_obligation.content_sha256
+                    ):
+                        raise GraphValidationError(
+                            f"target claim {obligation_id} changed after lemma audit"
+                        )
+                    continue
+                current_obligation = current_ledger.obligations.get(obligation_id)
+                resolved_by_this_gate = bool(
+                    current_obligation_node is not None
+                    and current_obligation_node.metadata.get("matek_resolved_by_derivation_id")
+                    == canonical_derivation_id
+                    and current_obligation_node.metadata.get("matek_resolution_audit_id")
+                    == audit_id_text
+                )
+                if (
+                    current_obligation is None
+                    or current_obligation_node is None
+                    or current_obligation_node.node_type is not NodeType.OBLIGATION
+                    or current_obligation.exact_statement != frozen_obligation.exact_statement
+                    or current_obligation.quantifiers != frozen_obligation.quantifiers
+                    or current_obligation.hypotheses != frozen_obligation.hypotheses
+                    or current_obligation.conclusion != frozen_obligation.conclusion
+                    or current_obligation.dependency_claim_ids
+                    != frozen_obligation.dependency_claim_ids
+                    or current_obligation.target_claim_ids != frozen_obligation.target_claim_ids
+                    or current_obligation.scope is not frozen_obligation.scope
+                    or current_obligation.notation_definition_version
+                    != frozen_obligation.notation_definition_version
+                    or current_obligation.falsification_evidence
+                    != frozen_obligation.falsification_evidence
+                    or current_obligation.logical_version != frozen_obligation.logical_version
+                    or current_obligation_node.statement_version
+                    != frozen_obligation.statement_version
+                    or (
+                        current_obligation_node.content_hash != frozen_obligation.content_sha256
+                        and not resolved_by_this_gate
+                    )
+                ):
+                    raise GraphValidationError(
+                        f"target obligation {obligation_id} changed after lemma audit"
+                    )
+            current_trusted_claim_ids = trusted_claim_ids(current_ledger)
+            expected_dependency_versions: list[str] = []
+            for dependency_id in current_dependency_ids:
+                dependency = by_id.get(dependency_id)
+                frozen_dependency = nominated_dependencies[dependency_id]
+                if (
+                    dependency is None
+                    or dependency.node_type not in {NodeType.CLAIM, NodeType.DEFINITION}
+                    or dependency.tombstone
+                    or dependency.invalidation_reasons
+                    or dependency.epistemic_status
+                    in {
+                        EpistemicStatus.STALE,
+                        EpistemicStatus.INCONSISTENT,
+                        EpistemicStatus.REFUTED,
+                    }
+                    or dependency.workflow_status
+                    in {
+                        WorkflowStatus.BLOCKED,
+                        WorkflowStatus.ABANDONED,
+                        WorkflowStatus.SUPERSEDED,
+                    }
+                    or dependency.statement_version != frozen_dependency.current_statement_version
+                    or dependency.content_hash != frozen_dependency.current_content_sha256
+                    or normalize_exact_statement(exact_statement(dependency.body))
+                    != normalize_exact_statement(frozen_dependency.exact_statement)
+                ):
+                    raise GraphValidationError(
+                        f"nominated dependency {dependency_id} changed after audit"
+                    )
+                if dependency.node_type is NodeType.DEFINITION and (
+                    canonical_admitted_definition_scope(dependency) is not ScientificScope.BRANCH
+                    or dependency_id not in current_trusted_claim_ids
+                ):
+                    raise GraphValidationError(
+                        f"nominated definition dependency {dependency_id} lacks current "
+                        "canonical admission provenance"
+                    )
+                if dependency_id not in current_trusted_claim_ids:
+                    raise GraphValidationError(
+                        f"nominated dependency {dependency_id} is not trusted in the current "
+                        "canonical ledger"
+                    )
+                expected_dependency_versions.append(
+                    f"{dependency_id}@{logical_version(exact_statement(dependency.body))}"
+                )
+            if derivation.dependency_versions != expected_dependency_versions:
+                raise GraphValidationError(
+                    "nominated derivation dependency-version binding changed after audit"
+                )
+            now = self._now()
+            raw_obligations = gate.get("obligations", [])
+            obligations = (
+                [str(item).strip() for item in raw_obligations if str(item).strip()]
+                if isinstance(raw_obligations, list)
+                else []
+            )
+            raw_falsification = gate.get("falsification_evidence", [])
+            falsification = (
+                [item for item in raw_falsification if isinstance(item, Mapping)]
+                if isinstance(raw_falsification, list)
+                else []
+            )
+            if status == "blocked" and not obligations:
+                raise GraphValidationError(
+                    "blocked lemma audit must record an exact audit obligation"
+                )
+            if status == "audit_failed" and not (obligations or falsification):
+                raise GraphValidationError(
+                    "failed lemma audit must record a defect or falsification"
+                )
+            audit_status = {
+                "audit_passed": EpistemicStatus.AUDIT_PASSED,
+                "audit_failed": EpistemicStatus.REFUTED,
+                "blocked": EpistemicStatus.OPEN,
+            }[status]
+            audit_node = GraphNode(
+                matek_id=audit_node_id,
+                node_type=NodeType.AUDIT,
+                problem_id=problem_id,
+                title=f"Independent lemma audit: {claim.title}",
+                epistemic_status=audit_status,
+                workflow_status=(
+                    WorkflowStatus.COMPLETE if status != "blocked" else WorkflowStatus.BLOCKED
+                ),
+                created_in_run=run_id,
+                last_modified_run=run_id,
+                author_role="lemma-audit-gate",
+                created_at=now,
+                updated_at=now,
+                body=new_generated_body(
+                    f"Independent lemma audit: {claim.title}",
+                    "## Exact statement audited\n\n"
+                    + exact_claim
+                    + "\n\n## Deterministic gate\n\n"
+                    + f"`{status}`"
+                    + "\n\n## Audit obligations\n\n"
+                    + ("\n".join(f"- {item}" for item in obligations) or "_None._")
+                    + "\n\n## Falsification evidence\n\n"
+                    + (
+                        "\n".join(
+                            "- "
+                            + str(
+                                item.get("observed_failure") or item.get("case_description") or item
+                            )
+                            for item in falsification
+                        )
+                        or "_None._"
+                    ),
+                ),
+                tags=["matek/audit", "matek/lemma-audit", f"matek/{status}"],
+                relations=[
+                    GraphEdge(
+                        source_id=audit_node_id,
+                        relation=RelationType.AUDITS,
+                        target_id=statement_id,
+                    ),
+                    GraphEdge(
+                        source_id=audit_node_id,
+                        relation=RelationType.AUDITS,
+                        target_id=derivation.matek_id,
+                    ),
+                    GraphEdge(
+                        source_id=audit_node_id,
+                        relation=RelationType.CREATED_DURING,
+                        target_id=_deterministic_id(NodeType.RUN, problem_id, run_id),
+                    ),
+                ],
+                source_artifacts=[source_artifact],
+                evidence=[
+                    str(value)
+                    for value in cast(
+                        Mapping[str, object], gate.get("response_sha256", {})
+                    ).values()
+                ]
+                if isinstance(gate.get("response_sha256", {}), Mapping)
+                else [],
+                metadata={
+                    "matek_audit_id": audit_id_text,
+                    "matek_audit_status": status,
+                    "matek_statement_sha256": expected_statement_sha256,
+                    "matek_origin_assignment_id": origin_assignment or None,
+                    "matek_gate_input_sha256": gate.get("input_sha256"),
+                    "matek_response_sha256": sorted(
+                        f"{key}:{value}"
+                        for key, value in cast(
+                            Mapping[str, object], gate.get("response_sha256", {})
+                        ).items()
+                    )
+                    if isinstance(gate.get("response_sha256", {}), Mapping)
+                    else [],
+                },
+            )
+            proposed: list[GraphNode] = [audit_node]
+            if status == "audit_passed":
+                # The audit accepts this exact derivation, not every route to the
+                # conclusion. Claim trust is derived by the canonical AND/OR ledger
+                # only after all version-bound premises and obligations are trusted.
+                derivation.epistemic_status = EpistemicStatus.AUDIT_PASSED
+                derivation.workflow_status = WorkflowStatus.COMPLETE
+                derivation.last_modified_run = run_id
+                derivation.updated_at = now
+                post_audit_ledger = project_markdown_ledger(
+                    [node for node in nodes if node.problem_id == problem_id],
+                    graph_revision=state.revision,
+                    problem_id=problem_id,
+                    target_claim_id=self.main_claim_id(problem_id),
+                )
+                trusted_after_audit = trusted_claim_ids(post_audit_ledger)
+                resolvable_obligation_ids = (
+                    persisted_nomination.target_obligation_ids
+                    if statement_id in trusted_after_audit
+                    else []
+                )
+                for obligation_id in resolvable_obligation_ids:
+                    target_obligation = by_id.get(obligation_id)
+                    frozen_obligation = frozen_obligations[obligation_id]
+                    if (
+                        frozen_obligation.target_kind != "obligation"
+                        or target_obligation is None
+                        or target_obligation.node_type is not NodeType.OBLIGATION
+                        or target_obligation.problem_id != problem_id
+                        or target_obligation.tombstone
+                        or target_obligation.invalidation_reasons
+                        or target_obligation.workflow_status
+                        in {WorkflowStatus.COMPLETE, WorkflowStatus.ABANDONED}
+                        or target_obligation.epistemic_status
+                        in {
+                            EpistemicStatus.AUDIT_PASSED,
+                            EpistemicStatus.LEAN_VERIFIED,
+                            EpistemicStatus.REFUTED,
+                            EpistemicStatus.STALE,
+                            EpistemicStatus.INCONSISTENT,
+                        }
+                    ):
+                        continue
+                    obligation_statement = normalize_exact_statement(
+                        exact_statement(target_obligation.body)
+                    )
+                    obligation_conclusion = normalize_exact_statement(
+                        str(target_obligation.metadata.get("matek_conclusion") or "")
+                    )
+                    if (
+                        frozen_obligation.quantifiers
+                        or frozen_obligation.hypotheses
+                        or frozen_obligation.falsification_evidence
+                        or not set(frozen_obligation.dependency_claim_ids).issubset(
+                            current_dependency_ids
+                        )
+                        or frozen_obligation.scope.value != scope
+                    ):
+                        # A bare claim does not encode a quantified/hypothesized obligation
+                        # contract.  Likewise, unresolved falsification evidence or missing
+                        # premise bindings require a dedicated semantic discharge rather than
+                        # this exact-text convenience transition.
+                        continue
+                    if exact_claim not in {obligation_statement, obligation_conclusion}:
+                        continue
+                    target_obligation.epistemic_status = EpistemicStatus.AUDIT_PASSED
+                    target_obligation.workflow_status = WorkflowStatus.COMPLETE
+                    target_obligation.last_modified_run = run_id
+                    target_obligation.updated_at = now
+                    target_obligation.source_artifacts = list(
+                        dict.fromkeys([*target_obligation.source_artifacts, source_artifact])
+                    )
+                    target_obligation.metadata["matek_resolved_by_derivation_id"] = (
+                        derivation.matek_id
+                    )
+                    target_obligation.metadata["matek_resolution_audit_id"] = audit_id_text
+                    if not any(
+                        edge.relation is RelationType.RESOLVES
+                        and edge.target_id == target_obligation.matek_id
+                        for edge in derivation.relations
+                    ):
+                        derivation.relations.append(
+                            GraphEdge(
+                                source_id=derivation.matek_id,
+                                relation=RelationType.RESOLVES,
+                                target_id=target_obligation.matek_id,
+                            )
+                        )
+                    proposed.append(target_obligation)
+                proposed.append(derivation)
+            elif status == "audit_failed":
+                derivation.epistemic_status = EpistemicStatus.REFUTED
+                derivation.workflow_status = WorkflowStatus.BLOCKED
+                derivation.invalidation_reasons = list(
+                    dict.fromkeys(
+                        [*derivation.invalidation_reasons, "independent_lemma_audit_failed"]
+                    )
+                )
+                derivation.last_modified_run = run_id
+                derivation.updated_at = now
+                proposed.append(derivation)
+            else:
+                created_obligation_ids: list[str] = []
+                for index, obligation_text in enumerate(obligations, start=1):
+                    obligation_id = _deterministic_id(
+                        NodeType.OBLIGATION,
+                        audit_node_id,
+                        str(index),
+                        sha256_text(obligation_text),
+                    )
+                    obligation_node = GraphNode(
+                        matek_id=obligation_id,
+                        node_type=NodeType.OBLIGATION,
+                        problem_id=problem_id,
+                        title=f"Lemma audit obligation {index}: {claim.title}",
+                        epistemic_status=EpistemicStatus.OPEN,
+                        workflow_status=WorkflowStatus.BLOCKED,
+                        created_in_run=run_id,
+                        last_modified_run=run_id,
+                        author_role="lemma-audit-gate",
+                        created_at=now,
+                        updated_at=now,
+                        body=new_generated_body(
+                            f"Lemma audit obligation {index}: {claim.title}",
+                            "## Exact statement\n\n"
+                            + obligation_text
+                            + "\n\n## Conclusion\n\n"
+                            + exact_claim,
+                        ),
+                        tags=["matek/obligation", "matek/lemma-audit"],
+                        relations=[
+                            GraphEdge(
+                                source_id=obligation_id,
+                                relation=RelationType.BLOCKS,
+                                target_id=derivation.matek_id,
+                            )
+                        ],
+                        source_artifacts=[source_artifact],
+                        metadata={
+                            "matek_parent_derivation_ids": [derivation.matek_id],
+                            "matek_dependency_claim_ids": [],
+                            "matek_target_claim_ids": [statement_id],
+                            "matek_conclusion": exact_claim,
+                            "matek_scope": scope,
+                            "matek_notation_definition_version": "1",
+                            "matek_estimated_leverage": 100,
+                        },
+                    )
+                    proposed.append(obligation_node)
+                    created_obligation_ids.append(obligation_id)
+                if created_obligation_ids:
+                    raw_obligation_ids = derivation.metadata.get("matek_obligation_ids", [])
+                    existing_obligation_ids = (
+                        [str(item) for item in raw_obligation_ids]
+                        if isinstance(raw_obligation_ids, list)
+                        else []
+                    )
+                    derivation.metadata["matek_obligation_ids"] = list(
+                        dict.fromkeys([*existing_obligation_ids, *created_obligation_ids])
+                    )
+                    for obligation_id in created_obligation_ids:
+                        if not any(
+                            edge.relation is RelationType.BLOCKED_BY
+                            and edge.target_id == obligation_id
+                            for edge in derivation.relations
+                        ):
+                            derivation.relations.append(
+                                GraphEdge(
+                                    source_id=derivation.matek_id,
+                                    relation=RelationType.BLOCKED_BY,
+                                    target_id=obligation_id,
+                                )
+                            )
+                    derivation.last_modified_run = run_id
+                    derivation.updated_at = now
+                    proposed.append(derivation)
+            return self._upsert_generated_nodes_unlocked(
+                state=state,
+                nodes=by_id,
+                proposed=proposed,
+                run_id=run_id,
+                author="lemma-audit-gate",
+                reason=f"Record independent intermediate-lemma audit {audit_id_text}.",
+                operation_id=operation_id,
+                source_artifacts=[source_artifact],
+            )
+
+    def record_counterexample_audit(
+        self,
+        *,
+        problem_id: str,
+        run_id: str,
+        assignment_id: str,
+        result_local_key: str,
+        nomination: Mapping[str, Any],
+        gate: Mapping[str, Any],
+        source_artifact: str,
+    ) -> GraphMergeResult:
+        """Promote one independently verified exact counterexample to the main target.
+
+        Worker admission deliberately cannot create this edge.  This method re-reads and
+        recomputes the canonical run artifact before adding ``REFUTES`` or changing the frozen
+        target's epistemic status.
+        """
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            state = self._load_state_unlocked()
+            nodes = self._load_nodes_unlocked(include_human_notes=True)
+            by_id = {node.matek_id: node for node in nodes}
+            audit_id = str(nomination.get("audit_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", audit_id):
+                raise GraphValidationError("counterexample audit has an invalid identity")
+            expected_source = (
+                f".matek/runs/{run_id}/research/counterexample-audits/{audit_id}/gate.json"
+            )
+            if source_artifact != expected_source:
+                raise GraphValidationError(
+                    "counterexample audit is not bound to its canonical run artifact"
+                )
+            try:
+                from ..stages.counterexample_audit import (
+                    CounterexampleAuditGateStatus,
+                    CounterexampleGraphReadSnapshot,
+                    verify_persisted_counterexample_audit,
+                )
+
+                gate_path = ensure_path_confined(
+                    self.project_root,
+                    self.project_root / expected_source,
+                )
+                target_id = self.main_claim_id(problem_id)
+                target = by_id.get(target_id)
+                if target is None or target.node_type is not NodeType.CLAIM:
+                    raise GraphValidationError("counterexample audit has no frozen main target")
+                target_statement = normalize_exact_statement(exact_statement(target.body))
+                persisted_nomination, persisted_gate = verify_persisted_counterexample_audit(
+                    gate_path.parent / "nomination.json",
+                    gate_path,
+                    expected_target_statement=target_statement,
+                    graph_snapshot=CounterexampleGraphReadSnapshot(
+                        graph_name=self.graph_name,
+                        state=state,
+                        nodes=tuple(nodes),
+                        main_target_id=target_id,
+                    ),
+                )
+            except GraphValidationError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise GraphValidationError(
+                    f"persisted counterexample-audit evidence failed verification: {exc}"
+                ) from exc
+            if nomination != persisted_nomination.model_dump(mode="json"):
+                raise GraphValidationError(
+                    "caller counterexample nomination differs from its canonical artifact"
+                )
+            if gate != persisted_gate.model_dump(mode="json"):
+                raise GraphValidationError(
+                    "caller counterexample gate differs from its canonical artifact"
+                )
+            if persisted_gate.status is not CounterexampleAuditGateStatus.REFUTATION_VERIFIED:
+                raise GraphValidationError(
+                    "only a verified exact-counterexample gate may refute the main target"
+                )
+            if (
+                persisted_nomination.assignment_id != assignment_id
+                or persisted_nomination.result_local_key != result_local_key
+            ):
+                raise GraphValidationError("counterexample audit belongs to another worker result")
+            if persisted_nomination.main_target_node_id not in {None, target_id}:
+                raise GraphValidationError("counterexample nomination names another main target")
+            try:
+                from ..stages.common import canonical_json_bytes, read_regular_bytes, sha256_bytes
+                from ..stages.research import ResearchWorkerReport
+
+                report_path = ensure_path_confined(
+                    self.project_root,
+                    self.project_root
+                    / ".matek"
+                    / "runs"
+                    / run_id
+                    / "research"
+                    / persisted_nomination.worker_report_path,
+                )
+                worker_report = ResearchWorkerReport.model_validate_json(
+                    read_regular_bytes(report_path)
+                )
+                bound_results = [
+                    result
+                    for result in worker_report.results
+                    if result.local_key == result_local_key
+                ]
+                if len(bound_results) != 1:
+                    raise ValueError("worker report does not contain one bound result")
+                bound_result = bound_results[0]
+                if (
+                    worker_report.assignment_id != assignment_id
+                    or sha256_bytes(canonical_json_bytes(bound_result))
+                    != persisted_nomination.scientific_result_sha256
+                ):
+                    raise ValueError("worker report result differs from the nomination")
+            except (OSError, ValueError) as exc:
+                raise GraphValidationError(
+                    f"counterexample admission binding cannot be reconstructed: {exc}"
+                ) from exc
+            expected_counterexample_id = _deterministic_id(
+                NodeType.COUNTEREXAMPLE,
+                problem_id,
+                run_id,
+                assignment_id,
+                result_local_key,
+                "1",
+            )
+            counterexample = by_id.get(expected_counterexample_id)
+            if counterexample is None or counterexample.node_type is not NodeType.COUNTEREXAMPLE:
+                raise GraphValidationError(
+                    "counterexample audit does not resolve to its deterministic admitted candidate"
+                )
+            if (
+                counterexample.problem_id != problem_id
+                or counterexample.created_in_run != run_id
+                or counterexample.author_role != "matek-scientific-admission"
+                or not node_has_scientific_admission_binding(
+                    counterexample,
+                    run_id=run_id,
+                    assignment_id=assignment_id,
+                    result=bound_result,
+                )
+                or counterexample.tombstone
+                or counterexample.invalidation_reasons
+                or counterexample.epistemic_status
+                in {
+                    EpistemicStatus.STALE,
+                    EpistemicStatus.INCONSISTENT,
+                    EpistemicStatus.REFUTED,
+                }
+                or counterexample.workflow_status
+                in {
+                    WorkflowStatus.BLOCKED,
+                    WorkflowStatus.ABANDONED,
+                    WorkflowStatus.SUPERSEDED,
+                }
+            ):
+                raise GraphValidationError("admitted counterexample is no longer live")
+            admitted_statement = _generated_heading_value(
+                counterexample.body, "Exact statement refuted"
+            )
+            if (
+                admitted_statement is None
+                or normalize_exact_statement(admitted_statement)
+                != normalize_exact_statement(persisted_nomination.exact_statement)
+                or normalize_exact_statement(persisted_nomination.exact_statement)
+                != target_statement
+            ):
+                raise GraphValidationError(
+                    "admitted counterexample exact statement changed after nomination"
+                )
+            if persisted_nomination.proof_or_certificate not in counterexample.evidence:
+                raise GraphValidationError(
+                    "admitted counterexample certificate changed after audit nomination"
+                )
+            verified = persisted_gate.verified_refutation
+            if verified is None or (
+                verified.target_statement_sha256 != sha256_text(target_statement)
+                or verified.certificate_sha256
+                != sha256_text(persisted_nomination.proof_or_certificate)
+            ):
+                raise GraphValidationError(
+                    "passing counterexample gate is not bound to the exact live evidence"
+                )
+            if not any(
+                edge.relation is RelationType.REFUTES and edge.target_id == target_id
+                for edge in counterexample.relations
+            ):
+                counterexample.relations.append(
+                    GraphEdge(
+                        source_id=counterexample.matek_id,
+                        relation=RelationType.REFUTES,
+                        target_id=target_id,
+                    )
+                )
+            now = self._now()
+            counterexample.epistemic_status = EpistemicStatus.AUDIT_PASSED
+            counterexample.workflow_status = WorkflowStatus.COMPLETE
+            counterexample.updated_at = now
+            counterexample.last_modified_run = run_id
+            counterexample.tags = list(
+                dict.fromkeys(
+                    [
+                        *(item for item in counterexample.tags if item != "matek/branch-local"),
+                        "matek/exact-main-counterexample",
+                        "matek/refutation-verified",
+                    ]
+                )
+            )
+            counterexample.source_artifacts = list(
+                dict.fromkeys([*counterexample.source_artifacts, source_artifact])
+            )
+            counterexample.metadata["matek_counterexample_audit_id"] = audit_id
+            counterexample.metadata["matek_counterexample_gate_sha256"] = sha256_file(gate_path)
+
+            target.epistemic_status = EpistemicStatus.REFUTED
+            target.workflow_status = WorkflowStatus.COMPLETE
+            target.updated_at = now
+            target.last_modified_run = run_id
+            target.source_artifacts = list(
+                dict.fromkeys([*target.source_artifacts, source_artifact])
+            )
+            target.metadata["matek_refuted_by_counterexample_id"] = counterexample.matek_id
+            target.metadata["matek_counterexample_audit_id"] = audit_id
+
+            audit_node_id = _deterministic_id(
+                NodeType.AUDIT,
+                problem_id,
+                run_id,
+                audit_id,
+                persisted_gate.target_statement_sha256,
+            )
+            audit_node = GraphNode(
+                matek_id=audit_node_id,
+                node_type=NodeType.AUDIT,
+                problem_id=problem_id,
+                title=f"Independent exact-counterexample audit: {counterexample.title}",
+                epistemic_status=EpistemicStatus.AUDIT_PASSED,
+                workflow_status=WorkflowStatus.COMPLETE,
+                created_in_run=run_id,
+                last_modified_run=run_id,
+                author_role="counterexample-audit-gate",
+                created_at=now,
+                updated_at=now,
+                body=new_generated_body(
+                    f"Independent exact-counterexample audit: {counterexample.title}",
+                    "## Exact statement audited\n\n"
+                    + persisted_nomination.exact_statement
+                    + "\n\n## Deterministic gate\n\n`refutation_verified`\n\n"
+                    + "## Certificate SHA-256\n\n`"
+                    + verified.certificate_sha256
+                    + "`",
+                ),
+                tags=[
+                    "matek/audit",
+                    "matek/counterexample-audit",
+                    "matek/refutation-verified",
+                ],
+                relations=[
+                    GraphEdge(
+                        source_id=audit_node_id,
+                        relation=RelationType.AUDITS,
+                        target_id=counterexample.matek_id,
+                    ),
+                    GraphEdge(
+                        source_id=audit_node_id,
+                        relation=RelationType.AUDITS,
+                        target_id=target_id,
+                    ),
+                    GraphEdge(
+                        source_id=audit_node_id,
+                        relation=RelationType.CREATED_DURING,
+                        target_id=_deterministic_id(NodeType.RUN, problem_id, run_id),
+                    ),
+                ],
+                source_artifacts=[source_artifact],
+                evidence=list(persisted_gate.response_evidence_sha256.values()),
+                metadata={
+                    "matek_audit_id": audit_id,
+                    "matek_audit_status": persisted_gate.status.value,
+                    "matek_statement_sha256": persisted_gate.target_statement_sha256,
+                    "matek_origin_assignment_id": assignment_id,
+                    "matek_result_local_key": result_local_key,
+                },
+            )
+            return self._upsert_generated_nodes_unlocked(
+                state=state,
+                nodes=by_id,
+                proposed=[counterexample, target, audit_node],
+                run_id=run_id,
+                author="counterexample-audit-gate",
+                reason=f"Record independently verified exact counterexample {audit_id}.",
+                operation_id=f"counterexample-audit:{run_id}:{audit_id}",
+                source_artifacts=[source_artifact],
+            )
+
+    def _trusted_context_selection_unlocked(
+        self,
+        *,
+        state: GraphState,
+        nodes: Sequence[GraphNode],
+        problem_id: str,
+        maximum_nodes: int,
+        include_sources: bool,
+        include_audits: bool,
+        include_formalizations: bool,
+    ) -> tuple[list[GraphNode], dict[str, object]]:
+        """Select a bounded downstream context from the canonical trust projection."""
+
+        if maximum_nodes < 1:
+            raise ValueError("trusted context maximum_nodes must be positive")
+        problem_nodes = [node for node in nodes if node.problem_id == problem_id]
+        by_id = {node.matek_id: node for node in problem_nodes}
+        target_id = self.main_claim_id(problem_id)
+        if target_id not in by_id:
+            raise GraphValidationError(
+                f"cannot build trusted context without canonical main claim {target_id}"
+            )
+        ledger = project_markdown_ledger(
+            problem_nodes,
+            graph_revision=state.revision,
+            problem_id=problem_id,
+            target_claim_id=target_id,
+        )
+        trusted_claim_node_ids = trusted_claim_ids(ledger)
+        selected_by_id: dict[str, GraphNode] = {}
+
+        for claim_id in sorted(trusted_claim_node_ids):
+            node = by_id.get(claim_id)
+            if node is None or not _context_node_is_live(node):
+                continue
+            if node.node_type is NodeType.CLAIM:
+                selected_by_id[node.matek_id] = node
+            elif node.node_type is NodeType.DEFINITION and (
+                canonical_admitted_definition_scope(node) is not None
+            ):
+                selected_by_id[node.matek_id] = node
+
+        trusted_route_node_ids: set[str] = set()
+        trusted_proof_attempt_ids: set[str] = set()
+        trusted_derivations = [
+            derivation
+            for derivation in ledger.derivations.values()
+            if derivation.status is DerivationStatus.AUDIT_PASSED
+            and derivation.conclusion_claim_id in trusted_claim_node_ids
+            and set(derivation.premise_claim_ids).issubset(trusted_claim_node_ids)
+            and all(
+                ledger.obligations[obligation_id].status is ObligationStatus.RESOLVED
+                for obligation_id in derivation.obligation_ids
+            )
+        ]
+        for ledger_derivation in trusted_derivations:
+            derivation_node = by_id.get(ledger_derivation.derivation_id)
+            if (
+                derivation_node is not None
+                and derivation_node.node_type is NodeType.DERIVATION
+                and _context_node_is_live(derivation_node)
+            ):
+                selected_by_id[derivation_node.matek_id] = derivation_node
+                trusted_route_node_ids.add(derivation_node.matek_id)
+
+            proof_node = by_id.get(ledger_derivation.proof_attempt_id)
+            if proof_node is None or not _context_node_is_live(proof_node):
+                continue
+            if proof_node.node_type is NodeType.PROOF:
+                selected_by_id[proof_node.matek_id] = proof_node
+                trusted_route_node_ids.add(proof_node.matek_id)
+                continue
+            if (
+                proof_node.node_type is not NodeType.PROOF_ATTEMPT
+                or derivation_node is None
+                or derivation_node.node_type is not NodeType.DERIVATION
+            ):
+                continue
+            identity = derivation_node.metadata.get("matek_admission_identity")
+            payload = derivation_node.metadata.get("matek_admission_payload_sha256")
+            if (
+                isinstance(identity, str)
+                and isinstance(payload, str)
+                and proof_node.metadata.get("matek_admission_identity") == identity
+                and proof_node.metadata.get("matek_admission_payload_sha256") == payload
+                and matches_admission_binding(derivation_node, identity, payload)
+                and matches_admission_binding(proof_node, identity, payload)
+                and any(
+                    edge.relation is RelationType.RELATED_TO
+                    and edge.target_id == proof_node.matek_id
+                    for edge in derivation_node.relations
+                )
+            ):
+                selected_by_id[proof_node.matek_id] = proof_node
+                trusted_proof_attempt_ids.add(proof_node.matek_id)
+
+        if include_sources:
+            for node in problem_nodes:
+                if _verified_source_for_context(node):
+                    selected_by_id[node.matek_id] = node
+
+        if include_formalizations:
+            for node in problem_nodes:
+                if _verified_formalization_for_context(
+                    node,
+                    nodes=by_id,
+                    trusted_claim_node_ids=trusted_claim_node_ids,
+                ):
+                    selected_by_id[node.matek_id] = node
+
+        if include_audits:
+            audit_anchor_ids = set(selected_by_id)
+            for node in problem_nodes:
+                if (
+                    node.node_type is NodeType.AUDIT
+                    and _context_node_is_live(node)
+                    and node.epistemic_status
+                    in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+                    and node.workflow_status is WorkflowStatus.COMPLETE
+                    and any(
+                        edge.relation is RelationType.AUDITS and edge.target_id in audit_anchor_ids
+                        for edge in node.relations
+                    )
+                ):
+                    selected_by_id[node.matek_id] = node
+
+        accepted_main_proof_ids = {
+            node_id
+            for node_id in trusted_route_node_ids
+            for node in [by_id[node_id]]
+            if node.node_type is NodeType.PROOF
+            and node.author_role == "candidate-packager"
+            and node.metadata.get("matek_acceptance_gate_passed") is True
+            and any(
+                edge.relation is RelationType.PROVES and edge.target_id == target_id
+                for edge in node.relations
+            )
+        }
+        main_support_ids: set[str] = {target_id, *accepted_main_proof_ids}
+        for accepted_proof_id in accepted_main_proof_ids:
+            main_support_ids.update(
+                self._main_result_support_ids(
+                    by_id,
+                    target_id=target_id,
+                    accepted_proof_id=accepted_proof_id,
+                )
+            )
+        for ledger_derivation in trusted_derivations:
+            if ledger_derivation.derivation_id in main_support_ids:
+                main_support_ids.add(ledger_derivation.proof_attempt_id)
+        audit_support_ids = {
+            node.matek_id
+            for node in selected_by_id.values()
+            if node.node_type is NodeType.AUDIT
+            and any(
+                edge.relation is RelationType.AUDITS and edge.target_id in main_support_ids
+                for edge in node.relations
+            )
+        }
+        main_support_ids.update(audit_support_ids)
+
+        type_priority = {
+            NodeType.CLAIM: 0,
+            NodeType.DEFINITION: 1,
+            NodeType.PROOF: 2,
+            NodeType.PROOF_ATTEMPT: 3,
+            NodeType.DERIVATION: 4,
+            NodeType.SOURCE: 5,
+            NodeType.AUDIT: 6,
+            NodeType.FORMALIZATION: 7,
+        }
+
+        def priority(node: GraphNode) -> tuple[int, int, str]:
+            if node.matek_id == target_id:
+                group = 0
+            elif node.matek_id in accepted_main_proof_ids:
+                group = 1
+            elif node.matek_id in main_support_ids:
+                group = 2
+            elif node.matek_id in trusted_claim_node_ids:
+                group = 3
+            elif node.matek_id in trusted_route_node_ids | trusted_proof_attempt_ids:
+                group = 4
+            else:
+                group = 5
+            return (group, type_priority.get(node.node_type, 99), node.matek_id)
+
+        eligible = sorted(selected_by_id.values(), key=priority)
+        included = eligible[:maximum_nodes]
+        omitted_count = len(eligible) - len(included)
+        selection = {
+            "policy": _TRUSTED_CONTEXT_POLICY,
+            "maximum_nodes": maximum_nodes,
+            "eligible_node_count": len(eligible),
+            "included_node_count": len(included),
+            "omitted_node_count": omitted_count,
+            "truncated": omitted_count > 0,
+            "canonical_ledger_ambiguity_count": len(ledger.ambiguities),
+            "priority_order": [
+                "main_target",
+                "accepted_main_proof",
+                "accepted_main_proof_support",
+                "other_canonical_trusted_mathematics",
+                "verified_evidence",
+            ],
+        }
+        return included, selection
+
     def manuscript_context(self, problem_id: str) -> dict[str, object]:
         with self._locked():
             self._recover_pending_unlocked()
             state = self._load_state_unlocked()
             nodes = self._load_nodes_unlocked(include_human_notes=False)
-            accepted = [
-                node
-                for node in nodes
-                if node.problem_id == problem_id
-                and node.node_type
-                in {
-                    NodeType.DEFINITION,
-                    NodeType.CLAIM,
-                    NodeType.PROOF,
-                    NodeType.SOURCE,
-                    NodeType.AUDIT,
-                }
-                and (
-                    node.node_type in {NodeType.DEFINITION, NodeType.SOURCE}
-                    or node.epistemic_status
-                    in {
-                        EpistemicStatus.PROVED_INFORMALLY,
-                        EpistemicStatus.AUDIT_PASSED,
-                        EpistemicStatus.LEAN_VERIFIED,
-                    }
-                )
-            ]
+            accepted, selection = self._trusted_context_selection_unlocked(
+                state=state,
+                nodes=nodes,
+                problem_id=problem_id,
+                maximum_nodes=MANUSCRIPT_CONTEXT_MAXIMUM_NODES,
+                include_sources=True,
+                include_audits=True,
+                include_formalizations=False,
+            )
             return {
                 "graph_revision": state.revision,
                 "problem_id": problem_id,
+                "selection": selection,
                 "accepted_nodes": [
                     {
                         "node": _node_summary(node).model_dump(mode="json"),
                         "content": generated_section(node.body),
                         "relations": [edge.model_dump(mode="json") for edge in node.relations],
                     }
-                    for node in accepted[:80]
+                    for node in accepted
                 ],
                 "instruction": (
                     "Use only accepted claim/proof nodes for theorem content. Preserve dependency "
@@ -4034,29 +7719,26 @@ class KnowledgeGraph:
             self._recover_pending_unlocked()
             state = self._load_state_unlocked()
             nodes = self._load_nodes_unlocked(include_human_notes=False)
-            selected = [
-                node
-                for node in nodes
-                if node.problem_id == problem_id
-                and node.node_type
-                in {NodeType.DEFINITION, NodeType.CLAIM, NodeType.PROOF, NodeType.FORMALIZATION}
-                and node.epistemic_status
-                in {
-                    EpistemicStatus.PROVED_INFORMALLY,
-                    EpistemicStatus.AUDIT_PASSED,
-                    EpistemicStatus.LEAN_VERIFIED,
-                }
-            ]
+            selected, selection = self._trusted_context_selection_unlocked(
+                state=state,
+                nodes=nodes,
+                problem_id=problem_id,
+                maximum_nodes=FORMALIZATION_CONTEXT_MAXIMUM_NODES,
+                include_sources=False,
+                include_audits=False,
+                include_formalizations=True,
+            )
             return {
                 "graph_revision": state.revision,
                 "problem_id": problem_id,
+                "selection": selection,
                 "statement_nodes": [
                     {
                         "node": _node_summary(node).model_dump(mode="json"),
                         "content": generated_section(node.body),
                         "content_hash": node.content_hash,
                     }
-                    for node in selected[:60]
+                    for node in selected
                 ],
             }
 

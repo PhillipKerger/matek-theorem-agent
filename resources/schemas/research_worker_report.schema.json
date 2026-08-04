@@ -1,5 +1,311 @@
 {
   "$defs": {
+    "BranchOutcome": {
+      "enum": [
+        "progress",
+        "blocked",
+        "refuted",
+        "candidate_complete"
+      ],
+      "title": "BranchOutcome",
+      "type": "string"
+    },
+    "ScientificArtifactDeclaration": {
+      "additionalProperties": false,
+      "description": "A worker-declared file and its replay contract.\n\nPaths are relative to the assignment-private workspace.  Hashes are deliberately not\naccepted from the worker; MATEK computes them while collecting the workspace.",
+      "properties": {
+        "command_line": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Command Line",
+          "type": "array"
+        },
+        "expected_output": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Output"
+        },
+        "input_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Input Paths",
+          "type": "array"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "purpose": {
+          "title": "Purpose",
+          "type": "string"
+        },
+        "replay_recipe": {
+          "title": "Replay Recipe",
+          "type": "string"
+        },
+        "stderr_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stderr Path"
+        },
+        "stdout_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stdout Path"
+        },
+        "supporting_result_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supporting Result Keys",
+          "type": "array"
+        },
+        "tool_versions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tool Versions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "purpose",
+        "supporting_result_keys",
+        "command_line",
+        "input_paths",
+        "stdout_path",
+        "stderr_path",
+        "expected_output",
+        "replay_recipe",
+        "tool_versions"
+      ],
+      "title": "ScientificArtifactDeclaration",
+      "type": "object"
+    },
+    "ScientificObligationDeclaration": {
+      "additionalProperties": false,
+      "properties": {
+        "conclusion": {
+          "title": "Conclusion",
+          "type": "string"
+        },
+        "dependency_node_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependency Node Ids",
+          "type": "array"
+        },
+        "estimated_leverage": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Estimated Leverage",
+          "type": "integer"
+        },
+        "exact_statement": {
+          "title": "Exact Statement",
+          "type": "string"
+        },
+        "falsification_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Falsification Evidence",
+          "type": "array"
+        },
+        "hypotheses": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Hypotheses",
+          "type": "array"
+        },
+        "local_key": {
+          "title": "Local Key",
+          "type": "string"
+        },
+        "notation_definition_version": {
+          "title": "Notation Definition Version",
+          "type": "string"
+        },
+        "parent_result_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Parent Result Keys",
+          "type": "array"
+        },
+        "quantifiers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Quantifiers",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/ScientificScope"
+        }
+      },
+      "required": [
+        "schema_version",
+        "local_key",
+        "exact_statement",
+        "quantifiers",
+        "hypotheses",
+        "conclusion",
+        "parent_result_keys",
+        "dependency_node_ids",
+        "scope",
+        "notation_definition_version",
+        "falsification_evidence",
+        "estimated_leverage"
+      ],
+      "title": "ScientificObligationDeclaration",
+      "type": "object"
+    },
+    "ScientificResult": {
+      "additionalProperties": false,
+      "properties": {
+        "assumptions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "dependency_node_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependency Node Ids",
+          "type": "array"
+        },
+        "dependency_result_keys": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependency Result Keys",
+          "type": "array"
+        },
+        "disposition": {
+          "$ref": "#/$defs/ScientificResultDisposition"
+        },
+        "exact_gap": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exact Gap"
+        },
+        "exact_statement": {
+          "title": "Exact Statement",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ScientificResultKind"
+        },
+        "local_key": {
+          "title": "Local Key",
+          "type": "string"
+        },
+        "proof_or_certificate": {
+          "title": "Proof Or Certificate",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/ScientificScope"
+        },
+        "target_node_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Target Node Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "local_key",
+        "kind",
+        "exact_statement",
+        "scope",
+        "assumptions",
+        "proof_or_certificate",
+        "exact_gap",
+        "dependency_node_ids",
+        "dependency_result_keys",
+        "target_node_ids",
+        "disposition"
+      ],
+      "title": "ScientificResult",
+      "type": "object"
+    },
+    "ScientificResultDisposition": {
+      "enum": [
+        "partial",
+        "proposed_complete",
+        "refuted_mechanism"
+      ],
+      "title": "ScientificResultDisposition",
+      "type": "string"
+    },
+    "ScientificResultKind": {
+      "enum": [
+        "definition",
+        "lemma",
+        "reduction",
+        "counterexample",
+        "computation",
+        "source_fact"
+      ],
+      "title": "ScientificResultKind",
+      "type": "string"
+    },
+    "ScientificScope": {
+      "enum": [
+        "main",
+        "reduction",
+        "branch",
+        "computation"
+      ],
+      "title": "ScientificScope",
+      "type": "string"
+    },
     "SourceEvidenceClaim": {
       "additionalProperties": false,
       "description": "A prose claim linked explicitly to stable source IDs.",
@@ -93,73 +399,24 @@
       ],
       "title": "SourcePurpose",
       "type": "string"
-    },
-    "WorkerStatus": {
-      "enum": [
-        "progress",
-        "blocked",
-        "refuted",
-        "candidate_complete"
-      ],
-      "title": "WorkerStatus",
-      "type": "string"
     }
   },
   "additionalProperties": false,
+  "description": "Provider-visible v2 report containing mathematics rather than persistence mutations.",
   "properties": {
+    "artifact_manifest": {
+      "items": {
+        "$ref": "#/$defs/ScientificArtifactDeclaration"
+      },
+      "title": "Artifact Manifest",
+      "type": "array"
+    },
     "assignment_id": {
       "title": "Assignment Id",
       "type": "string"
     },
-    "assumptions": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Assumptions",
-      "type": "array"
-    },
-    "counterexamples": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Counterexamples",
-      "type": "array"
-    },
-    "dependencies": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Dependencies",
-      "type": "array"
-    },
-    "exact_gap": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Exact Gap"
-    },
-    "formal_results": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Formal Results",
-      "type": "array"
-    },
-    "graph_patch": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "title": "Graph Patch"
+    "branch_outcome": {
+      "$ref": "#/$defs/BranchOutcome"
     },
     "mechanism": {
       "anyOf": [
@@ -172,33 +429,42 @@
       ],
       "title": "Mechanism"
     },
-    "proof_content": {
-      "title": "Proof Content",
-      "type": "string"
+    "results": {
+      "items": {
+        "$ref": "#/$defs/ScientificResult"
+      },
+      "title": "Results",
+      "type": "array"
     },
-    "sources": {
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_ledger": {
       "items": {
         "$ref": "#/$defs/SourceLedgerEntry"
       },
-      "title": "Sources",
+      "title": "Source Ledger",
       "type": "array"
     },
-    "status": {
-      "$ref": "#/$defs/WorkerStatus"
+    "unresolved_obligations": {
+      "items": {
+        "$ref": "#/$defs/ScientificObligationDeclaration"
+      },
+      "title": "Unresolved Obligations",
+      "type": "array"
     }
   },
   "required": [
+    "schema_version",
     "assignment_id",
-    "status",
-    "formal_results",
-    "proof_content",
-    "exact_gap",
-    "sources",
-    "assumptions",
-    "counterexamples",
-    "dependencies",
-    "mechanism",
-    "graph_patch"
+    "results",
+    "unresolved_obligations",
+    "source_ledger",
+    "artifact_manifest",
+    "branch_outcome",
+    "mechanism"
   ],
   "title": "ResearchWorkerReport",
   "type": "object"

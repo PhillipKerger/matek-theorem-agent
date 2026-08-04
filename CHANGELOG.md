@@ -1,12 +1,93 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — Unreleased
 
+- Replaced new full-copy graph snapshots with schema-v2 content-addressed node/edge blobs, compact
+  delta manifests, parent/content integrity roots, and periodic full checkpoints. Existing
+  schema-v1 snapshots remain byte-preserving and read-only; offline reconstruct and verification
+  commands work across both formats, and snapshot corruption now fails graph validation.
+- Froze the exact target, canonical contract, and compiled prompt by normalized source SHA-256.
+  Deterministic clause alignment now blocks contract-clause drift, while the explicitly confirmed
+  `matek run PROBLEM_FILE --migrate-target REASON` path records a versioned migration, survives
+  resume, and invalidates affected evidence. Same-contract rewordings are recorded as cosmetic
+  paraphrases and do not replace the frozen bytes by default.
+- Replaced worker-authored graph patches with `ResearchWorkerReport` schema v2. Workers report
+  typed mathematics, obligations, sources, computation declarations, and branch outcomes;
+  application code owns identities, relation directions, status rules, and deterministic graph
+  admission. The legacy-named `research/graph-patches/` files are admission records with
+  `model_authored_patch = false`. Admission is idempotent on run, assignment, local result key, and
+  result schema version. Nonempty assumption contracts and partial results are retained as
+  quarantined proof attempts with explicit obligations, cannot act as same-report premises, and
+  cannot support candidates or either audit lane; only eligible complete, assumption-free results
+  create proposed derivations.
+- Added an integrity-protected canonical claim/derivation/obligation ledger alongside the complete
+  Markdown archive. Trusted closure now models AND-premises and OR derivations, quarantines
+  ambiguous, partial, gapped, or assumption-bearing evidence, and exposes a bounded smallest-known-
+  open-cut computation without overstating minimality when the search is capped. Obligation logical
+  versions now cover exact statement, conclusion, quantifiers, hypotheses, dependency and target
+  claim IDs, scope, notation-definition version, and falsification evidence.
+- Hardened acceptance against evidence-envelope forgery: exact-target candidates must match the
+  frozen normalized theorem, persisted computation manifests and replay verdicts are reverified
+  before graph admission, and blind lemma gates are recomputed from their immutable role artifacts.
+  Successful lemma audits resolve only the exact live obligation they audited; changed premises,
+  fabricated mappings, proposed zero-premise derivations, and model-only refutation stops fail
+  closed. Prompt-only forced replay now freezes the original pre-gate candidate-support slice so
+  graph promotion from the first pass cannot trigger duplicate candidate/audit calls.
+- Added the production exact-counterexample terminal lane. Only a complete typed main-scope result
+  matching the frozen theorem can be nominated; official verifier and hostile-falsifier requests,
+  independently accounted responses, and the deterministic gate are persisted and hash-bound to
+  the immutable worker report, transitive support closure, dependency versions, current canonical
+  graph, and independently replayed computations. Policy settings and distinct role contexts are
+  frozen; `FAIL` and parsed `BLOCKED` judgments take terminal precedence. Missing or tampered
+  evidence pauses or fails closed, resume calls only genuinely missing roles, and only a recomputed
+  passing gate may return `RESEARCH_REJECTED` or add a main-target `REFUTES` edge. A frozen
+  retryable `BLOCKED` nomination survives unrelated graph revisions; a genuine canonical support
+  change durably supersedes the old audit with a reason and artifacts, creates a new audit ID, and
+  reruns the required roles.
+- Added durable `explore`, `consolidate`, `bottleneck`, `adversarial_audit`, and `synthesize`
+  scientific phases, configurable under `[research.scientific_phase]`, with exact-duplicate merge,
+  near-duplicate redirection, durable one-obligation bottleneck focus, five-role rotation across
+  activations, queued old-phase retirement, and audited-premise synthesis.
+- Added live blind verifier/falsifier transactions for exact, gap-free, non-main open-cut lemmas.
+  Schema-v2 evidence binds distinct application execution contexts and optional sanitized provider
+  session IDs across inputs, responses, and gates. Role evidence resumes independently. Existing
+  schema-v1 artifacts are archived byte-for-byte beneath an integrity manifest and both roles must
+  rerun as v2 before graph trust; an intermediate pass is hard-coded not to accept the main target
+  or authorize manuscript generation. Missing-role retries preserve SHA-addressed gate checkpoints;
+  resume adopts only authenticated monotone evidence progress and repairs response accounting.
+- Unified manuscript and formalization graph inputs behind one bounded trusted-context selector.
+  Accepted main-proof support is prioritized; informal/open claims, unverified sources,
+  unauthenticated or unresolved routes, experiments, and archive-only evidence are excluded. Each
+  context now reports its policy, cap, eligible/included/omitted counts, truncation state, ledger
+  ambiguity count, and priority order.
+- Added private per-assignment computation workspaces, quota- and path-safe collection into a
+  run-local content-addressed store, and independent replay through restricted Docker with
+  filesystem confinement and networking disabled; unsafe native replay is refused. A passing
+  replay yields only proposed evidence pending mathematical/domain audit, while unreplayed or
+  mismatching computations remain non-proof evidence.
+- Canonicalized verified sources by DOI, base arXiv ID, MR, ISBN, then stable URL while retaining
+  revisions, aliases, evidence links, and provenance. Distinct identifiers no longer merge by
+  title or through a shared URL carrying conflicting stable identifiers, including across runs;
+  later verified identifiers upgrade compatible provisional entities without changing their
+  stable node identity. Worker-result `CITES` edges require explicit source references. Exact
+  normalized statement plus scope defines claim identity; semantic near-duplicates require audit
+  or an explicit equivalence derivation instead of fuzzy merging.
+- Added `matek graph migrate-legacy`, which defaults to an external integrity-protected read-only
+  plan. The explicitly confirmed `--apply-plan` form rejects stale, tampered, or wrong-graph plans
+  and performs one atomic idempotent backfill while retaining legacy nodes and snapshots as archive
+  evidence. It creates proposed proof attempts/derivations, aliases and refutation quarantines, and
+  queued verifier/falsifier tasks without making model calls or granting audit trust.
 - Coordinator context schema v3 ranks graph evidence by scientific relevance, emits bounded typed
   node digests, caps unrequested full graph evidence at 120,000 characters, deduplicates exact
   repeated content, and uses an intentional versioned section order with expanded manifest
   accounting. Consequential actions citing omitted evidence now defer into authenticated
   retrieval-only activations; frozen legacy manifests retain exact replay identity.
+- Made target-registry publication part of the same recoverable graph transaction as compiled
+  target admission, and versioned scientific-phase evidence with a phase epoch so stale audit or
+  synthesis signals cannot advance a resumed run.
+- Added a sanitized, synthetic-derived legacy worker-report regression corpus. It exercises the
+  historical envelope shapes described by the available archive notes without claiming replay of
+  the unavailable original multi-gigabyte run archives.
 
 - Added explicit bootstrap/continuation/resume coordinator activation metadata with current and
   previous graph revisions. Fresh coordinator contexts now reconstruct the branch map from
@@ -18,9 +99,7 @@
 - Preserved one registry record and graph approach node per assignment branch rather than
   collapsing same-family work. Blocked/refuted branches retain their failure and reopen
   conditions, while automatically distilled counterexamples remain branch-local unless an
-  explicit typed claim-refutation proposal passes independent review.
-- Fixed worker graph-patch role binding so a worker cannot impersonate an auditor, create
-  `audit_passed` or `lean_verified` evidence, or directly mark a claim refuted.
+  exact-claim scientific refutation result passes independent review.
 
 ## 0.3.0 — 2026-07-23
 
@@ -65,7 +144,8 @@
   skipped stages, and retriable actions. Publication-only defects no longer overwrite scientific
   status or prevent statement-aligned Lean formalization.
 - Research audit artifacts now carry role-specific rationales and nonempty
-  `checks_performed` evidence, and graph-patch warnings report only the actual patch defect.
+  `checks_performed` evidence, and the legacy v0.3 graph-mutation warning reports only the actual
+  admission defect. The Unreleased schema-v2 boundary above supersedes that mutation protocol.
 - Added a persisted resilience taxonomy (`integrity`, `execution`, `evidence`, `scientific`, and
   `resource`). Only security/state/artifact integrity failures hard-stop; recoverable provider,
   source, worker, graph-mutation, and audit failures now produce warnings or coordinator events.
@@ -79,8 +159,9 @@
 - Literature-only source outages now quarantine and qualify dependent claims without blocking
   research, with an `arxiv.org/abs/` fallback; strict proof, citation, and bibliography gates are
   unchanged.
-- Scientific worker reports are committed before optional graph proposals, workers no longer
-  supply trusted graph hashes, and invalid/stale graph mutations cannot discard valid results.
+- Scientific worker reports are committed before the legacy graph-mutation integration, workers
+  do not supply trusted graph hashes, and an invalid/stale graph admission cannot discard valid
+  results. The Unreleased schema-v2 boundary removes the optional model proposal entirely.
 - Candidate audits checkpoint independently and resume retries only missing checks. Reports and
   `matek status` now separate scientific from workflow state and expose audit progress and resume
   obligations.
@@ -99,9 +180,10 @@
   stable IDs, separate claims/proofs/audits/formalizations, typed relation constraints, portable
   Markdown source, rebuildable SQLite indexing, snapshots, dashboards, and curated canvases.
 - Integrated graph frontier memory and graph-scoped tasks into the continuous coordinator.
-  Workers receive bounded context slices and return structured optimistic-concurrency patches;
-  the deterministic service performs conflict/duplicate/status/DAG checks and atomic idempotent
-  merges only after raw worker evidence is durable.
+  Workers receive bounded context slices, and the deterministic service performs
+  conflict/duplicate/status/DAG checks and atomic idempotent integration only after raw worker
+  evidence is durable. The Unreleased schema-v2 report admission replaces the original v0.3
+  model-mutation boundary.
 - Added dependency and exact-statement invalidation, human-edit ownership rules, preservation of
   distilled failed/partial routes, manuscript mappings, and exact-version Lean verification
   records. Added `matek graph` init/validate/status/frontier/rebuild/open/export/diff and focused

@@ -34,6 +34,15 @@ Requirements:
   Keep this snapshot concise; the later framework sections must still provide the full protocol.
 - Produce a self-contained, technically precise prompt with no unresolved editorial
   placeholders.
+- Treat `normalized_statement` and `claim_contract` as two exact encodings of the same target.
+  Every material contract clause must appear explicitly in `normalized_statement`; do not leave
+  theorem-strength information only in the compiled prompt or contract metadata.
+- Give applicable contract clauses clear keys for `quantifiers`, `constants`, `additive_terms`,
+  `domain`, `edge_cases`, `polarity`, and `conclusion`. Preserve all quantified variables,
+  constants and additive terms (for example `+ beta`), deterministic versus randomized
+  qualifiers, finite versus arbitrary domains, exceptional cases, and prove-versus-refute
+  posture. If the input does not settle one of these material choices, request clarification
+  instead of strengthening or weakening the theorem.
 - Use public web search aggressively to verify definitions, known results, primary sources,
   exact bottlenecks, and bibliographic metadata.
 - Classify the exact target's relationship to existing literature as `unknown`,

@@ -1,0 +1,27 @@
+{
+  "assignment_id": "kserver-archived-route-31",
+  "status": "refuted",
+  "formal_results": [],
+  "proof_content": "On the three-point path metric with initial servers at the endpoints, the alternating request sequence makes the proposed memoryless-transfer inequality fail at the middle point. This refutes only that transfer mechanism.",
+  "exact_gap": null,
+  "sources": [],
+  "assumptions": [
+    "The route uses the proposed memoryless transfer inequality"
+  ],
+  "counterexamples": [
+    "A three-point path instance refutes the proposed memoryless-transfer inequality, not the k-server theorem."
+  ],
+  "dependencies": [
+    "CLM-KSRVPRE1"
+  ],
+  "mechanism": "hostile small-instance test of a memoryless transfer",
+  "graph_patch": {
+    "graph_task_id": "kserver-archived-route-31",
+    "nodes": [
+      {
+        "type": "counterexample",
+        "refutes": "main"
+      }
+    ]
+  }
+}

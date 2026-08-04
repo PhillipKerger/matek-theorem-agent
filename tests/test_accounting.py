@@ -34,8 +34,9 @@ class Answer(BaseModel):
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, *, request_metadata: dict[str, Any] | None = None) -> None:
         self.calls = 0
+        self.request_metadata = request_metadata or {}
 
     async def generate_structured(
         self, request: ModelRequest, output_type: type[T]
@@ -57,6 +58,7 @@ class FakeClient:
                 reasoning_tokens=3,
                 estimated_cost_usd=0.25,
             ),
+            request_metadata=self.request_metadata,
         )
 
 
@@ -90,6 +92,21 @@ class RoleAwareClient(FakeClient):
     ) -> RoleAwareClient:
         del stage, run_root
         self.observed_roles.append(role)
+        return self
+
+
+class WorkspaceAwareClient(RoleAwareClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.workspace_bindings: list[tuple[Path, tuple[Path, ...]]] = []
+
+    def for_workspace(
+        self,
+        workspace_root: Path,
+        *,
+        writable_paths: tuple[Path, ...] = (),
+    ) -> WorkspaceAwareClient:
+        self.workspace_bindings.append((workspace_root, writable_paths))
         return self
 
 
@@ -201,6 +218,52 @@ async def test_accounting_decorator_creates_explicit_model_role_contexts(
     assert delegate.observed_roles == [None, "research-orchestrator"]
 
 
+@pytest.mark.asyncio
+async def test_accounting_forwards_workspace_binding_and_preserves_shared_journals(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    workspace = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = workspace / "scratch"
+    scratch.mkdir(parents=True)
+    delegate = WorkspaceAwareClient()
+    budget = BudgetTracker(Limits(maximum_cost_usd=1.0))
+    accounting = AccountingModelClient(
+        delegate,
+        stage="research",
+        budget=budget,
+        logger=RunLogger(run_root),
+        role="research-worker",
+    )
+
+    bound = accounting.for_workspace(workspace, writable_paths=(scratch,))
+    request = ModelRequest("worker", "assignment", ModelSettings())
+    first = await bound.generate_structured(request, Answer)
+    replayed = await accounting.generate_structured(request, Answer)
+
+    assert first.parsed.value == "ok"
+    assert replayed.parsed.value == "ok"
+    assert delegate.workspace_bindings == [(workspace, (scratch,))]
+    assert delegate.calls == 1
+    assert budget.snapshot().calls == 1
+
+
+def test_accounting_workspace_binding_requires_delegate_support(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    accounting = AccountingModelClient(
+        FakeClient(),
+        stage="research",
+        budget=BudgetTracker(Limits(maximum_cost_usd=1.0)),
+        logger=RunLogger(run_root),
+        role="research-worker",
+    )
+
+    with pytest.raises(TypeError, match="does not support"):
+        accounting.for_workspace(run_root, writable_paths=(run_root / "scratch",))
+
+
 async def test_run_wall_clock_cancels_an_in_flight_model_call(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     (run_root / "logs").mkdir(parents=True)
@@ -282,6 +345,49 @@ async def test_model_call_is_atomically_checkpointed_and_replayed_after_restart(
     assert second_delegate.calls == 0
     assert second_budget.snapshot().calls == 1
     assert len((run_root / "logs" / "usage.jsonl").read_text().splitlines()) == 1
+
+
+async def test_provider_session_identity_survives_checkpoint_and_replay(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "logs").mkdir(parents=True)
+    request = ModelRequest("audit", "frozen packet", ModelSettings(web_search=False))
+    delegate = FakeClient(
+        request_metadata={
+            "session_id": "thread-safe-123",
+            "untrusted_extra": "must-not-be-checkpointed",
+        }
+    )
+    first = AccountingModelClient(
+        delegate,
+        stage="lemma_audit",
+        budget=BudgetTracker(Limits(maximum_cost_usd=1.0)),
+        logger=RunLogger(run_root),
+    )
+
+    live = await first.generate_structured(request, Answer)
+    cached = await first.generate_structured(request, Answer)
+    record_path = next((run_root / "logs" / "model_calls").glob("*.json"))
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+
+    recovered_usage = load_usage_journal_strict(run_root / "logs" / "usage.jsonl")
+    replay = AccountingModelClient(
+        FakeClient(),
+        stage="lemma_audit",
+        budget=BudgetTracker(Limits(maximum_cost_usd=1.0), recovered_usage),
+        logger=RunLogger(run_root),
+    )
+    restarted = await replay.generate_structured(request, Answer)
+
+    assert delegate.calls == 1
+    assert live.request_metadata["session_id"] == "thread-safe-123"
+    assert cached.request_metadata["session_id"] == "thread-safe-123"
+    assert restarted.request_metadata["session_id"] == "thread-safe-123"
+    assert record["schema_version"] == 2
+    assert record["provider_session_id"] == "thread-safe-123"
+    assert "untrusted_extra" not in record_path.read_text(encoding="utf-8")
+    assert "untrusted_extra" not in restarted.request_metadata
 
 
 async def test_replay_backfills_usage_if_crash_happened_after_response_checkpoint(

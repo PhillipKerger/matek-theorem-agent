@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import matek_theorem_agent.stages.research as research_stage
 from matek_theorem_agent.budget import BudgetExceeded, BudgetSnapshot
@@ -15,12 +16,33 @@ from matek_theorem_agent.codex_client import CodexRequest, CodexResult
 from matek_theorem_agent.config import ModelSettings
 from matek_theorem_agent.coordinator_context import serialize_coordinator_payload
 from matek_theorem_agent.execution.base import CommandRequest, CommandResult
-from matek_theorem_agent.knowledge_graph import KnowledgeGraph
+from matek_theorem_agent.knowledge_graph import (
+    ClaimType,
+    EpistemicStatus,
+    GraphEdge,
+    GraphNodeCreate,
+    GraphNodeUpdate,
+    GraphPatch,
+    GraphValidationError,
+    KnowledgeGraph,
+    NodeType,
+    RelationType,
+    WorkflowStatus,
+)
 from matek_theorem_agent.openai_client import (
     ModelInputTooLargeError,
     ModelRequest,
     ModelResult,
     StructuredOutputError,
+)
+from matek_theorem_agent.scientific import (
+    BranchOutcome,
+    ScientificArtifactDeclaration,
+    ScientificObligationDeclaration,
+    ScientificResult,
+    ScientificResultDisposition,
+    ScientificResultKind,
+    ScientificScope,
 )
 from matek_theorem_agent.source_provenance import (
     SourceVerificationRecord,
@@ -29,6 +51,7 @@ from matek_theorem_agent.source_provenance import (
 )
 from matek_theorem_agent.stages.common import (
     StageValidationError,
+    atomic_write_json,
     atomic_write_text,
     sha256_json,
     sha256_text,
@@ -46,6 +69,12 @@ from matek_theorem_agent.stages.compile_prompt import (
     compile_prompt,
     find_unresolved_placeholders,
 )
+from matek_theorem_agent.stages.computation_artifacts import ComputationReplayIsolation
+from matek_theorem_agent.stages.counterexample_audit import (
+    CounterexampleAuditDecision,
+    CounterexampleAuditResponse,
+    CounterexampleAuditRole,
+)
 from matek_theorem_agent.stages.lean import (
     MANDATORY_ALIGNMENT_FIELDS,
     AlignmentCheck,
@@ -58,6 +87,13 @@ from matek_theorem_agent.stages.lean import (
     LeanWorkflowSettings,
     run_lean_pipeline,
     scan_generated_lean,
+)
+from matek_theorem_agent.stages.lemma_audit import (
+    LemmaAuditDecision,
+    LemmaAuditResponse,
+    LemmaAuditRole,
+    LemmaNomination,
+    run_lemma_audit,
 )
 from matek_theorem_agent.stages.manuscript import (
     BibliographyAudit,
@@ -96,7 +132,15 @@ from matek_theorem_agent.stages.research import (
     ResearchWorkerReport,
     ResearchWorkflowSettings,
     WorkerStatus,
+    adapt_research_worker_report_v1,
     run_adaptive_research,
+)
+from matek_theorem_agent.stages.scientific_phase import (
+    ScientificPhase,
+    ScientificPhasePolicy,
+    ScientificPhaseState,
+    ScientificRole,
+    load_scientific_phase_state,
 )
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -139,6 +183,558 @@ MATEK_FIXTURE_WHITEPAPER_ID = "2099.99999"
 MATEK_FIXTURE_WHITEPAPER_URL = f"https://arxiv.org/abs/{MATEK_FIXTURE_WHITEPAPER_ID}"
 
 
+def research_worker_report_v1(**values: Any) -> ResearchWorkerReport:
+    """Build an archived flat fixture only through the explicit compatibility adapter."""
+
+    return adapt_research_worker_report_v1(values)
+
+
+def typed_worker_report_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "assignment_id": "typed-worker-fixture",
+        "results": [
+            {
+                "schema_version": 1,
+                "local_key": "lemma-1",
+                "kind": "lemma",
+                "exact_statement": "For every n, P(n).",
+                "scope": "branch",
+                "assumptions": [],
+                "proof_or_certificate": "A complete proof of the scoped lemma.",
+                "exact_gap": None,
+                "dependency_node_ids": [],
+                "dependency_result_keys": [],
+                "target_node_ids": [],
+                "disposition": "partial",
+            }
+        ],
+        "unresolved_obligations": [],
+        "source_ledger": [],
+        "artifact_manifest": [],
+        "branch_outcome": "progress",
+        "mechanism": "Direct induction on n.",
+    }
+
+
+def test_research_worker_v2_provider_schema_omits_low_level_graph_mutations() -> None:
+    schema = ResearchWorkerReport.model_json_schema()
+    properties = schema["properties"]
+    assert set(properties) == {
+        "schema_version",
+        "assignment_id",
+        "results",
+        "unresolved_obligations",
+        "source_ledger",
+        "artifact_manifest",
+        "branch_outcome",
+        "mechanism",
+    }
+    rendered = json.dumps(schema, sort_keys=True)
+    for forbidden in (
+        "graph_patch",
+        "base_graph_revision",
+        "run_id",
+        "task_id",
+        "create_nodes",
+        "update_nodes",
+        "add_edges",
+    ):
+        assert forbidden not in rendered
+
+
+def test_resumed_assignment_must_match_current_scientific_phase_epoch() -> None:
+    archived = research_stage.ResearchAssignmentState(
+        assignment=ResearchAssignment(
+            id="stale-bottleneck-route",
+            approach_family="cut attack",
+            task="Attack the old cut.",
+            expected_output="A proof or exact gap.",
+            scientific_phase=ScientificPhase.BOTTLENECK,
+            scientific_role=ScientificRole.PROVER,
+            target_obligation_ids=["OBL-OLD10000"],
+            mechanism_delta="Try the old decomposition in reverse.",
+        ),
+        admitted_by_decision=1,
+        scientific_phase_epoch=2,
+    )
+    resumed = research_stage.ResearchAssignmentState.model_validate_json(archived.model_dump_json())
+    cycled_state = ScientificPhaseState(
+        phase=ScientificPhase.BOTTLENECK,
+        phase_epoch=4,
+    )
+
+    assert not research_stage._assignment_matches_active_scientific_phase(
+        resumed,
+        cycled_state,
+    )
+    assert research_stage._assignment_matches_active_scientific_phase(
+        resumed.model_copy(update={"scientific_phase_epoch": 4}),
+        cycled_state,
+    )
+
+
+def test_bare_main_claim_open_cut_has_a_semantic_phase_target_version(tmp_path: Path) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    graph = KnowledgeGraph(tmp_path, "bare-main-cut")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-bare-main-cut",
+    )
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-bare-main-cut",
+        compiled_problem=compiled_problem().model_dump(mode="json"),
+    )
+    target_id = graph.main_claim_id(problem_id)
+
+    versions = research_stage._scientific_target_versions(
+        graph.load_nodes(),
+        graph_revision=graph.load_state().revision,
+        problem_id=problem_id,
+        target_claim_id=target_id,
+    )
+
+    assert target_id in versions
+    assert len(versions[target_id]) == 64
+
+
+@pytest.mark.asyncio
+async def test_late_old_epoch_workers_do_not_advance_the_current_scientific_phase(
+    tmp_path: Path,
+) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    run_id = "run-stale-phase-workers"
+    graph = KnowledgeGraph(tmp_path, "stale-phase-workers")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=run_id,
+    )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=run_id,
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    target_id = graph.main_claim_id(problem_id)
+
+    class StaggeredPhaseClient:
+        def __init__(self) -> None:
+            self.release_old_epoch = asyncio.Event()
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[Any],
+        ) -> ModelResult[Any]:
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                assignments = [
+                    ResearchAssignment(
+                        id=f"stale-route-{index}",
+                        approach_family=family,
+                        task=f"Investigate {family}.",
+                        expected_output="A proof or exact gap.",
+                        target_node_ids=[target_id],
+                    )
+                    for index, family in enumerate(
+                        ("direct", "structural", "probabilistic", "computational"),
+                        start=1,
+                    )
+                ]
+                memory = payload["knowledge_graph_memory"]
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=assignments,
+                        rationale=(
+                            f"Graph review {memory['graph_revision']}: launch a staggered "
+                            "phase-transition fixture."
+                        ),
+                    ),
+                    response_id="stale-phase-coordinator",
+                )
+            assert output_type is ResearchWorkerReport
+            assignment_id = payload["assignment"]["id"]
+            if assignment_id == "stale-route-1":
+                asyncio.get_running_loop().call_later(0.01, self.release_old_epoch.set)
+            else:
+                await self.release_old_epoch.wait()
+            return ModelResult(
+                parsed=ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    unresolved_obligations=[
+                        ScientificObligationDeclaration(
+                            local_key="exact-gap",
+                            exact_statement=f"Complete the {assignment_id} route.",
+                            conclusion=f"Complete the {assignment_id} route.",
+                        )
+                    ],
+                    branch_outcome=BranchOutcome.BLOCKED,
+                    mechanism=payload["assignment"]["task"],
+                ),
+                response_id=f"stale-phase-{assignment_id}",
+            )
+
+    research_dir = tmp_path / ".matek" / "runs" / run_id / "research"
+    result = await run_adaptive_research(
+        client=StaggeredPhaseClient(),  # type: ignore[arg-type]
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=1,
+            scientific_phase_policy=ScientificPhasePolicy(
+                no_audited_progress_assignments=1,
+            ),
+        ),
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    phase_state = load_scientific_phase_state(
+        research_dir / "coordinator" / "scientific-phase.json"
+    )
+    assert phase_state.phase is ScientificPhase.CONSOLIDATE
+    assert phase_state.phase_epoch == 1
+    assert phase_state.completed_assignment_count == 1
+    assert phase_state.progress_counted_assignment_ids == ["stale-route-1"]
+    scheduler = json.loads(
+        (research_dir / "coordinator" / "state.json").read_text(encoding="utf-8")
+    )
+    assert all(record["status"] == "completed" for record in scheduler["assignments"])
+
+
+def test_no_gap_progress_report_cannot_pass_adversarial_phase_without_durable_audits() -> None:
+    target_id = "OBL-AUDIT001"
+    target_version = "c" * 64
+
+    def evidence_record(
+        assignment_id: str,
+        role: ScientificRole,
+        *,
+        audited: bool,
+        audit_target_id: str = target_id,
+    ) -> tuple[research_stage.ResearchAssignmentState, ResearchWorkerReport]:
+        audit_records = (
+            [
+                research_stage.IntermediateLemmaAuditRecord(
+                    result_local_key="checked-claim",
+                    nomination_id=f"nomination-{assignment_id}",
+                    graph_revision="00000001-fixture",
+                    target_obligation_ids=[audit_target_id],
+                    target_obligation_versions={audit_target_id: target_version},
+                    gate_status=research_stage.LemmaAuditGateStatus.AUDIT_PASSED,
+                    nomination_path=f"lemma-audits/{assignment_id}/nomination.json",
+                    nomination_sha256="a" * 64,
+                    gate_path=f"lemma-audits/{assignment_id}/gate.json",
+                    gate_sha256="b" * 64,
+                    graph_recorded=True,
+                )
+            ]
+            if audited
+            else []
+        )
+        record = research_stage.ResearchAssignmentState(
+            assignment=ResearchAssignment(
+                id=assignment_id,
+                approach_family=role.value,
+                task="Audit the exact cut obligation.",
+                expected_output="An independently checked result.",
+                scientific_phase=ScientificPhase.ADVERSARIAL_AUDIT,
+                scientific_role=role,
+                target_obligation_ids=[target_id],
+                target_obligation_versions=[
+                    research_stage.TargetObligationVersion(
+                        obligation_id=target_id,
+                        logical_version=target_version,
+                    )
+                ],
+                mechanism_delta=f"Use the {role.value} lane.",
+            ),
+            admitted_by_decision=2,
+            scientific_phase_epoch=7,
+            status=research_stage.AssignmentLifecycle.COMPLETED,
+            intermediate_lemma_audits=audit_records,
+        )
+        report = ResearchWorkerReport(
+            assignment_id=assignment_id,
+            results=[
+                ScientificResult(
+                    local_key="checked-claim",
+                    kind=ScientificResultKind.LEMMA,
+                    exact_statement=f"The {role.value} check passes.",
+                    scope=ScientificScope.BRANCH,
+                    proof_or_certificate="Complete independently checkable argument.",
+                    disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                )
+            ],
+            branch_outcome=BranchOutcome.PROGRESS,
+            mechanism=role.value,
+        )
+        return record, report
+
+    no_audit_record, no_audit_report = evidence_record(
+        "no-gap-progress",
+        ScientificRole.FALSIFIER,
+        audited=False,
+    )
+    assert not research_stage._adversarial_audit_has_durable_pass_evidence(
+        [no_audit_record],
+        {no_audit_report.assignment_id: no_audit_report},
+        phase_epoch=7,
+        active_cut_ids=[],
+        current_obligation_versions={target_id: target_version},
+    )
+
+    falsifier_record, falsifier_report = evidence_record(
+        "audited-falsifier",
+        ScientificRole.FALSIFIER,
+        audited=True,
+    )
+    transfer_record, transfer_report = evidence_record(
+        "audited-transfer",
+        ScientificRole.TRANSFER_AUDITOR,
+        audited=True,
+    )
+    assert research_stage._adversarial_audit_has_durable_pass_evidence(
+        [falsifier_record, transfer_record],
+        {
+            falsifier_report.assignment_id: falsifier_report,
+            transfer_report.assignment_id: transfer_report,
+        },
+        phase_epoch=7,
+        active_cut_ids=[],
+        current_obligation_versions={target_id: target_version},
+    )
+
+    assert not research_stage._adversarial_audit_has_durable_pass_evidence(
+        [falsifier_record, transfer_record],
+        {
+            falsifier_report.assignment_id: falsifier_report,
+            transfer_report.assignment_id: transfer_report,
+        },
+        phase_epoch=7,
+        active_cut_ids=[],
+        current_obligation_versions={target_id: "d" * 64},
+    )
+
+    legacy_payload = falsifier_record.model_dump(mode="json")
+    legacy_payload["intermediate_lemma_audits"][0].pop("target_obligation_ids")
+    legacy_payload["intermediate_lemma_audits"][0].pop("target_obligation_versions")
+    legacy_falsifier = research_stage.ResearchAssignmentState.model_validate(legacy_payload)
+    assert legacy_falsifier.intermediate_lemma_audits[0].target_obligation_ids == []
+    assert not research_stage._adversarial_audit_has_durable_pass_evidence(
+        [legacy_falsifier, transfer_record],
+        {
+            falsifier_report.assignment_id: falsifier_report,
+            transfer_report.assignment_id: transfer_report,
+        },
+        phase_epoch=7,
+        active_cut_ids=[],
+        current_obligation_versions={target_id: target_version},
+    )
+
+    unrelated_target_id = "OBL-OTHER001"
+    unrelated_falsifier, unrelated_falsifier_report = evidence_record(
+        "unrelated-falsifier",
+        ScientificRole.FALSIFIER,
+        audited=True,
+        audit_target_id=unrelated_target_id,
+    )
+    unrelated_transfer, unrelated_transfer_report = evidence_record(
+        "unrelated-transfer",
+        ScientificRole.TRANSFER_AUDITOR,
+        audited=True,
+        audit_target_id=unrelated_target_id,
+    )
+    assert not research_stage._adversarial_audit_has_durable_pass_evidence(
+        [unrelated_falsifier, unrelated_transfer],
+        {
+            unrelated_falsifier_report.assignment_id: unrelated_falsifier_report,
+            unrelated_transfer_report.assignment_id: unrelated_transfer_report,
+        },
+        phase_epoch=7,
+        active_cut_ids=[],
+        current_obligation_versions={
+            target_id: target_version,
+            unrelated_target_id: target_version,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation_field",
+    ["graph_patch", "run_id", "task_id", "base_graph_revision", "update_nodes"],
+)
+def test_research_worker_v2_rejects_model_authored_identity_and_mutation_fields(
+    mutation_field: str,
+) -> None:
+    payload = typed_worker_report_payload()
+    payload[mutation_field] = {"model_authored": True}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ResearchWorkerReport.model_validate(payload)
+
+
+def test_archived_worker_v1_reports_adapt_without_schema_rejection() -> None:
+    archived = [
+        {
+            "assignment_id": "atsp-route",
+            "status": "progress",
+            "formal_results": ["A cycle-cover reduction holds under hypothesis H."],
+            "proof_content": "Derive the reduction directly from the decomposition.",
+            "exact_gap": "Remove hypothesis H.",
+            "sources": [],
+            "assumptions": ["H"],
+            "counterexamples": [],
+            "dependencies": ["CLM-ABCDEF12", "Prove the transfer lemma."],
+            "mechanism": "cycle-cover reduction",
+            "graph_patch": {"run_id": "legacy-run", "update_nodes": []},
+        },
+        {
+            "assignment_id": "matroid-route",
+            "status": "blocked",
+            "formal_results": [],
+            "proof_content": "The exchange argument stops at the correlation step.",
+            "exact_gap": "Prove negative correlation for the selected basis.",
+            "sources": [],
+            "assumptions": [],
+            "counterexamples": [],
+            "dependencies": [],
+            "mechanism": "exchange argument",
+            "graph_patch": None,
+        },
+        {
+            "assignment_id": "k-server-route",
+            "status": "refuted",
+            "formal_results": [],
+            "proof_content": "The displayed three-point instance violates the branch lemma.",
+            "exact_gap": None,
+            "sources": [],
+            "assumptions": [],
+            "counterexamples": ["A three-point metric refutes the proposed transfer lemma."],
+            "dependencies": [],
+            "mechanism": "hostile small-instance search",
+            "graph_patch": '{"nodes": []}',
+        },
+    ]
+
+    normalized = [adapt_research_worker_report_v1(item) for item in archived]
+
+    assert len(normalized) == len(archived)
+    assert all(item.schema_version == 2 for item in normalized)
+    assert all("graph_patch" not in item.model_dump(mode="json") for item in normalized)
+    assert normalized[0].unresolved_obligations
+    assert normalized[1].branch_outcome.value == "blocked"
+    assert normalized[2].counterexamples
+
+
+def test_gapped_or_blocked_worker_result_cannot_be_proposed_complete() -> None:
+    gapped = typed_worker_report_payload()
+    gapped["results"][0]["exact_gap"] = "Prove the induction step."
+    gapped["results"][0]["disposition"] = "proposed_complete"
+    with pytest.raises(ValidationError, match="exact gap is a proof attempt"):
+        ResearchWorkerReport.model_validate(gapped)
+
+    blocked = typed_worker_report_payload()
+    blocked["results"][0]["scope"] = "main"
+    blocked["results"][0]["disposition"] = "proposed_complete"
+    blocked["branch_outcome"] = "blocked"
+    blocked["unresolved_obligations"] = [
+        {
+            "schema_version": 1,
+            "local_key": "open-gap",
+            "exact_statement": "Prove the induction step.",
+            "quantifiers": [],
+            "hypotheses": [],
+            "conclusion": "The induction step holds.",
+            "parent_result_keys": ["lemma-1"],
+            "dependency_node_ids": [],
+            "scope": "main",
+            "notation_definition_version": "1",
+            "falsification_evidence": [],
+            "estimated_leverage": 100,
+        }
+    ]
+    with pytest.raises(
+        ValidationError,
+        match="blocked branch cannot contain a proposed_complete main result",
+    ):
+        ResearchWorkerReport.model_validate(blocked)
+
+
+def test_blocked_branch_can_preserve_a_complete_restricted_lemma() -> None:
+    payload = typed_worker_report_payload()
+    payload["branch_outcome"] = "blocked"
+    payload["unresolved_obligations"] = [
+        {
+            "local_key": "main-gap",
+            "exact_statement": "Extend the restricted lemma to the main domain.",
+            "conclusion": "The main-domain theorem holds.",
+            "scope": "main",
+        }
+    ]
+    payload["results"][0]["disposition"] = "proposed_complete"
+
+    report = ResearchWorkerReport.model_validate(payload)
+
+    assert report.results[0].scope is ScientificScope.BRANCH
+    assert report.results[0].disposition is ScientificResultDisposition.PROPOSED_COMPLETE
+
+
+def test_incomplete_counterexample_cannot_create_a_refutation() -> None:
+    payload = typed_worker_report_payload()["results"][0]
+    payload.update(
+        {
+            "kind": "counterexample",
+            "disposition": "refuted_mechanism",
+            "exact_gap": "Check that the proposed instance satisfies the domain assumptions.",
+        }
+    )
+
+    with pytest.raises(ValidationError, match="incomplete counterexample"):
+        ScientificResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("dependency_keys", "match"),
+    [
+        (["missing-result"], "unknown local result"),
+        (["lemma-1"], "cannot depend on itself"),
+    ],
+)
+def test_worker_report_rejects_invalid_local_result_dependencies(
+    dependency_keys: list[str],
+    match: str,
+) -> None:
+    payload = typed_worker_report_payload()
+    payload["results"][0]["dependency_result_keys"] = dependency_keys
+
+    with pytest.raises(ValidationError, match=match):
+        ResearchWorkerReport.model_validate(payload)
+
+
+def test_worker_report_rejects_local_result_dependency_cycle() -> None:
+    payload = typed_worker_report_payload()
+    second = dict(payload["results"][0])
+    second["local_key"] = "lemma-2"
+    second["dependency_result_keys"] = ["lemma-1"]
+    payload["results"][0]["dependency_result_keys"] = ["lemma-2"]
+    payload["results"].append(second)
+
+    with pytest.raises(ValidationError, match="dependency cycle"):
+        ResearchWorkerReport.model_validate(payload)
+
+
 def test_prompt_compiler_requires_compact_cdc_aligned_research_mandate() -> None:
     instructions = PROMPT_COMPILER_INSTRUCTIONS.read_text(encoding="utf-8")
     normalized = " ".join(instructions.split())
@@ -151,6 +747,10 @@ def test_prompt_compiler_requires_compact_cdc_aligned_research_mandate() -> None
         "problem-specific adversarial checks",
         "permitted public-search boundary",
         "audited complete solution",
+        "additive terms",
+        "deterministic versus randomized",
+        "finite versus arbitrary",
+        "prove-versus-refute",
     ):
         assert requirement in normalized
 
@@ -224,7 +824,7 @@ def compiled_problem(
 ) -> CompiledProblem:
     return CompiledProblem(
         title="Fixture theorem",
-        normalized_statement="Prove the fixture theorem.",
+        normalized_statement="Prove P(n) for every n.",
         claim_contract={"quantifiers": "for every n", "conclusion": "P n"},
         compiled_prompt=prompt or covered_compiled_prompt(),
         source_ledger=[],
@@ -296,7 +896,10 @@ async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
         "prompt_validation",
         "source_ledger",
         "source_verification",
+        "target_alignment",
     }
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
     assert client.requests[0].settings.reasoning_effort == "xhigh"
     assert client.requests[0].settings.web_search is True
     assert "Allowed terminal reductions: none" in result.compiled_prompt
@@ -312,6 +915,154 @@ async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
             framework_path=FRAMEWORK,
             prompts_dir=tmp_path / "bad",
         )
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_persists_hash_bound_k_server_target_alignment(
+    tmp_path: Path,
+) -> None:
+    statement = (
+        "Prove that on arbitrary metric spaces, for every k there exists beta such that "
+        "cost_ALG <= k * OPT + beta."
+    )
+    contract = {
+        "quantifiers": "for every k there exists beta",
+        "domain": "arbitrary metric spaces",
+        "additive_terms": "cost_ALG <= k * OPT + beta",
+        "polarity": "prove",
+        "conclusion": "cost_ALG <= k * OPT + beta",
+    }
+    payload = CompiledProblem(
+        title="K-server target",
+        normalized_statement=statement,
+        claim_contract=contract,
+        compiled_prompt=covered_compiled_prompt(),
+    )
+
+    result = await compile_prompt(
+        client=StaticClient([payload]),
+        problem_text="Prove the k-server bound including its additive constant.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
+
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
+    persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
+    assert persisted["passed"] is True
+    assert persisted["statement_sha256"] == sha256_text(statement)
+    canonical_contract = "\n".join(f"{key}\0{value}" for key, value in sorted(contract.items()))
+    assert persisted["contract_sha256"] == sha256_text(canonical_contract)
+    assert "target_alignment" in result.artifacts.paths
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
+    tmp_path: Path,
+) -> None:
+    payload = CompiledProblem(
+        title="Weakened k-server target",
+        normalized_statement=(
+            "Prove that on arbitrary metric spaces, for every k there exists beta such that "
+            "cost_ALG <= k * OPT."
+        ),
+        claim_contract={
+            "quantifiers": "for every k there exists beta",
+            "domain": "arbitrary metric spaces",
+            "additive_terms": "cost_ALG <= k * OPT + beta",
+            "polarity": "prove",
+            "conclusion": "cost_ALG <= k * OPT + beta",
+        },
+        compiled_prompt=covered_compiled_prompt(),
+    )
+    client = StaticClient([payload])
+
+    with pytest.raises(StageValidationError, match=r"Missing.*\+ beta"):
+        await compile_prompt(
+            client=client,
+            problem_text="Prove the k-server bound including its additive constant.",
+            framework_path=FRAMEWORK,
+            prompts_dir=tmp_path,
+        )
+
+    assert len(client.requests) == 1
+    persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
+    assert persisted["passed"] is False
+    additive_check = next(
+        check for check in persisted["checks"] if check["category"] == "additive_terms"
+    )
+    assert additive_check["passed"] is False
+    assert "+ beta" in additive_check["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statement", "contract", "expected_category", "missing_marker"),
+    [
+        (
+            "Prove the guarantee for every deterministic online algorithm.",
+            {"algorithm_domain": "randomized online algorithm"},
+            "domain",
+            "randomized",
+        ),
+        (
+            "Prove the guarantee on every finite metric space.",
+            {"domain": "arbitrary metric spaces"},
+            "domain",
+            "arbitrary",
+        ),
+        (
+            "Prove P(n) for every n.",
+            {"quantifiers": "there exists n such that P(n)"},
+            "quantifiers",
+            "exists n",
+        ),
+        (
+            "Prove that the conjecture holds.",
+            {"polarity": "refute the conjecture by a counterexample"},
+            "polarity",
+            "refute/disprove polarity",
+        ),
+        (
+            "For every n, foo(n) <= bar(n) + beta.",
+            {"conclusion": "cost_ALG(n) <= k * OPT(n) + beta"},
+            "additive_terms",
+            "cost_alg",
+        ),
+        (
+            "For every n, cost(n) <= 2 * OPT(n).",
+            {"conclusion": "cost(n) <= 3 * OPT(n)"},
+            "conclusion",
+            "3",
+        ),
+    ],
+)
+async def test_prompt_compiler_blocks_material_target_clause_drift(
+    tmp_path: Path,
+    statement: str,
+    contract: dict[str, str],
+    expected_category: str,
+    missing_marker: str,
+) -> None:
+    payload = CompiledProblem(
+        title="Clause drift fixture",
+        normalized_statement=statement,
+        claim_contract=contract,
+        compiled_prompt=covered_compiled_prompt(),
+    )
+
+    with pytest.raises(StageValidationError, match="does not match the claim contract"):
+        await compile_prompt(
+            client=StaticClient([payload]),
+            problem_text="Exercise deterministic target-clause validation.",
+            framework_path=FRAMEWORK,
+            prompts_dir=tmp_path,
+        )
+
+    persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
+    check = next(item for item in persisted["checks"] if item["category"] == expected_category)
+    assert check["passed"] is False
+    assert missing_marker in check["detail"]
 
 
 @pytest.mark.asyncio
@@ -675,7 +1426,7 @@ async def test_malformed_required_literature_source_is_quarantined_not_aborted(
 
 
 @pytest.mark.asyncio
-async def test_invalid_optional_graph_proposal_does_not_discard_scientific_report(
+async def test_typed_worker_report_drives_graph_integration_without_model_patch(
     tmp_path: Path,
 ) -> None:
     problem = tmp_path / "problem.md"
@@ -691,8 +1442,14 @@ async def test_invalid_optional_graph_proposal_does_not_discard_scientific_repor
         problem_text=problem.read_text(encoding="utf-8"),
         run_id="run-graph-warning",
     )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-graph-warning",
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
 
-    class InvalidGraphProposalClient(SuccessfulResearchClient):
+    class TypedScientificClient(SuccessfulResearchClient):
         def __init__(self) -> None:
             super().__init__()
             self.initial_graph_review_seen = False
@@ -732,28 +1489,23 @@ async def test_invalid_optional_graph_proposal_does_not_discard_scientific_repor
                 )
             if output_type is ResearchWorkerReport:
                 assert self.initial_graph_review_seen
-                task_id = payload["graph_task_id"]
-                result.parsed.graph_patch = json.dumps(
-                    {
-                        "base_graph_revision": payload["base_graph_revision"],
-                        "run_id": "run-graph-warning",
-                        "task_id": task_id,
-                        "update_nodes": [
-                            {
-                                "matek_id": problem_id,
-                                "expected_content_hash": "not-a-server-bound-hash",
-                                "body": "Invalid optional mutation.",
-                                "reason": "Exercise graph quarantine.",
-                            }
-                        ],
-                    }
-                )
+                assert "graph_patch" not in request.instructions
+                assert "graph_patch" not in request.input_text
+                assert "graph_patch_contract" not in payload
+                assert "graph_patch" not in payload
+                assert "scientific_result_contract" in payload
+                result.parsed.results = [
+                    scientific_result.model_copy(
+                        update={"exact_statement": compiled.normalized_statement}
+                    )
+                    for scientific_result in result.parsed.results
+                ]
             return result
 
-    client = InvalidGraphProposalClient()
+    client = TypedScientificClient()
     result = await run_adaptive_research(
         client=client,
-        compiled_problem=compiled_problem(),
+        compiled_problem=compiled,
         research_dir=tmp_path / "research",
         knowledge_graph=graph,
         graph_problem_id=problem_id,
@@ -763,15 +1515,747 @@ async def test_invalid_optional_graph_proposal_does_not_discard_scientific_repor
     assert result.worker_reports
     assert client.initial_graph_review_seen
     assert result.accepted_for_manuscript
-    graph_issue = next(
-        issue for issue in result.execution_issues if issue.event_kind == "graph_mutation_rejected"
+    assert result.acceptance_gate is not None
+    assert result.acceptance_gate.graph_support_bindings_sha256 is not None
+    candidate_input = json.loads(
+        next((tmp_path / "research" / "candidate" / "attempts").glob("*/input.json")).read_text(
+            encoding="utf-8"
+        )
     )
-    assert graph_issue.recovery_obligations == [
-        "Discard or repair the optional graph proposal; retain the validated scientific report."
+    canonical_support = candidate_input["candidate_canonical_graph_support"]
+    assert canonical_support["blocking_obligations"] == []
+    assert {node["node_type"] for node in canonical_support["bindings"][0]["support_nodes"]} == {
+        "claim",
+        "proof_attempt",
+        "derivation",
+    }
+    assert not [
+        issue for issue in result.execution_issues if issue.event_kind == "graph_mutation_rejected"
     ]
     patch_records = list((tmp_path / "research" / "graph-patches").glob("*.json"))
     assert patch_records
-    assert any(json.loads(path.read_text(encoding="utf-8"))["warning"] for path in patch_records)
+    for path in patch_records:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["model_authored_patch"] is False
+        assert "proposed_patch_json" not in record
+    raw_reports = list((tmp_path / "research" / "workers").glob("*.raw.json"))
+    assert raw_reports
+    raw_payload = json.loads(raw_reports[0].read_text(encoding="utf-8"))
+    normalized_path = raw_reports[0].with_name(
+        raw_reports[0].name.removesuffix(".raw.json") + ".json"
+    )
+    normalized_payload = json.loads(normalized_path.read_text(encoding="utf-8"))
+    assert raw_payload["schema_version"] == 2
+    assert normalized_payload["schema_version"] == 2
+    evidence_path = (
+        tmp_path / "research" / "worker-evidence" / f"{normalized_payload['assignment_id']}.json"
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["raw_report"] == raw_payload
+    assert evidence["normalized_report"] == normalized_payload
+
+
+@pytest.mark.asyncio
+async def test_gap_free_intermediate_results_run_live_blind_independent_audits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    graph = KnowledgeGraph(tmp_path, "lemma-live")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-lemma-live",
+    )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-lemma-live",
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    target_id = graph.main_claim_id(problem_id)
+    dependency_id = "CLM-0000000000000000D001"
+    dependency_tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id="run-lemma-live",
+        decision_id=900,
+        assignments=[
+            {
+                "id": "dependency-seed",
+                "approach_family": "prior-audit",
+                "task": "Record the already audited fixture premise.",
+                "expected_output": "One frozen dependency lemma.",
+                "target_node_ids": [target_id],
+            }
+        ],
+    )
+    dependency_task_id = dependency_tasks["dependency-seed"]
+    dependency_created = graph.merge_patch(
+        GraphPatch(
+            base_graph_revision=graph.load_state().revision,
+            run_id="run-lemma-live",
+            task_id=dependency_task_id,
+            agent_role="research-auditor-fixture",
+            create_nodes=[
+                GraphNodeCreate(
+                    matek_id=dependency_id,
+                    node_type=NodeType.CLAIM,
+                    claim_type=ClaimType.LEMMA,
+                    title="Audited fixture premise",
+                    body="## Exact statement\n\nThe fixture premise holds.",
+                    epistemic_status=EpistemicStatus.AUDIT_PASSED,
+                )
+            ],
+        ),
+        problem_id=problem_id,
+        operation_id="create-audited-fixture-premise",
+    )
+    assert dependency_created.committed
+
+    class IntermediateAuditClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.audit_inputs: list[str] = []
+            self.response_ids_by_request: dict[tuple[str, str, str], str] = {}
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[Any],
+        ) -> ModelResult[Any]:
+            request_identity = (
+                output_type.__name__,
+                request.instructions,
+                request.input_text,
+            )
+            response_id = self.response_ids_by_request.get(request_identity)
+            if response_id is None:
+                self.calls += 1
+                response_id = f"lemma-live-{self.calls}"
+                self.response_ids_by_request[request_identity] = response_id
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                assert payload["literature_refresh"]["literature_status"] == "unknown"
+                assert payload["literature_refresh"]["verified_source_ledger"] == []
+                assert "cannot rewrite" in payload["literature_refresh"]["instruction"]
+                assert payload["scientific_phase_state"]["phase"] == "explore"
+                assert payload["compiled_prompt"] == compiled.compiled_prompt
+                assert payload["claim_contract"] == compiled.claim_contract.as_dict()
+                assert payload["exact_target_policy"]["acceptance_requires_exact_claim_contract"]
+                assignments = (
+                    [
+                        ResearchAssignment(
+                            id=f"lemma-worker-{index}",
+                            approach_family=f"family-{index}",
+                            task=f"Prove restricted lemma {index}",
+                            expected_output="A complete scoped lemma.",
+                            target_node_ids=[target_id],
+                        )
+                        for index in range(1, 5)
+                    ]
+                    if payload["initial_portfolio"]
+                    else []
+                )
+                parsed: BaseModel = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=assignments,
+                    rationale=(
+                        f"Graph review {payload['knowledge_graph_memory']['graph_revision']}: "
+                        "audit exact restricted lemmas."
+                    ),
+                    stop_recommended=not assignments,
+                    stop_reason=(
+                        None if assignments else "The configured fixture budget is exhausted."
+                    ),
+                    stop_category="budget",
+                )
+            elif output_type is ResearchWorkerReport:
+                assignment = payload["assignment"]
+                statement = f"Every object in restricted class {assignment['id']} has property P."
+                parsed = ResearchWorkerReport(
+                    assignment_id=assignment["id"],
+                    results=[
+                        ScientificResult(
+                            local_key="restricted-lemma",
+                            kind=ScientificResultKind.LEMMA,
+                            exact_statement=statement,
+                            scope=ScientificScope.BRANCH,
+                            proof_or_certificate="A complete induction over the restricted class.",
+                            dependency_node_ids=[dependency_id],
+                            target_node_ids=[target_id],
+                            disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                        )
+                    ],
+                    branch_outcome=BranchOutcome.PROGRESS,
+                    mechanism=assignment["task"],
+                )
+            elif output_type is LemmaAuditResponse:
+                self.audit_inputs.append(request.input_text)
+                packet = payload["blind_lemma_audit_packet"]
+                role = LemmaAuditRole(payload["audit_role"])
+                parsed = LemmaAuditResponse(
+                    audit_role=role,
+                    audit_id=packet["audit_id"],
+                    statement_sha256=packet["statement_sha256"],
+                    decision=LemmaAuditDecision.PASS,
+                    statement_aligned=True,
+                    proof_valid=True if role is LemmaAuditRole.VERIFIER else None,
+                    proof_step_ids_checked=[item["step_id"] for item in packet["proof_steps"]],
+                    source_artifact_ids_checked=[
+                        item["artifact_id"] for item in packet["source_artifacts"]
+                    ],
+                    checks_performed=["Checked the exact statement and every supplied step."],
+                    boundary_or_adversarial_cases=(
+                        ["Checked the smallest and empty-boundary cases."]
+                        if role is LemmaAuditRole.FALSIFIER
+                        else []
+                    ),
+                    rationale="The independent role found no unresolved defect.",
+                )
+            else:  # pragma: no cover - this fixture permits no terminal candidate lane
+                raise AssertionError(output_type)
+            return ModelResult(parsed=parsed, response_id=response_id)
+
+    client = IntermediateAuditClient()
+    research_dir = tmp_path / ".matek" / "runs" / "run-lemma-live" / "research"
+    original_record_lemma_audit = graph.record_lemma_audit
+    fail_first_graph_commit = True
+
+    def flaky_record_lemma_audit(**kwargs: Any) -> Any:
+        nonlocal fail_first_graph_commit
+        if fail_first_graph_commit:
+            fail_first_graph_commit = False
+            raise RuntimeError("simulated crash-boundary graph interruption")
+        return original_record_lemma_audit(**kwargs)
+
+    monkeypatch.setattr(graph, "record_lemma_audit", flaky_record_lemma_audit)
+    result = await run_adaptive_research(
+        client=client,  # type: ignore[arg-type]
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+        ),
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id="run-lemma-live",
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    gates = sorted((research_dir / "lemma-audits").glob("lemma-*/gate.json"))
+    assert len(gates) == 4
+    assert len(client.audit_inputs) == 8
+    assert all("origin_confidence" not in item for item in client.audit_inputs)
+    assert all("desired_verdict" not in item for item in client.audit_inputs)
+    scheduler_path = research_dir / "coordinator" / "state.json"
+    scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    pending_graph_records = [
+        (assignment, assignment["intermediate_lemma_audits"][0])
+        for assignment in scheduler["assignments"]
+        if not assignment["intermediate_lemma_audits"][0]["graph_recorded"]
+    ]
+    assert len(pending_graph_records) == 1
+    pending_assignment, pending_audit = pending_graph_records[0]
+    legacy_gate = research_dir / pending_audit["gate_path"]
+    legacy_input = legacy_gate.parent / "input.json"
+    input_payload = json.loads(legacy_input.read_text(encoding="utf-8"))
+    input_payload["schema_version"] = 1
+    input_payload.pop("execution_context_ids")
+    atomic_write_json(legacy_input, input_payload)
+    for response_path in sorted((legacy_gate.parent / "responses").glob("*.json")):
+        response_payload = json.loads(response_path.read_text(encoding="utf-8"))
+        response_payload["schema_version"] = 1
+        response_payload.pop("execution_context_id")
+        response_payload.pop("provider_session_id")
+        atomic_write_json(response_path, response_payload)
+    gate_payload = json.loads(legacy_gate.read_text(encoding="utf-8"))
+    gate_payload["schema_version"] = 1
+    gate_payload.pop("execution_context_ids")
+    gate_payload.pop("provider_session_ids")
+    atomic_write_json(legacy_gate, gate_payload)
+    pending_audit["gate_sha256"] = hashlib.sha256(legacy_gate.read_bytes()).hexdigest()
+    scheduler["phase"] = "running"
+    scheduler["stop_reason"] = None
+    scheduler["stop_category"] = None
+    scheduler["final_outcome"] = None
+    scheduler["final_obligations"] = []
+    scheduler["final_strongest_result"] = ""
+    atomic_write_json(scheduler_path, scheduler)
+
+    calls_before_resume = len(client.audit_inputs)
+    resumed = await run_adaptive_research(
+        client=client,  # type: ignore[arg-type]
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+        ),
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id="run-lemma-live",
+    )
+
+    assert resumed.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert len(client.audit_inputs) == calls_before_resume + 2
+    assert json.loads(legacy_gate.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert (legacy_gate.parent / "legacy-v1" / "manifest.json").is_file()
+    scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    assert all(
+        assignment["intermediate_lemma_audits"][0]["graph_recorded"]
+        for assignment in scheduler["assignments"]
+    )
+    assert pending_assignment["assignment"]["id"] in {
+        assignment["assignment"]["id"] for assignment in scheduler["assignments"]
+    }
+    # Four newly audited intermediates plus the pre-audited dependency fixture.
+    assert len(graph.frontier(problem_id).strongest_audited_results) == 5
+
+    dependency_changed = graph.merge_patch(
+        GraphPatch(
+            base_graph_revision=graph.load_state().revision,
+            run_id="run-lemma-live",
+            task_id=dependency_task_id,
+            agent_role="research-auditor-fixture",
+            update_nodes=[
+                GraphNodeUpdate(
+                    matek_id=dependency_id,
+                    body="## Exact statement\n\nThe strengthened fixture premise holds.",
+                    reason="Exercise the post-audit dependency-version boundary.",
+                )
+            ],
+        ),
+        problem_id=problem_id,
+        operation_id="mutate-audited-fixture-premise",
+    )
+    assert dependency_changed.committed
+    first_gate = gates[0]
+    first_nomination = first_gate.parent / "nomination.json"
+    with pytest.raises(GraphValidationError, match=r"no longer live|changed after audit"):
+        graph.record_lemma_audit(
+            problem_id=problem_id,
+            run_id="run-lemma-live",
+            nomination=json.loads(first_nomination.read_text(encoding="utf-8")),
+            gate=json.loads(first_gate.read_text(encoding="utf-8")),
+            source_artifact=(
+                ".matek/runs/run-lemma-live/research/lemma-audits/"
+                f"{first_gate.parent.name}/gate.json"
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_intermediate_lemma_resume_reuses_frozen_nomination_and_only_missing_role(
+    tmp_path: Path,
+) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    graph = KnowledgeGraph(tmp_path, "lemma-missing-role")
+    run_id = "run-lemma-missing-role"
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=run_id,
+    )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=run_id,
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    target_id = graph.main_claim_id(problem_id)
+    dependency_id = "CLM-0000000000000000D101"
+    dependency_tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id=run_id,
+        decision_id=901,
+        assignments=[
+            {
+                "id": "missing-role-dependency",
+                "approach_family": "prior-audit",
+                "task": "Record a trusted fixture premise.",
+                "expected_output": "One frozen dependency lemma.",
+                "target_node_ids": [target_id],
+            }
+        ],
+    )
+    dependency_task_id = dependency_tasks["missing-role-dependency"]
+    dependency_created = graph.merge_patch(
+        GraphPatch(
+            base_graph_revision=graph.load_state().revision,
+            run_id=run_id,
+            task_id=dependency_task_id,
+            agent_role="research-auditor-fixture",
+            create_nodes=[
+                GraphNodeCreate(
+                    matek_id=dependency_id,
+                    node_type=NodeType.CLAIM,
+                    claim_type=ClaimType.LEMMA,
+                    title="Trusted missing-role fixture premise",
+                    body="## Exact statement\n\nThe frozen fixture premise holds.",
+                    epistemic_status=EpistemicStatus.AUDIT_PASSED,
+                )
+            ],
+        ),
+        problem_id=problem_id,
+        operation_id="create-missing-role-fixture-premise",
+    )
+    assert dependency_created.committed
+
+    class MissingRoleClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.failed_falsifier = False
+            self.failed_audit_id: str | None = None
+            self.audit_attempts: list[tuple[str, LemmaAuditRole]] = []
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[Any],
+        ) -> ModelResult[Any]:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                assignments = (
+                    [
+                        ResearchAssignment(
+                            id=f"missing-role-worker-{index}",
+                            approach_family=f"family-{index}",
+                            task=f"Investigate fixture route {index}.",
+                            expected_output="A complete restricted lemma or exact obstruction.",
+                            target_node_ids=[target_id],
+                        )
+                        for index in range(1, 5)
+                    ]
+                    if payload["initial_portfolio"]
+                    else []
+                )
+                parsed: BaseModel = ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=assignments,
+                    rationale=(
+                        f"Graph review {payload['knowledge_graph_memory']['graph_revision']}: "
+                        "exercise frozen missing-role lemma-audit resume."
+                    ),
+                    stop_recommended=not assignments,
+                    stop_reason=None if assignments else "The fixture work is complete.",
+                    stop_category="budget",
+                )
+            elif output_type is ResearchWorkerReport:
+                assignment_id = payload["assignment"]["id"]
+                if assignment_id == "missing-role-worker-1":
+                    parsed = ResearchWorkerReport(
+                        assignment_id=assignment_id,
+                        results=[
+                            ScientificResult(
+                                local_key="frozen-intermediate",
+                                kind=ScientificResultKind.LEMMA,
+                                exact_statement=(
+                                    "Every object in the frozen restricted class has property P."
+                                ),
+                                scope=ScientificScope.BRANCH,
+                                proof_or_certificate=(
+                                    "A complete induction proves the restricted statement."
+                                ),
+                                dependency_node_ids=[dependency_id],
+                                target_node_ids=[target_id],
+                                disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                            )
+                        ],
+                        branch_outcome=BranchOutcome.PROGRESS,
+                        mechanism="Complete the frozen restricted induction.",
+                    )
+                else:
+                    parsed = ResearchWorkerReport(
+                        assignment_id=assignment_id,
+                        results=[],
+                        unresolved_obligations=[
+                            ScientificObligationDeclaration(
+                                local_key="unused-route",
+                                exact_statement="Complete this unused fixture route.",
+                                conclusion="Complete this unused fixture route.",
+                            )
+                        ],
+                        branch_outcome=BranchOutcome.BLOCKED,
+                        mechanism="No result on this unused fixture route.",
+                    )
+            elif output_type is LemmaAuditResponse:
+                packet = payload["blind_lemma_audit_packet"]
+                role = LemmaAuditRole(payload["audit_role"])
+                audit_id = packet["audit_id"]
+                self.audit_attempts.append((audit_id, role))
+                if role is LemmaAuditRole.FALSIFIER and not self.failed_falsifier:
+                    self.failed_falsifier = True
+                    self.failed_audit_id = audit_id
+                    raise RuntimeError("fixture falsifier transport interruption")
+                decision = (
+                    LemmaAuditDecision.BLOCKED
+                    if role is LemmaAuditRole.FALSIFIER
+                    else LemmaAuditDecision.PASS
+                )
+                parsed = LemmaAuditResponse(
+                    audit_role=role,
+                    audit_id=audit_id,
+                    statement_sha256=packet["statement_sha256"],
+                    decision=decision,
+                    statement_aligned=True,
+                    proof_valid=True if role is LemmaAuditRole.VERIFIER else None,
+                    proof_step_ids_checked=[item["step_id"] for item in packet["proof_steps"]],
+                    source_artifact_ids_checked=[
+                        item["artifact_id"] for item in packet["source_artifacts"]
+                    ],
+                    checks_performed=["Checked the frozen statement and supplied evidence."],
+                    boundary_or_adversarial_cases=(
+                        ["The final boundary case remains unresolved."]
+                        if role is LemmaAuditRole.FALSIFIER
+                        else []
+                    ),
+                    rationale=(
+                        "The boundary case requires additional mathematical evidence."
+                        if decision is LemmaAuditDecision.BLOCKED
+                        else "The supplied proof is complete."
+                    ),
+                    obligations=(
+                        ["Resolve the final boundary case in the frozen intermediate lemma."]
+                        if decision is LemmaAuditDecision.BLOCKED
+                        else []
+                    ),
+                )
+            else:  # pragma: no cover - this fixture has no main candidate
+                raise AssertionError(output_type)
+            return ModelResult(parsed=parsed, response_id=f"missing-role-{self.calls}")
+
+    client = MissingRoleClient()
+    research_dir = tmp_path / ".matek" / "runs" / run_id / "research"
+    workflow_settings = ResearchWorkflowSettings(
+        minimum_initial_assignments=4,
+        maximum_concurrent_agents=4,
+        maximum_pending_assignments=4,
+        maximum_coordinator_decisions=2,
+    )
+    interrupted = await run_adaptive_research(
+        client=client,  # type: ignore[arg-type]
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=workflow_settings,
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+
+    assert interrupted.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert interrupted.pause_reason == "LEMMA_AUDIT_INCOMPLETE"
+    assert client.failed_audit_id is not None
+    audit_id = client.failed_audit_id
+    audit_dir = research_dir / "lemma-audits" / audit_id
+    nomination_path = audit_dir / "nomination.json"
+    gate_path = audit_dir / "gate.json"
+    nomination_before = nomination_path.read_bytes()
+    frozen_revision = json.loads(nomination_before)["current_graph_revision"]
+    gate_payload = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert gate_payload["missing_roles"] == [LemmaAuditRole.FALSIFIER.value]
+    assert (audit_dir / "responses" / f"{LemmaAuditRole.VERIFIER.value}.json").is_file()
+    assert not (audit_dir / "responses" / f"{LemmaAuditRole.FALSIFIER.value}.json").exists()
+    scheduler_path = research_dir / "coordinator" / "state.json"
+    scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    frozen_record = next(
+        audit
+        for assignment in scheduler["assignments"]
+        for audit in assignment["intermediate_lemma_audits"]
+        if audit["nomination_id"] == audit_id
+    )
+    assert not frozen_record["graph_recorded"]
+    assert not any(node.metadata.get("matek_audit_id") == audit_id for node in graph.load_nodes())
+
+    unrelated_change = graph.merge_patch(
+        GraphPatch(
+            base_graph_revision=graph.load_state().revision,
+            run_id=run_id,
+            task_id=dependency_task_id,
+            agent_role="research-auditor-fixture",
+            create_nodes=[
+                GraphNodeCreate(
+                    matek_id="CLM-0000000000000000D102",
+                    node_type=NodeType.CLAIM,
+                    claim_type=ClaimType.LEMMA,
+                    title="Unrelated post-interruption claim",
+                    body="## Exact statement\n\nThis unrelated fixture claim remains open.",
+                    epistemic_status=EpistemicStatus.OPEN,
+                )
+            ],
+        ),
+        problem_id=problem_id,
+        operation_id="create-unrelated-post-interruption-claim",
+    )
+    assert unrelated_change.committed
+    assert graph.load_state().revision != frozen_revision
+
+    verifier_attempts_before = client.audit_attempts.count((audit_id, LemmaAuditRole.VERIFIER))
+    falsifier_attempts_before = client.audit_attempts.count((audit_id, LemmaAuditRole.FALSIFIER))
+    resumed = await run_adaptive_research(
+        client=client,  # type: ignore[arg-type]
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=workflow_settings,
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+
+    assert resumed.outcome is not ResearchOutcome.PAUSED_RETRIABLE
+    assert nomination_path.read_bytes() == nomination_before
+    assert client.audit_attempts.count((audit_id, LemmaAuditRole.VERIFIER)) == (
+        verifier_attempts_before
+    )
+    assert client.audit_attempts.count((audit_id, LemmaAuditRole.FALSIFIER)) == (
+        falsifier_attempts_before + 1
+    )
+    gate_payload = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert gate_payload["status"] == "blocked"
+    assert gate_payload["missing_roles"] == []
+    scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    frozen_record = next(
+        audit
+        for assignment in scheduler["assignments"]
+        for audit in assignment["intermediate_lemma_audits"]
+        if audit["nomination_id"] == audit_id
+    )
+    assert frozen_record["graph_recorded"]
+    assert sum(node.metadata.get("matek_audit_id") == audit_id for node in graph.load_nodes()) == 1
+    replayed_blocked_commit = graph.record_lemma_audit(
+        problem_id=problem_id,
+        run_id=run_id,
+        nomination=json.loads(nomination_path.read_text(encoding="utf-8")),
+        gate=json.loads(gate_path.read_text(encoding="utf-8")),
+        source_artifact=(f".matek/runs/{run_id}/research/lemma-audits/{audit_id}/gate.json"),
+    )
+    assert replayed_blocked_commit.status == "already_applied"
+
+    # Emulate a process dying after the graph service committed an AUDIT_FAILED
+    # mutation but before the scheduler could checkpoint graph_recorded=True.
+    failed_nomination_id = "lemma-failed-graph-commit-replay"
+    failed_nomination = LemmaNomination.model_validate_json(
+        nomination_path.read_text(encoding="utf-8")
+    ).model_copy(update={"nomination_id": failed_nomination_id})
+    failed_audit_dir = research_dir / "lemma-audits" / failed_nomination_id
+    atomic_write_json(failed_audit_dir / "nomination.json", failed_nomination)
+
+    class FailedGateClient:
+        def __init__(self, role: LemmaAuditRole) -> None:
+            self.role = role
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[LemmaAuditResponse],
+        ) -> ModelResult[LemmaAuditResponse]:
+            packet = json.loads(request.input_text)["blind_lemma_audit_packet"]
+            decision = (
+                LemmaAuditDecision.FAIL
+                if self.role is LemmaAuditRole.VERIFIER
+                else LemmaAuditDecision.PASS
+            )
+            return ModelResult(
+                parsed=LemmaAuditResponse(
+                    audit_role=self.role,
+                    audit_id=packet["audit_id"],
+                    statement_sha256=packet["statement_sha256"],
+                    decision=decision,
+                    statement_aligned=True,
+                    proof_valid=False if self.role is LemmaAuditRole.VERIFIER else None,
+                    proof_step_ids_checked=[item["step_id"] for item in packet["proof_steps"]],
+                    source_artifact_ids_checked=[
+                        item["artifact_id"] for item in packet["source_artifacts"]
+                    ],
+                    checks_performed=["Rechecked every frozen proof step."],
+                    boundary_or_adversarial_cases=(
+                        ["Checked the smallest boundary instance."]
+                        if self.role is LemmaAuditRole.FALSIFIER
+                        else []
+                    ),
+                    rationale=(
+                        "The verifier found a decisive proof defect."
+                        if decision is LemmaAuditDecision.FAIL
+                        else "No additional falsification was found."
+                    ),
+                    obligations=(
+                        ["Repair the decisive proof defect."]
+                        if decision is LemmaAuditDecision.FAIL
+                        else []
+                    ),
+                ),
+                response_id=f"failed-gate-{self.role.value}",
+            )
+
+    failed_gate = await run_lemma_audit(
+        failed_nomination,
+        failed_audit_dir,
+        verifier_client=FailedGateClient(LemmaAuditRole.VERIFIER),
+        falsifier_client=FailedGateClient(LemmaAuditRole.FALSIFIER),
+        settings=ModelSettings(web_search=False),
+    )
+    failed_nomination_payload = json.loads(
+        (failed_audit_dir / "nomination.json").read_text(encoding="utf-8")
+    )
+    failed_gate_payload = failed_gate.model_dump(mode="json")
+    failed_source = f".matek/runs/{run_id}/research/lemma-audits/{failed_nomination_id}/gate.json"
+    first_failed_commit = graph.record_lemma_audit(
+        problem_id=problem_id,
+        run_id=run_id,
+        nomination=failed_nomination_payload,
+        gate=failed_gate_payload,
+        source_artifact=failed_source,
+    )
+    assert first_failed_commit.committed
+    replayed_failed_commit = graph.record_lemma_audit(
+        problem_id=problem_id,
+        run_id=run_id,
+        nomination=failed_nomination_payload,
+        gate=failed_gate_payload,
+        source_artifact=failed_source,
+    )
+    assert replayed_failed_commit.status == "already_applied"
+
+    migration_run_id = f"{run_id}-migration"
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=migration_run_id,
+    )
+    changed_compiled = compiled.model_dump(mode="json")
+    changed_compiled["title"] = "Changed fixture theorem"
+    changed_compiled["normalized_statement"] = (
+        "The changed fixture theorem has a different conclusion."
+    )
+    changed_compiled["compiled_prompt"] = "Prove the explicitly changed fixture theorem."
+    changed_target = graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=migration_run_id,
+        compiled_problem=changed_compiled,
+        allow_target_migration=True,
+        target_migration_reason="Exercise the frozen claim-cut version boundary.",
+    )
+    assert changed_target.committed
+    with pytest.raises(
+        GraphValidationError,
+        match=rf"target claim {target_id} changed|no longer live|changed after audit",
+    ):
+        graph.record_lemma_audit(
+            problem_id=problem_id,
+            run_id=run_id,
+            nomination=failed_nomination_payload,
+            gate=failed_gate_payload,
+            source_artifact=failed_source,
+        )
 
 
 class SuccessfulResearchClient:
@@ -848,7 +2332,7 @@ class SuccessfulResearchClient:
                 await asyncio.sleep(0.01)
             finally:
                 self.active -= 1
-            parsed = ResearchWorkerReport(
+            parsed = research_worker_report_v1(
                 assignment_id=assignment["id"],
                 status=WorkerStatus.CANDIDATE_COMPLETE,
                 formal_results=[f"Lemma from {assignment['approach_family']}"],
@@ -876,6 +2360,920 @@ class SuccessfulResearchClient:
         else:  # pragma: no cover - a stage adding an unexpected call should fail loudly
             raise AssertionError(output_type)
         return ModelResult(parsed=parsed, response_id=response_id)
+
+
+SAFE_COMPUTATION_REPLAY = ComputationReplayIsolation(
+    filesystem_write_confined=True,
+    network_disabled=True,
+    description="offline candidate-gate fixture",
+)
+
+
+class CandidateComputationBackend:
+    def __init__(self, *, mismatch: bool = False) -> None:
+        self.mismatch = mismatch
+        self.requests: list[CommandRequest] = []
+
+    async def run(self, request: CommandRequest) -> CommandResult:
+        self.requests.append(request)
+        output = request.cwd / "outputs" / "certificate.txt"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"wrong-certificate\n" if self.mismatch else b"certificate-v1\n")
+        return CommandResult(
+            argv=request.argv,
+            cwd=request.cwd,
+            exit_code=0,
+            stdout="checked\n",
+            stderr="",
+            duration_seconds=0.01,
+        )
+
+
+class CandidateComputationResearchClient(SuccessfulResearchClient):
+    def __init__(
+        self,
+        *,
+        supporting_key: str = "finite-certificate",
+        computation_scope: ScientificScope = ScientificScope.COMPUTATION,
+        link_computation: bool = True,
+        transitive_link: bool = False,
+    ) -> None:
+        super().__init__()
+        self.supporting_key = supporting_key
+        self.computation_scope = computation_scope
+        self.link_computation = link_computation
+        self.transitive_link = transitive_link
+        self.workspaces: dict[str, Path] = {}
+        self.package_calls = 0
+
+    def for_workspace(
+        self,
+        workspace_root: Path,
+        *,
+        writable_paths: tuple[Path, ...],
+    ) -> CandidateComputationResearchClient:
+        assert len(writable_paths) == 1
+        self.workspaces[workspace_root.name] = writable_paths[0]
+        return self
+
+    @staticmethod
+    def _write_computation_workspace(workspace: Path) -> None:
+        files = {
+            "code/verify.py": b"# deterministic verifier fixture\n",
+            "inputs/data.txt": b"1 2 3\n",
+            "outputs/certificate.txt": b"certificate-v1\n",
+            "captures/stdout.txt": b"checked\n",
+            "captures/stderr.txt": b"",
+        }
+        for relative, contents in files.items():
+            path = workspace / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        if output_type is ResearchCoordinatorDecision:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            if payload["initial_portfolio"]:
+                assignments = [
+                    ResearchAssignment(
+                        id="computed-candidate",
+                        approach_family="finite verification",
+                        task="Prove the exact theorem using a replayed finite certificate.",
+                        expected_output="Exact proof plus replayable certificate.",
+                    ),
+                    *(
+                        ResearchAssignment(
+                            id=f"unused-{index}",
+                            approach_family=f"unused-{index}",
+                            task="Explore an independent route.",
+                            expected_output="A proof or exact gap.",
+                        )
+                        for index in range(1, 4)
+                    ),
+                ]
+                return ModelResult(
+                    parsed=ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=assignments,
+                        rationale="Exercise the deterministic computation candidate gate.",
+                    ),
+                    response_id=f"candidate-computation-{self.calls}",
+                )
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[],
+                    rationale="The fixture stops after the rejected computation candidate.",
+                    stop_recommended=True,
+                    stop_reason="No further fixture work is configured.",
+                    stop_category="budget",
+                ),
+                response_id=f"candidate-computation-{self.calls}",
+            )
+        if output_type is ResearchWorkerReport:
+            self.calls += 1
+            assignment_id = json.loads(request.input_text)["assignment"]["id"]
+            if assignment_id != "computed-candidate":
+                return ModelResult(
+                    parsed=ResearchWorkerReport(
+                        assignment_id=assignment_id,
+                        results=[],
+                        unresolved_obligations=[
+                            ScientificObligationDeclaration(
+                                local_key="unused-gap",
+                                exact_statement="Complete the unused fixture route.",
+                                conclusion="Complete the unused fixture route.",
+                            )
+                        ],
+                        branch_outcome=BranchOutcome.BLOCKED,
+                        mechanism="Unused fixture route.",
+                    ),
+                    response_id=f"candidate-computation-{self.calls}",
+                )
+            workspace = self.workspaces[assignment_id]
+            self._write_computation_workspace(workspace)
+            report = ResearchWorkerReport(
+                assignment_id=assignment_id,
+                results=[
+                    ScientificResult(
+                        local_key="main-proof",
+                        kind=ScientificResultKind.LEMMA,
+                        exact_statement="Prove P(n) for every n.",
+                        scope=ScientificScope.MAIN,
+                        proof_or_certificate=(
+                            "Reduce the frozen theorem to the finite certificate and verify "
+                            "domain completeness."
+                        ),
+                        dependency_result_keys=(
+                            ["domain-reduction"]
+                            if self.link_computation and self.transitive_link
+                            else ["finite-certificate"]
+                            if self.link_computation
+                            else []
+                        ),
+                        disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                    ),
+                    *(
+                        [
+                            ScientificResult(
+                                local_key="domain-reduction",
+                                kind=ScientificResultKind.REDUCTION,
+                                exact_statement=(
+                                    "The frozen theorem follows from the finite certificate."
+                                ),
+                                scope=ScientificScope.REDUCTION,
+                                proof_or_certificate=(
+                                    "Verify the exhaustive finite-domain reduction."
+                                ),
+                                dependency_result_keys=["finite-certificate"],
+                                disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                            )
+                        ]
+                        if self.transitive_link
+                        else []
+                    ),
+                    ScientificResult(
+                        local_key="finite-certificate",
+                        kind=ScientificResultKind.COMPUTATION,
+                        exact_statement="The deterministic finite verifier accepts every case.",
+                        scope=self.computation_scope,
+                        proof_or_certificate="The retained certificate and verifier output.",
+                        disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                    ),
+                ],
+                artifact_manifest=[
+                    ScientificArtifactDeclaration(
+                        path="outputs/certificate.txt",
+                        purpose="Check the finite certificate supporting the exact proof.",
+                        supporting_result_keys=[self.supporting_key],
+                        command_line=["python3", "code/verify.py", "inputs/data.txt"],
+                        input_paths=["code/verify.py", "inputs/data.txt"],
+                        stdout_path="captures/stdout.txt",
+                        stderr_path="captures/stderr.txt",
+                        expected_output="checked\n",
+                        replay_recipe="Run the fixed verifier over the frozen finite input.",
+                        tool_versions=["python 3.11"],
+                    )
+                ],
+                branch_outcome=BranchOutcome.CANDIDATE_COMPLETE,
+                mechanism="Finite reduction with a deterministic certificate.",
+            )
+            return ModelResult(
+                parsed=report,
+                response_id=f"candidate-computation-{self.calls}",
+            )
+        if output_type is CandidateProofPackage:
+            self.package_calls += 1
+        return await super().generate_structured(request, output_type)
+
+
+class GraphCandidateComputationResearchClient(CandidateComputationResearchClient):
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        result = await super().generate_structured(request, output_type)
+        if output_type is ResearchCoordinatorDecision:
+            payload = json.loads(request.input_text)
+            memory = payload.get("knowledge_graph_memory")
+            if isinstance(memory, dict):
+                result.parsed.rationale = (
+                    f"Graph review {memory['graph_revision']}: " + result.parsed.rationale
+                )
+            summaries = payload.get("graph_node_summaries", [])
+            target_id = next(
+                (item["matek_id"] for item in summaries if item.get("node_type") == "claim"),
+                None,
+            )
+            if target_id is not None:
+                result.parsed.assignments = [
+                    assignment.model_copy(update={"target_node_ids": [target_id]})
+                    for assignment in result.parsed.assignments
+                ]
+        return result
+
+
+def candidate_computation_events(research_dir: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((research_dir / "events").glob("*.json"))
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "backend", "isolation", "supporting_key", "scope", "status_fragment"),
+    [
+        (
+            "missing",
+            None,
+            SAFE_COMPUTATION_REPLAY,
+            "finite-certificate",
+            ScientificScope.COMPUTATION,
+            "absent",
+        ),
+        (
+            "unsafe",
+            CandidateComputationBackend(),
+            ComputationReplayIsolation(
+                filesystem_write_confined=False,
+                network_disabled=False,
+                description="untrusted native fixture",
+            ),
+            "finite-certificate",
+            ScientificScope.COMPUTATION,
+            "unsafe_backend",
+        ),
+        (
+            "failed",
+            CandidateComputationBackend(mismatch=True),
+            SAFE_COMPUTATION_REPLAY,
+            "finite-certificate",
+            ScientificScope.COMPUTATION,
+            "mismatch",
+        ),
+        (
+            "wrong-result-key",
+            CandidateComputationBackend(),
+            SAFE_COMPUTATION_REPLAY,
+            "main-proof",
+            ScientificScope.COMPUTATION,
+            "not named",
+        ),
+        (
+            "wrong-scope",
+            CandidateComputationBackend(),
+            SAFE_COMPUTATION_REPLAY,
+            "finite-certificate",
+            ScientificScope.BRANCH,
+            "mathematically admissible",
+        ),
+    ],
+)
+async def test_candidate_computation_gate_rejects_untrusted_or_inadmissible_evidence(
+    tmp_path: Path,
+    case: str,
+    backend: CandidateComputationBackend | None,
+    isolation: ComputationReplayIsolation,
+    supporting_key: str,
+    scope: ScientificScope,
+    status_fragment: str,
+) -> None:
+    research_dir = tmp_path / "research"
+    client = CandidateComputationResearchClient(
+        supporting_key=supporting_key,
+        computation_scope=scope,
+    )
+
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+        ),
+        computation_backend=backend,
+        computation_replay_isolation=isolation,
+    )
+
+    assert case
+    assert result.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert not result.accepted_for_manuscript
+    assert result.acceptance_gate is None
+    assert client.package_calls == 0
+    assert any(status_fragment in obligation for obligation in result.unresolved_obligations)
+    rejection_events = [
+        event
+        for event in candidate_computation_events(research_dir)
+        if event["kind"] == "candidate_computation_evidence_rejected"
+    ]
+    assert len(rejection_events) == 1
+    assert any(status_fragment in detail for detail in rejection_events[0]["detail"])
+
+
+@pytest.mark.asyncio
+async def test_valid_computation_replay_still_requires_graph_bound_named_support(
+    tmp_path: Path,
+) -> None:
+    research_dir = tmp_path / "research"
+    backend = CandidateComputationBackend()
+    client = CandidateComputationResearchClient()
+
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+        ),
+        computation_backend=backend,
+        computation_replay_isolation=SAFE_COMPUTATION_REPLAY,
+    )
+
+    assert result.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert not result.accepted_for_manuscript
+    assert client.package_calls == 0
+    assert len(backend.requests) == 1
+    candidate_input = next((research_dir / "candidate" / "attempts").glob("*/input.json"))
+    candidate_payload = json.loads(candidate_input.read_text(encoding="utf-8"))
+    gate_payload = candidate_payload["candidate_computation_gate"]
+    assert gate_payload["blocking_obligations"] == []
+    assert gate_payload["bindings"][0]["result_local_key"] == "finite-certificate"
+    assert any(
+        "no active canonical knowledge graph" in obligation
+        for obligation in candidate_payload["candidate_canonical_graph_support"][
+            "blocking_obligations"
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_computation_gate_rejects_unrelated_replayed_result(
+    tmp_path: Path,
+) -> None:
+    research_dir = tmp_path / "research"
+    client = CandidateComputationResearchClient(link_computation=False)
+
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=2,
+        ),
+        computation_backend=CandidateComputationBackend(),
+        computation_replay_isolation=SAFE_COMPUTATION_REPLAY,
+    )
+
+    assert result.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert client.package_calls == 0
+    assert any("unrelated" in obligation for obligation in result.unresolved_obligations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "support_kind",
+    ["external-node", "local-result"],
+)
+async def test_named_candidate_support_requires_an_active_knowledge_graph(
+    tmp_path: Path,
+    support_kind: str,
+) -> None:
+    compiled = compiled_problem()
+
+    class NoGraphNamedSupportClient(SuccessfulResearchClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.package_calls = 0
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[Any],
+        ) -> ModelResult[Any]:
+            if output_type is ResearchWorkerReport:
+                self.calls += 1
+                assignment_id = json.loads(request.input_text)["assignment"]["id"]
+                main_result = ScientificResult(
+                    local_key="main-proof",
+                    kind=ScientificResultKind.LEMMA,
+                    exact_statement=compiled.normalized_statement,
+                    scope=ScientificScope.MAIN,
+                    proof_or_certificate="A purported derivation using named support.",
+                    dependency_node_ids=(
+                        ["CLM-FAKE0001"] if support_kind == "external-node" else []
+                    ),
+                    dependency_result_keys=(
+                        ["support-lemma"] if support_kind == "local-result" else []
+                    ),
+                    disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                )
+                local_support = (
+                    [
+                        ScientificResult(
+                            local_key="support-lemma",
+                            kind=ScientificResultKind.LEMMA,
+                            exact_statement="The named local support lemma holds.",
+                            scope=ScientificScope.BRANCH,
+                            proof_or_certificate="A separate purported proof.",
+                            disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                        )
+                    ]
+                    if support_kind == "local-result"
+                    else []
+                )
+                return ModelResult(
+                    parsed=ResearchWorkerReport(
+                        assignment_id=assignment_id,
+                        results=[main_result, *local_support],
+                        branch_outcome=BranchOutcome.CANDIDATE_COMPLETE,
+                        mechanism="Use named support without a graph.",
+                    ),
+                    response_id=f"no-graph-support-{self.calls}",
+                )
+            if output_type is CandidateProofPackage:
+                self.package_calls += 1
+            return await super().generate_structured(request, output_type)
+
+    client = NoGraphNamedSupportClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled,
+        research_dir=tmp_path / "research",
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=1,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert not result.accepted_for_manuscript
+    assert client.package_calls == 0
+    assert any(
+        "no active canonical knowledge graph" in obligation
+        for obligation in result.unresolved_obligations
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_assumed_exact_main_candidate_never_reaches_packaging_without_graph(
+    tmp_path: Path,
+) -> None:
+    compiled = compiled_problem()
+
+    class AssumedMainCandidateClient(SuccessfulResearchClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.package_calls = 0
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[Any],
+        ) -> ModelResult[Any]:
+            if output_type is ResearchWorkerReport:
+                self.calls += 1
+                assignment_id = json.loads(request.input_text)["assignment"]["id"]
+                return ModelResult(
+                    parsed=ResearchWorkerReport(
+                        assignment_id=assignment_id,
+                        results=[
+                            ScientificResult(
+                                local_key="self-assumed-main",
+                                kind=ScientificResultKind.LEMMA,
+                                exact_statement=compiled.normalized_statement,
+                                scope=ScientificScope.MAIN,
+                                assumptions=[compiled.normalized_statement],
+                                proof_or_certificate="The conclusion is repeated as an assumption.",
+                                disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                            )
+                        ],
+                        branch_outcome=BranchOutcome.CANDIDATE_COMPLETE,
+                        mechanism="Assume the exact theorem and repeat it.",
+                    ),
+                    response_id=f"assumed-main-{self.calls}",
+                )
+            if output_type is CandidateProofPackage:
+                self.package_calls += 1
+            return await super().generate_structured(request, output_type)
+
+    client = AssumedMainCandidateClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled,
+        research_dir=tmp_path / "research",
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=1,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert not result.accepted_for_manuscript
+    assert client.package_calls == 0
+    assert any("unbound assumptions" in item for item in result.unresolved_obligations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "dependency_node_type",
+        "dependency_status",
+        "dependency_tags",
+        "blocking_main_obligation",
+        "accepted",
+        "obligation_fragment",
+    ),
+    [
+        (
+            NodeType.CLAIM,
+            EpistemicStatus.OPEN,
+            [],
+            False,
+            False,
+            "not current canonical trusted claims",
+        ),
+        (
+            NodeType.CLAIM,
+            EpistemicStatus.CANDIDATE,
+            [],
+            False,
+            False,
+            "not current canonical trusted claims",
+        ),
+        (NodeType.CLAIM, EpistemicStatus.AUDIT_PASSED, [], False, True, None),
+        (
+            NodeType.CLAIM,
+            EpistemicStatus.AUDIT_PASSED,
+            [],
+            True,
+            False,
+            "unresolved obligation",
+        ),
+        (
+            NodeType.CLAIM,
+            EpistemicStatus.AUDIT_PASSED,
+            ["matek/computation", "matek/replay-required"],
+            False,
+            False,
+            "external computation premise",
+        ),
+        (
+            NodeType.DEFINITION,
+            EpistemicStatus.OPEN,
+            [],
+            False,
+            False,
+            "application-admitted definitions",
+        ),
+    ],
+)
+async def test_candidate_graph_support_requires_trusted_external_premises(
+    tmp_path: Path,
+    dependency_node_type: NodeType,
+    dependency_status: EpistemicStatus,
+    dependency_tags: list[str],
+    blocking_main_obligation: bool,
+    accepted: bool,
+    obligation_fragment: str | None,
+) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    run_id = "run-external-premise"
+    graph = KnowledgeGraph(tmp_path, "external-premise")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=run_id,
+    )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=run_id,
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    target_id = graph.main_claim_id(problem_id)
+    dependency_id = (
+        "DEF-HUMAN001" if dependency_node_type is NodeType.DEFINITION else "CLM-EXTERNAL001"
+    )
+    task_ids, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id=run_id,
+        decision_id=800,
+        assignments=[
+            {
+                "id": "external-premise-seed",
+                "approach_family": "fixture",
+                "task": "Record the external premise fixture.",
+                "expected_output": "One exact premise.",
+                "target_node_ids": [target_id],
+            }
+        ],
+    )
+    created = graph.merge_patch(
+        GraphPatch(
+            base_graph_revision=graph.load_state().revision,
+            run_id=run_id,
+            task_id=task_ids["external-premise-seed"],
+            agent_role="research-auditor-fixture",
+            create_nodes=[
+                GraphNodeCreate(
+                    matek_id=dependency_id,
+                    node_type=dependency_node_type,
+                    claim_type=(
+                        ClaimType.LEMMA if dependency_node_type is NodeType.CLAIM else None
+                    ),
+                    title="External fixture premise",
+                    body="## Exact statement\n\nThe external fixture premise holds.",
+                    epistemic_status=dependency_status,
+                    tags=dependency_tags,
+                )
+            ],
+        ),
+        problem_id=problem_id,
+        operation_id="create-external-premise-fixture",
+    )
+    assert created.committed
+    if blocking_main_obligation:
+        obligation_id = "OBL-MAINBLOCK001"
+        blocked = graph.merge_patch(
+            GraphPatch(
+                base_graph_revision=graph.load_state().revision,
+                run_id=run_id,
+                task_id=task_ids["external-premise-seed"],
+                agent_role="research-auditor-fixture",
+                create_nodes=[
+                    GraphNodeCreate(
+                        matek_id=obligation_id,
+                        node_type=NodeType.OBLIGATION,
+                        title="Unresolved main-target fixture",
+                        body=(
+                            "## Exact statement\n\nDischarge the remaining main-target case."
+                            "\n\n## Conclusion\n\nThe fixture theorem holds."
+                        ),
+                        workflow_status=WorkflowStatus.BLOCKED,
+                    )
+                ],
+                add_edges=[
+                    GraphEdge(
+                        source_id=obligation_id,
+                        relation=RelationType.TARGETS,
+                        target_id=target_id,
+                    )
+                ],
+            ),
+            problem_id=problem_id,
+            operation_id="create-main-obligation-fixture",
+        )
+        assert blocked.committed
+
+    class ExternalPremiseCandidateClient(SuccessfulResearchClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.package_calls = 0
+
+        async def generate_structured(
+            self,
+            request: ModelRequest,
+            output_type: type[Any],
+        ) -> ModelResult[Any]:
+            if output_type is ResearchCoordinatorDecision:
+                result = await super().generate_structured(request, output_type)
+                payload = json.loads(request.input_text)
+                memory = payload["knowledge_graph_memory"]
+                result.parsed.assignments = [
+                    assignment.model_copy(update={"target_node_ids": [target_id]})
+                    for assignment in result.parsed.assignments
+                ]
+                result.parsed.rationale = (
+                    f"Graph review {memory['graph_revision']}: " + result.parsed.rationale
+                )
+                return result
+            if output_type is ResearchWorkerReport:
+                self.calls += 1
+                assignment_id = json.loads(request.input_text)["assignment"]["id"]
+                return ModelResult(
+                    parsed=ResearchWorkerReport(
+                        assignment_id=assignment_id,
+                        results=[
+                            ScientificResult(
+                                local_key="main-proof",
+                                kind=ScientificResultKind.LEMMA,
+                                exact_statement=compiled.normalized_statement,
+                                scope=ScientificScope.MAIN,
+                                proof_or_certificate=(
+                                    "A complete derivation from the exact external premise."
+                                ),
+                                dependency_node_ids=[dependency_id],
+                                target_node_ids=[target_id],
+                                disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+                            )
+                        ],
+                        branch_outcome=BranchOutcome.CANDIDATE_COMPLETE,
+                        mechanism="Apply the exact external premise.",
+                    ),
+                    response_id=f"external-premise-{self.calls}",
+                )
+            if output_type is CandidateProofPackage:
+                self.package_calls += 1
+            return await super().generate_structured(request, output_type)
+
+    client = ExternalPremiseCandidateClient()
+    research_dir = tmp_path / ".matek" / "runs" / run_id / "research"
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+            maximum_coordinator_decisions=1,
+        ),
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+
+    assert result.accepted_for_manuscript is accepted
+    assert client.package_calls == int(accepted)
+    if obligation_fragment is not None:
+        assert result.outcome is ResearchOutcome.PAUSED_RETRIABLE
+        assert any(
+            obligation_fragment in obligation for obligation in result.unresolved_obligations
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_graph_support_binds_computation_dependency_and_artifacts(
+    tmp_path: Path,
+) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    run_id = "run-computation-graph"
+    graph = KnowledgeGraph(tmp_path, "computation-candidate")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=run_id,
+    )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=run_id,
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    research_dir = tmp_path / ".matek" / "runs" / run_id / "research"
+
+    result = await run_adaptive_research(
+        client=GraphCandidateComputationResearchClient(transitive_link=True),
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+        ),
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+        computation_backend=CandidateComputationBackend(),
+        computation_replay_isolation=SAFE_COMPUTATION_REPLAY,
+    )
+
+    assert result.accepted_for_manuscript
+    candidate_input = json.loads(
+        next((research_dir / "candidate" / "attempts").glob("*/input.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    binding = candidate_input["candidate_canonical_graph_support"]["bindings"][0]
+    assert binding["main_result_keys"] == ["main-proof"]
+    assert binding["closure_result_keys"] == [
+        "domain-reduction",
+        "finite-certificate",
+        "main-proof",
+    ]
+    assert binding["computation_result_keys"] == ["finite-certificate"]
+    support_nodes = binding["support_nodes"]
+    assert any(node["matek_id"] == binding["main_claim_id"] for node in support_nodes)
+    assert binding["support_sha256"] == sha256_json(support_nodes)
+    assert {node["node_type"] for node in support_nodes} == {
+        "artifact",
+        "claim",
+        "derivation",
+        "proof_attempt",
+    }
+    claim_ids = {
+        node["metadata"].get("matek_result_local_key"): node["matek_id"]
+        for node in support_nodes
+        if node["node_type"] == "claim"
+    }
+    derivations = {
+        node["metadata"].get("matek_result_local_key"): node
+        for node in support_nodes
+        if node["node_type"] == "derivation"
+    }
+    assert derivations["main-proof"]["metadata"]["matek_premise_claim_ids"] == [
+        claim_ids["domain-reduction"]
+    ]
+    assert derivations["domain-reduction"]["metadata"]["matek_premise_claim_ids"] == [
+        claim_ids["finite-certificate"]
+    ]
+    assert len([node for node in support_nodes if node["node_type"] == "artifact"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_accepted_candidate_revalidates_computation_cas_on_resume(tmp_path: Path) -> None:
+    problem = tmp_path / "problem.md"
+    problem.write_text("Prove the fixture theorem.", encoding="utf-8")
+    run_id = "run-computation-resume"
+    graph = KnowledgeGraph(tmp_path, "computation-resume")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=run_id,
+    )
+    compiled = compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=run_id,
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    research_dir = tmp_path / ".matek" / "runs" / run_id / "research"
+    client = GraphCandidateComputationResearchClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=1,
+            maximum_pending_assignments=4,
+        ),
+        computation_backend=CandidateComputationBackend(),
+        computation_replay_isolation=SAFE_COMPUTATION_REPLAY,
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+    assert result.accepted_for_manuscript
+    blob = next((research_dir / "computations" / "blobs" / "sha256").iterdir())
+    blob.chmod(0o600)
+    blob.write_bytes(b"tampered\n")
+
+    with pytest.raises(StageValidationError, match="invalid computation evidence"):
+        await run_adaptive_research(
+            client=client,
+            compiled_problem=compiled,
+            research_dir=research_dir,
+            workflow_settings=ResearchWorkflowSettings(
+                minimum_initial_assignments=4,
+                maximum_concurrent_agents=1,
+                maximum_pending_assignments=4,
+            ),
+            computation_backend=CandidateComputationBackend(),
+            computation_replay_isolation=SAFE_COMPUTATION_REPLAY,
+            knowledge_graph=graph,
+            graph_problem_id=problem_id,
+            run_id=run_id,
+        )
 
 
 class PolicyAssertingResearchClient(SuccessfulResearchClient):
@@ -975,7 +3373,7 @@ class CompletionDrainResearchClient(SuccessfulResearchClient):
             finally:
                 self.active -= 1
             return ModelResult(
-                parsed=ResearchWorkerReport(
+                parsed=research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=status,
                     formal_results=[f"Result from {assignment_id}"],
@@ -1071,7 +3469,7 @@ class ContinuityResearchClient(SuccessfulResearchClient):
             assignment = json.loads(request.input_text)["assignment"]
             assignment_id = assignment["id"]
             if assignment_id == "route-1":
-                report = ResearchWorkerReport(
+                report = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=["Lemma A establishes the finite reduction."],
@@ -1082,7 +3480,7 @@ class ContinuityResearchClient(SuccessfulResearchClient):
                     mechanism=assignment["task"],
                 )
             elif assignment_id == "route-2":
-                report = ResearchWorkerReport(
+                report = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.REFUTED,
                     formal_results=[],
@@ -1093,7 +3491,7 @@ class ContinuityResearchClient(SuccessfulResearchClient):
                     mechanism=assignment["task"],
                 )
             elif assignment_id == "route-3":
-                report = ResearchWorkerReport(
+                report = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.BLOCKED,
                     formal_results=[],
@@ -1103,7 +3501,7 @@ class ContinuityResearchClient(SuccessfulResearchClient):
                     mechanism=assignment["task"],
                 )
             elif assignment_id == "route-4":
-                report = ResearchWorkerReport(
+                report = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=["Lemma B proves the required boundary case."],
@@ -1114,7 +3512,7 @@ class ContinuityResearchClient(SuccessfulResearchClient):
                     mechanism=assignment["task"],
                 )
             else:
-                report = ResearchWorkerReport(
+                report = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.CANDIDATE_COMPLETE,
                     formal_results=["The target follows from Lemmas A and B."],
@@ -1180,8 +3578,9 @@ class RollingPoolResearchClient:
                 assert [
                     report["assignment_id"] for report in payload["visible_worker_reports"]
                 ] == ["fast-route"]
-                assert payload["visible_worker_reports"][0]["proof_content"] == (
-                    "Full proof of the reduction lemma."
+                assert (
+                    payload["visible_worker_reports"][0]["results"][0]["proof_or_certificate"]
+                    == "Full proof of the reduction lemma."
                 )
                 assert any(
                     event["kind"] == "worker_report_accepted"
@@ -1212,7 +3611,7 @@ class RollingPoolResearchClient:
             assignment_id = assignment["id"]
             if assignment_id == "fast-route":
                 await self.slow_started.wait()
-                parsed: BaseModel = ResearchWorkerReport(
+                parsed: BaseModel = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=["Reduction lemma"],
@@ -1229,7 +3628,7 @@ class RollingPoolResearchClient:
                     self.slow_cancelled = True
                     raise
                 self.slow_completed = True
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=["Slow structural lemma"],
@@ -1241,7 +3640,7 @@ class RollingPoolResearchClient:
             elif assignment_id == "targeted-followup":
                 self.followup_started.set()
                 assert not self.slow_completed
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.CANDIDATE_COMPLETE,
                     formal_results=["The target theorem"],
@@ -1350,7 +3749,7 @@ class ReservationReplacementResearchClient:
             self.worker_ids.append(assignment_id)
             assert assignment_id in {"fast-feedback", "targeted-replacement"}
             return ModelResult(
-                parsed=ResearchWorkerReport(
+                parsed=research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Progress from {assignment_id}."],
@@ -1435,7 +3834,7 @@ class CleanupCandidateRaceResearchClient:
             assignment_id = assignment["id"]
             if assignment_id == "fast-terminal-feedback":
                 await self.candidate_started.wait()
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=["A reduction with one apparent gap."],
@@ -1450,7 +3849,7 @@ class CleanupCandidateRaceResearchClient:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     self.cleanup_cancelled_candidate = True
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.CANDIDATE_COMPLETE,
                     formal_results=["The exact target theorem."],
@@ -1560,7 +3959,7 @@ class DeferredCandidateGateClient:
             else:  # pragma: no cover - finite gate budget retires queued work
                 raise AssertionError(f"unexpected worker launch: {assignment_id}")
             return ModelResult(
-                parsed=ResearchWorkerReport(
+                parsed=research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.CANDIDATE_COMPLETE,
                     formal_results=[f"Candidate theorem from {assignment_id}."],
@@ -1605,7 +4004,7 @@ class DeferredCandidateGateClient:
 
 def candidate_package() -> CandidateProofPackage:
     return CandidateProofPackage(
-        exact_theorem="For every n, P n.",
+        exact_theorem="Prove P(n) for every n.",
         definitions=["P is the fixture predicate."],
         lemma_dependency_graph={"main": ["lemma"]},
         full_proof="Proof of the lemma and then the theorem.",
@@ -1845,7 +4244,7 @@ async def test_interrupted_research_resume_freezes_old_requests_and_rekeys_unlau
             assert output_type is ResearchWorkerReport
             assignment = json.loads(request.input_text)["assignment"]
             return ModelResult(
-                parsed=ResearchWorkerReport(
+                parsed=research_worker_report_v1(
                     assignment_id=assignment["id"],
                     status=WorkerStatus.PROGRESS,
                     formal_results=["A preserved partial result."],
@@ -2159,7 +4558,7 @@ async def test_resumed_borrowed_headroom_uses_current_worker_policy(tmp_path: Pa
                 assert request.settings.web_search is False
                 assignment = payload["assignment"]
                 return ModelResult(
-                    parsed=ResearchWorkerReport(
+                    parsed=research_worker_report_v1(
                         assignment_id=assignment["id"],
                         status=WorkerStatus.PROGRESS,
                         formal_results=["A preserved partial result."],
@@ -2513,7 +4912,7 @@ async def test_scientific_reduction_stop_is_declined_and_exact_research_continue
                 assert payload["exact_target_policy"]["terminal_reductions_allowed"] is False
                 assignment_id = payload["assignment"]["id"]
                 exact = assignment_id == "exact-target-finisher"
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=(WorkerStatus.CANDIDATE_COMPLETE if exact else WorkerStatus.PROGRESS),
                     formal_results=[
@@ -2566,6 +4965,129 @@ async def test_scientific_reduction_stop_is_declined_and_exact_research_continue
     ]
     assert any(event["kind"] == "coordinator_scientific_stop_declined" for event in events)
     assert result.worker_reports[-1].assignment_id == "exact-target-finisher"
+
+
+@pytest.mark.asyncio
+async def test_model_only_refutation_stop_is_declined_and_research_continues(
+    tmp_path: Path,
+) -> None:
+    class RefutationPersistenceClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.noninitial_coordinator_calls = 0
+            self.saw_declined_refutation = False
+
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            self.calls += 1
+            payload = json.loads(request.input_text)
+            if output_type is ResearchCoordinatorDecision:
+                if payload["initial_portfolio"]:
+                    parsed: BaseModel = ResearchCoordinatorDecision(
+                        decision_id=payload["decision_id"],
+                        after_event_sequence=payload["after_event_sequence"],
+                        assignments=[
+                            ResearchAssignment(
+                                id=f"refutation-route-{index}",
+                                approach_family=f"family-{index}",
+                                task=f"Investigate exact route {index}",
+                                expected_output="An exact proof or a checkable obstruction",
+                            )
+                            for index in range(4)
+                        ],
+                        rationale="Launch diverse exact-target work.",
+                    )
+                else:
+                    self.noninitial_coordinator_calls += 1
+                    if self.noninitial_coordinator_calls == 1:
+                        parsed = ResearchCoordinatorDecision(
+                            decision_id=payload["decision_id"],
+                            after_event_sequence=payload["after_event_sequence"],
+                            assignments=[],
+                            rationale="Treat unsuccessful proof attempts as a refutation.",
+                            stop_recommended=True,
+                            stop_reason=("The attempted routes failed, so the theorem is false."),
+                            stop_category="refuted",
+                        )
+                    elif self.noninitial_coordinator_calls == 2:
+                        self.saw_declined_refutation = any(
+                            event["kind"] == "coordinator_unverified_refutation_stop_declined"
+                            for event in payload["unacknowledged_events"]
+                        )
+                        assert self.saw_declined_refutation
+                        parsed = ResearchCoordinatorDecision(
+                            decision_id=payload["decision_id"],
+                            after_event_sequence=payload["after_event_sequence"],
+                            assignments=[
+                                ResearchAssignment(
+                                    id="post-refutation-check",
+                                    approach_family="counterexample-audit",
+                                    task=(
+                                        "Continue the exact theorem search and independently "
+                                        "check the alleged obstruction."
+                                    ),
+                                    expected_output="Checkable exact-contract evidence",
+                                )
+                            ],
+                            rationale=("The prior model-only claim was not a theorem refutation."),
+                        )
+                    else:
+                        parsed = ResearchCoordinatorDecision(
+                            decision_id=payload["decision_id"],
+                            after_event_sequence=payload["after_event_sequence"],
+                            assignments=[],
+                            rationale="The configured research budget is now exhausted.",
+                            stop_recommended=True,
+                            stop_reason="No more funded research activations remain.",
+                            stop_category="budget",
+                        )
+            elif output_type is ResearchWorkerReport:
+                assignment_id = payload["assignment"]["id"]
+                parsed = research_worker_report_v1(
+                    assignment_id=assignment_id,
+                    status=WorkerStatus.PROGRESS,
+                    formal_results=[f"Partial result from {assignment_id}."],
+                    proof_content="A rigorous partial argument, but not a disproof.",
+                    exact_gap="The frozen exact theorem remains unresolved.",
+                    sources=[],
+                    mechanism=payload["assignment"]["task"],
+                )
+            else:  # pragma: no cover - this fixture never produces a candidate
+                raise AssertionError(output_type)
+            return ModelResult(parsed=parsed, response_id=f"refutation-{self.calls}")
+
+    client = RefutationPersistenceClient()
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_pending_assignments=8,
+            maximum_coordinator_decisions=6,
+        ),
+    )
+
+    assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
+    assert client.saw_declined_refutation
+    assert any(report.assignment_id == "post-refutation-check" for report in result.worker_reports)
+    assert any(
+        "independently verified disproof" in obligation
+        for obligation in result.unresolved_obligations
+    )
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((tmp_path / "events").glob("*.json"))
+    ]
+    decline_events = [
+        event
+        for event in events
+        if event["kind"] == "coordinator_unverified_refutation_stop_declined"
+    ]
+    assert len(decline_events) == 1
+    assert "theorem is false" in decline_events[0]["detail"][0]
 
 
 @pytest.mark.asyncio
@@ -2629,7 +5151,7 @@ async def test_default_pool_runs_8_hierarchical_web_enabled_initial_research_wor
                     await asyncio.wait_for(self.all_workers_started.wait(), timeout=2)
                 finally:
                     self.active_workers -= 1
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Partial result from {assignment_id}"],
@@ -2700,7 +5222,7 @@ async def test_coordinator_input_too_large_rebuilds_a_smaller_distinct_context(
                     )
             elif output_type is ResearchWorkerReport:
                 assignment = payload["assignment"]
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment["id"],
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Partial lemma from {assignment['id']}"],
@@ -2799,7 +5321,7 @@ async def test_oversized_mandatory_scheduler_history_uses_indexed_context_and_co
                     )
             elif output_type is ResearchWorkerReport:
                 assignment = payload["assignment"]
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment["id"],
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Partial lemma from {assignment['id']}"],
@@ -2880,7 +5402,7 @@ async def test_repeated_context_rejection_pauses_with_partial_progress_and_resum
                     raise ModelInputTooLargeError("input_too_large at provider boundary")
             elif output_type is ResearchWorkerReport:
                 assignment = payload["assignment"]
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment["id"],
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Durable partial lemma from {assignment['id']}"],
@@ -3047,7 +5569,7 @@ async def test_api_coordinator_can_request_and_receive_omitted_report(
                     )
             elif output_type is ResearchWorkerReport:
                 assignment = payload["assignment"]
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment["id"],
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Partial lemma from {assignment['id']}"],
@@ -3146,7 +5668,7 @@ async def test_consequential_decision_citing_omitted_evidence_becomes_retrieval_
                     )
             elif output_type is ResearchWorkerReport:
                 assignment = payload["assignment"]
-                parsed = ResearchWorkerReport(
+                parsed = research_worker_report_v1(
                     assignment_id=assignment["id"],
                     status=WorkerStatus.PROGRESS,
                     formal_results=[f"Partial result from {assignment['id']}"],
@@ -3232,7 +5754,7 @@ async def test_research_coordinator_receives_durable_full_fidelity_continuity(
     route_one = next(
         report for report in later["visible_worker_reports"] if report["assignment_id"] == "route-1"
     )
-    assert route_one["proof_content"] == "Proof of Lemma A."
+    assert route_one["results"][0]["proof_or_certificate"] == "Proof of Lemma A."
     continuity = later["research_continuity"]
     assert {route["assignment_id"] for route in continuity["promising_routes"]} == {
         "route-1",
@@ -3438,7 +5960,7 @@ async def test_worker_schema_failure_during_candidate_audit_does_not_cancel_audi
                 if assignment_id == "candidate-fast":
                     await asyncio.sleep(0)
                     return self.result(
-                        ResearchWorkerReport(
+                        research_worker_report_v1(
                             assignment_id=assignment_id,
                             status=WorkerStatus.CANDIDATE_COMPLETE,
                             formal_results=["Fixture theorem"],
@@ -3452,7 +5974,7 @@ async def test_worker_schema_failure_during_candidate_audit_does_not_cancel_audi
                     raise StructuredOutputError("worker report failed schema validation")
                 await asyncio.sleep(0.08)
                 return self.result(
-                    ResearchWorkerReport(
+                    research_worker_report_v1(
                         assignment_id=assignment_id,
                         status=WorkerStatus.PROGRESS,
                         formal_results=["Slow partial result"],
@@ -3548,6 +6070,7 @@ async def test_research_scales_initial_portfolio_to_available_budget_above_safet
             maximum_model_calls=10,
             minimum_initial_assignments=9,
             maximum_concurrent_agents=9,
+            scientific_phase_policy=ScientificPhasePolicy(explore_concurrency=9),
         ),
     )
 
@@ -3733,7 +6256,7 @@ class VerdictResearchClient(SuccessfulResearchClient):
 @pytest.mark.parametrize(
     ("decision", "outcome"),
     [
-        (FinalJudgeDecision.REJECTED, ResearchOutcome.REJECTED),
+        (FinalJudgeDecision.REJECTED, ResearchOutcome.BUDGET_EXHAUSTED),
         (FinalJudgeDecision.PARTIAL, ResearchOutcome.BUDGET_EXHAUSTED),
     ],
 )
@@ -3752,6 +6275,432 @@ async def test_research_preserves_rejected_and_partial_candidates(
     assert not result.accepted_for_manuscript
     assert (tmp_path / "candidate" / "package.json").is_file()
     assert result.unresolved_obligations
+
+
+EXACT_FALSE_TARGET = "For every integer n, n + 1 = n."
+
+
+def false_exact_compiled_problem() -> CompiledProblem:
+    return CompiledProblem(
+        title="False fixture theorem",
+        normalized_statement=EXACT_FALSE_TARGET,
+        claim_contract={
+            "quantifiers": "for every integer n",
+            "domain": "integers",
+            "conclusion": "n + 1 = n",
+        },
+        compiled_prompt=covered_compiled_prompt(),
+        source_ledger=[],
+        unresolved_ambiguities=[],
+    )
+
+
+class ExactCounterexampleResearchClient:
+    def __init__(
+        self,
+        *,
+        interrupt_falsifier: bool = False,
+        parented_support_obligation: bool = False,
+        graph_target_id: str | None = None,
+        dependency_node_id: str | None = None,
+    ) -> None:
+        self.calls = 0
+        self.interrupt_falsifier = interrupt_falsifier
+        self.parented_support_obligation = parented_support_obligation
+        self.graph_target_id = graph_target_id
+        self.dependency_node_id = dependency_node_id
+        self.role_calls: list[CounterexampleAuditRole] = []
+
+    async def generate_structured(
+        self, request: ModelRequest, output_type: type[Any]
+    ) -> ModelResult[Any]:
+        self.calls += 1
+        payload = json.loads(request.input_text)
+        if output_type is ResearchCoordinatorDecision:
+            return ModelResult(
+                parsed=ResearchCoordinatorDecision(
+                    decision_id=payload["decision_id"],
+                    after_event_sequence=payload["after_event_sequence"],
+                    assignments=[
+                        ResearchAssignment(
+                            id=f"exact-refutation-route-{index}",
+                            approach_family=family,
+                            task=f"Investigate {family}",
+                            expected_output="A typed result or exact obstruction",
+                            target_node_ids=(
+                                [self.graph_target_id] if self.graph_target_id is not None else []
+                            ),
+                        )
+                        for index, family in enumerate(
+                            ("counterexample", "direct", "structural", "literature"),
+                            start=1,
+                        )
+                    ],
+                    rationale=(
+                        "Launch a diverse exact-target portfolio."
+                        + (
+                            " Reviewed graph "
+                            + str(payload["knowledge_graph_memory"]["graph_revision"])
+                            + "."
+                            if self.graph_target_id is not None
+                            else ""
+                        )
+                    ),
+                ),
+                response_id=f"exact-refutation-{self.calls}",
+            )
+        if output_type is ResearchWorkerReport:
+            assignment_id = payload["assignment"]["id"]
+            if assignment_id == "exact-refutation-route-1":
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    results=[
+                        ScientificResult(
+                            local_key="main-exact-counterexample",
+                            kind=ScientificResultKind.COUNTEREXAMPLE,
+                            exact_statement=EXACT_FALSE_TARGET,
+                            scope=ScientificScope.MAIN,
+                            proof_or_certificate=(
+                                "Take n = 0. It is an integer, but 0 + 1 = 1 and 1 is not equal "
+                                "to 0, so the exact universal conclusion fails."
+                            ),
+                            dependency_node_ids=(
+                                [self.dependency_node_id]
+                                if self.dependency_node_id is not None
+                                else []
+                            ),
+                            disposition=ScientificResultDisposition.REFUTED_MECHANISM,
+                        )
+                    ],
+                    unresolved_obligations=(
+                        [
+                            {
+                                "local_key": "unresolved-certificate-domain",
+                                "exact_statement": "The witness belongs to the exact domain.",
+                                "conclusion": "The witness belongs to the exact domain.",
+                                "parent_result_keys": ["main-exact-counterexample"],
+                            }
+                        ]
+                        if self.parented_support_obligation
+                        else []
+                    ),
+                    branch_outcome=BranchOutcome.REFUTED,
+                    mechanism="A complete explicit exact-target instance.",
+                )
+            else:
+                report = ResearchWorkerReport(
+                    assignment_id=assignment_id,
+                    results=[
+                        ScientificResult(
+                            local_key=f"partial-{assignment_id}",
+                            kind=ScientificResultKind.LEMMA,
+                            exact_statement=f"Partial statement from {assignment_id}.",
+                            scope=ScientificScope.BRANCH,
+                            proof_or_certificate="A rigorous but nonterminal branch calculation.",
+                            exact_gap="Connect this calculation to the frozen main theorem.",
+                            disposition=ScientificResultDisposition.PARTIAL,
+                        )
+                    ],
+                    unresolved_obligations=[
+                        {
+                            "local_key": f"gap-{assignment_id}",
+                            "exact_statement": "Connect the branch to the exact main theorem.",
+                            "conclusion": "The exact main theorem follows.",
+                        }
+                    ],
+                    branch_outcome=BranchOutcome.BLOCKED,
+                    mechanism="A nonterminal comparison route.",
+                )
+            return ModelResult(parsed=report, response_id=f"exact-refutation-{self.calls}")
+        if output_type is CounterexampleAuditResponse:
+            role = CounterexampleAuditRole(payload["audit_role"])
+            self.role_calls.append(role)
+            if role is CounterexampleAuditRole.FALSIFIER and self.interrupt_falsifier:
+                raise RuntimeError("fixture interruption after verifier persistence")
+            packet = payload["exact_counterexample_packet"]
+            return ModelResult(
+                parsed=CounterexampleAuditResponse(
+                    audit_role=role,
+                    audit_id=packet["audit_id"],
+                    target_statement_sha256=packet["target_statement_sha256"],
+                    decision=CounterexampleAuditDecision.PASS,
+                    statement_aligned=True,
+                    every_hypothesis_satisfied=True,
+                    claimed_failure_demonstrated=True,
+                    certificate_valid=True,
+                    witness_or_instance="n = 0",
+                    hypothesis_check="0 is an integer, so the quantified domain includes it.",
+                    conclusion_evaluation="0 + 1 = 1, and 1 is not equal to 0.",
+                    checks_performed=["Checked the complete exact certificate independently."],
+                    hostile_or_boundary_tests=(
+                        ["Attacked the domain, boundary instance, and quantifier order."]
+                        if role is CounterexampleAuditRole.FALSIFIER
+                        else []
+                    ),
+                    rationale="The exact-target counterexample survives independent review.",
+                ),
+                response_id=f"exact-refutation-{role.value}-{self.calls}",
+            )
+        raise AssertionError(output_type)
+
+
+@pytest.mark.asyncio
+async def test_exact_main_counterexample_requires_two_audits_and_resumes_missing_role(
+    tmp_path: Path,
+) -> None:
+    interrupted_client = ExactCounterexampleResearchClient(interrupt_falsifier=True)
+    paused = await run_adaptive_research(
+        client=interrupted_client,
+        compiled_problem=false_exact_compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_pending_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_coordinator_decisions=1,
+        ),
+    )
+    assert paused.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    assert paused.pause_reason == "COUNTEREXAMPLE_AUDIT_INCOMPLETE"
+    assert interrupted_client.role_calls.count(CounterexampleAuditRole.VERIFIER) == 1
+    assert interrupted_client.role_calls.count(CounterexampleAuditRole.FALSIFIER) == 1
+
+    resume_client = ExactCounterexampleResearchClient()
+    resumed = await run_adaptive_research(
+        client=resume_client,
+        compiled_problem=false_exact_compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_pending_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_coordinator_decisions=1,
+        ),
+    )
+    assert resumed.outcome is ResearchOutcome.REJECTED
+    assert resumed.refutation_gate is not None
+    assert resumed.refutation_gate.verified_refutation is not None
+    assert resume_client.role_calls == [CounterexampleAuditRole.FALSIFIER]
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((tmp_path / "events").glob("*.json"))
+    ]
+    assert sum(event["kind"] == "main_counterexample_audit_passed" for event in events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "support_changed",
+    [False, True],
+    ids=["unrelated-revision", "genuine-support-change"],
+)
+async def test_counterexample_resume_reuses_frozen_nomination_after_unrelated_graph_revision(
+    tmp_path: Path,
+    support_changed: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    problem = project / "problem.md"
+    problem.write_text(EXACT_FALSE_TARGET + "\n", encoding="utf-8")
+    run_id = "run-frozen-counterexample"
+    graph = KnowledgeGraph(project, "frozen-counterexample")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id=run_id,
+    )
+    compiled = false_exact_compiled_problem()
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id=run_id,
+        compiled_problem=compiled.model_dump(mode="json"),
+    )
+    target_id = graph.main_claim_id(problem_id)
+    setup_tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id=run_id,
+        decision_id=0,
+        assignments=[
+            {
+                "id": "trusted-premise-setup",
+                "task": "Record an independently checked domain fact.",
+                "expected_output": "One audited premise.",
+                "target_node_ids": [target_id],
+            }
+        ],
+    )
+    dependency_id = "CLM-DEPEND01"
+    trusted_dependency = GraphPatch(
+        base_graph_revision=graph.load_state().revision,
+        run_id=run_id,
+        task_id=setup_tasks["trusted-premise-setup"],
+        agent_role="research-auditor-fixture",
+        create_nodes=[
+            GraphNodeCreate(
+                matek_id=dependency_id,
+                node_type=NodeType.CLAIM,
+                claim_type=ClaimType.LEMMA,
+                title="Audited integer-domain fact",
+                body="## Exact statement\n\nZero is an integer.",
+                epistemic_status=EpistemicStatus.AUDIT_PASSED,
+                workflow_status=WorkflowStatus.COMPLETE,
+            )
+        ],
+    )
+    assert graph.merge_patch(
+        trusted_dependency,
+        problem_id=problem_id,
+        operation_id="trusted-premise-setup",
+    ).committed
+
+    research_dir = project / ".matek" / "runs" / run_id / "research"
+    settings = ResearchWorkflowSettings(
+        minimum_initial_assignments=4,
+        maximum_pending_assignments=4,
+        maximum_concurrent_agents=4,
+        maximum_coordinator_decisions=1,
+    )
+    interrupted_client = ExactCounterexampleResearchClient(
+        interrupt_falsifier=True,
+        graph_target_id=target_id,
+        dependency_node_id=dependency_id,
+    )
+    paused = await run_adaptive_research(
+        client=interrupted_client,
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=settings,
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+    assert paused.outcome is ResearchOutcome.PAUSED_RETRIABLE
+    scheduler_path = research_dir / "coordinator" / "state.json"
+    paused_scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    paused_assignment = next(
+        item
+        for item in paused_scheduler["assignments"]
+        if item["assignment"]["id"] == "exact-refutation-route-1"
+    )
+    paused_audit = paused_assignment["exact_counterexample_audits"][0]
+    frozen_audit_id = paused_audit["audit_id"]
+    frozen_nomination_sha256 = paused_audit["nomination_sha256"]
+    graph_revision_at_pause = graph.load_state().revision
+
+    unrelated_patch = GraphPatch(
+        base_graph_revision=graph_revision_at_pause,
+        run_id=run_id,
+        task_id=setup_tasks["trusted-premise-setup"],
+        agent_role=("research-auditor-fixture" if support_changed else "research-worker"),
+        create_nodes=(
+            []
+            if support_changed
+            else [
+                GraphNodeCreate(
+                    matek_id="SRC-UNRELATED1",
+                    node_type=NodeType.SOURCE,
+                    title="Unrelated archival source",
+                    body="An unrelated source note that is not counterexample support.",
+                )
+            ]
+        ),
+        update_nodes=(
+            [
+                GraphNodeUpdate(
+                    matek_id=dependency_id,
+                    evidence=["A second independent domain check was recorded."],
+                    reason="Attach fresh support evidence without changing the exact claim.",
+                )
+            ]
+            if support_changed
+            else []
+        ),
+    )
+    assert graph.merge_patch(
+        unrelated_patch,
+        problem_id=problem_id,
+        operation_id=(
+            "support-post-audit-revision" if support_changed else "unrelated-post-audit-revision"
+        ),
+    ).committed
+    assert graph.load_state().revision != graph_revision_at_pause
+
+    resume_client = ExactCounterexampleResearchClient(
+        graph_target_id=target_id,
+        dependency_node_id=dependency_id,
+    )
+    resumed = await run_adaptive_research(
+        client=resume_client,
+        compiled_problem=compiled,
+        research_dir=research_dir,
+        workflow_settings=settings,
+        knowledge_graph=graph,
+        graph_problem_id=problem_id,
+        run_id=run_id,
+    )
+
+    assert resumed.outcome is ResearchOutcome.REJECTED
+    assert resume_client.role_calls == (
+        [CounterexampleAuditRole.VERIFIER, CounterexampleAuditRole.FALSIFIER]
+        if support_changed
+        else [CounterexampleAuditRole.FALSIFIER]
+    )
+    resumed_scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
+    resumed_assignment = next(
+        item
+        for item in resumed_scheduler["assignments"]
+        if item["assignment"]["id"] == "exact-refutation-route-1"
+    )
+    resumed_audits = resumed_assignment["exact_counterexample_audits"]
+    if support_changed:
+        assert len(resumed_audits) == 2
+        assert resumed_audits[0]["audit_id"] == frozen_audit_id
+        assert resumed_audits[0]["nomination_sha256"] == frozen_nomination_sha256
+        assert resumed_audits[0]["superseded"] is True
+        assert "support changed" in resumed_audits[0]["superseded_reason"].casefold()
+        assert resumed_audits[1]["audit_id"] != frozen_audit_id
+        assert resumed_audits[1]["superseded"] is False
+        assert sorted(
+            path.name for path in (research_dir / "counterexample-audits").iterdir()
+        ) == sorted([frozen_audit_id, resumed_audits[1]["audit_id"]])
+    else:
+        assert len(resumed_audits) == 1
+        assert resumed_audits[0]["audit_id"] == frozen_audit_id
+        assert resumed_audits[0]["nomination_sha256"] == frozen_nomination_sha256
+        assert [path.name for path in (research_dir / "counterexample-audits").iterdir()] == [
+            frozen_audit_id
+        ]
+
+
+@pytest.mark.asyncio
+async def test_untrusted_counterexample_support_is_durably_nonterminal(tmp_path: Path) -> None:
+    client = ExactCounterexampleResearchClient(parented_support_obligation=True)
+    result = await run_adaptive_research(
+        client=client,
+        compiled_problem=false_exact_compiled_problem(),
+        research_dir=tmp_path,
+        workflow_settings=ResearchWorkflowSettings(
+            minimum_initial_assignments=4,
+            maximum_pending_assignments=4,
+            maximum_concurrent_agents=4,
+            maximum_coordinator_decisions=1,
+        ),
+    )
+    assert result.outcome is not ResearchOutcome.REJECTED
+    assert result.refutation_gate is None
+    assert client.role_calls == []
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text(encoding="utf-8"))
+    assignment = next(
+        item
+        for item in scheduler["assignments"]
+        if item["assignment"]["id"] == "exact-refutation-route-1"
+    )
+    assert "main-exact-counterexample" in assignment["counterexample_support_rejections"]
+    events = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((tmp_path / "events").glob("*.json"))
+    ]
+    assert sum(event["kind"] == "main_counterexample_support_rejected" for event in events) == 1
 
 
 class RepairResearchClient(SuccessfulResearchClient):
@@ -3834,7 +6783,7 @@ class RepairResearchClient(SuccessfulResearchClient):
             if assignment_id.startswith("initial-") and assignment_id != "initial-1":
                 await self.release_unrelated_workers.wait()
             return ModelResult(
-                parsed=ResearchWorkerReport(
+                parsed=research_worker_report_v1(
                     assignment_id=assignment_id,
                     status=WorkerStatus.CANDIDATE_COMPLETE,
                     formal_results=[f"Proof route from {assignment_id}"],

@@ -128,6 +128,10 @@ def test_role_specific_research_defaults() -> None:
     assert config.research.maximum_coordinator_context_characters == 800_000
     assert config.research.maximum_unrequested_full_graph_node_characters == 120_000
     assert config.research.maximum_coordinator_requested_artifacts == 32
+    assert config.research.scientific_phase.no_audited_progress_assignments == 8
+    assert config.research.scientific_phase.unchanged_cut_snapshots == 4
+    assert config.research.scientific_phase.bottleneck_concurrency == 3
+    assert config.research.scientific_phase.adversarial_concurrency == 2
     assert config.research.orchestration_mode == "hierarchical"
     assert config.research.maximum_subagents_per_agent == 8
     assert config.research.hierarchical_subagent_limit == 8
@@ -550,6 +554,23 @@ def test_research_assignment_cap_cannot_undercut_initial_portfolio(tmp_path: Pat
 
     with pytest.raises(ConfigError, match="maximum_assignments_per_round"):
         load_config(path, env={})
+
+
+def test_scientific_phase_progress_thresholds_are_configurable(tmp_path: Path) -> None:
+    path = tmp_path / "matek.toml"
+    path.write_text(
+        "[research.scientific_phase]\n"
+        "no_audited_progress_assignments = 12\n"
+        "similarity_threshold = 0.91\n"
+        "bottleneck_concurrency = 2\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path, env={})
+
+    assert config.research.scientific_phase.no_audited_progress_assignments == 12
+    assert config.research.scientific_phase.similarity_threshold == 0.91
+    assert config.research.scientific_phase.bottleneck_concurrency == 2
 
 
 def test_resolved_toml_omits_runtime_root_and_none(tmp_path: Path) -> None:

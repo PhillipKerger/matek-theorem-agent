@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ..config import ModelSettings
 from ..openai_client import ModelClient, ModelRequest
+from ..scientific import TargetContractAlignment, validate_target_contract
 from ..source_identifiers import source_identifiers, tool_metadata_source_identifiers
 from ..source_provenance import (
     IdentifierVerifier,
@@ -417,6 +418,7 @@ class PromptCompilationResult(BaseModel):
 
     compiled_problem: CompiledProblem
     framework_sha256: str
+    target_alignment: TargetContractAlignment | None = None
     source_verification: SourceVerificationReport = Field(default_factory=SourceVerificationReport)
     prompt_validation: PromptValidationReport = Field(default_factory=PromptValidationReport)
     artifacts: ArtifactManifest = Field(default_factory=ArtifactManifest)
@@ -522,6 +524,7 @@ def _write_prompt_snapshot(
     *,
     framework_bytes: bytes,
     compiled: CompiledProblem,
+    target_alignment: TargetContractAlignment | None,
     verification: SourceVerificationReport,
     validation: PromptValidationReport,
     provider_metadata: Sequence[dict[str, Any] | Any],
@@ -540,6 +543,10 @@ def _write_prompt_snapshot(
         ),
         "prompt_validation": atomic_write_json(destination / "prompt_validation.json", validation),
     }
+    if target_alignment is not None:
+        paths["target_alignment"] = atomic_write_json(
+            destination / "target_alignment.json", target_alignment
+        )
     if compiled.status is PromptCompilationStatus.COMPILED:
         paths["compiled_prompt"] = atomic_write_text(
             destination / "compiled_research_prompt.md", compiled.compiled_prompt
@@ -1044,6 +1051,32 @@ async def compile_prompt(
         CompiledProblem,
     )
     compiled = model_result.parsed
+    target_alignment = (
+        validate_target_contract(
+            compiled.normalized_statement,
+            compiled.claim_contract.as_dict(),
+        )
+        if compiled.status is PromptCompilationStatus.COMPILED
+        else None
+    )
+    destination = ensure_stage_directory(prompts_dir) if prompts_dir is not None else None
+    if destination is not None and target_alignment is not None:
+        atomic_write_json(destination / "target_alignment.json", target_alignment)
+    if target_alignment is not None and not target_alignment.passed:
+        if destination is not None:
+            _write_prompt_snapshot(
+                destination,
+                framework_bytes=framework_bytes,
+                compiled=compiled,
+                target_alignment=target_alignment,
+                verification=SourceVerificationReport(),
+                validation=PromptValidationReport(),
+                provider_metadata=model_result.tool_metadata,
+            )
+        raise StageValidationError(
+            "Compiled normalized statement does not match the claim contract: "
+            + " ".join(target_alignment.blocking_issues)
+        )
     compiled.source_ledger = _normalize_evidence_links(
         [SourceLedgerEntry.model_validate(entry) for entry in compiled.source_ledger]
     )
@@ -1196,7 +1229,6 @@ async def compile_prompt(
     if repair_warning:
         verification.warnings.append(repair_warning)
 
-    destination = ensure_stage_directory(prompts_dir) if prompts_dir is not None else None
     snapshot_paths: dict[str, Path] = {}
 
     def persist_prompt_snapshot(validation: PromptValidationReport) -> None:
@@ -1207,6 +1239,7 @@ async def compile_prompt(
             destination,
             framework_bytes=framework_bytes,
             compiled=compiled,
+            target_alignment=target_alignment,
             verification=verification,
             validation=validation,
             provider_metadata=provider_metadata,
@@ -1255,6 +1288,7 @@ async def compile_prompt(
     return PromptCompilationResult(
         compiled_problem=compiled,
         framework_sha256=framework_digest,
+        target_alignment=target_alignment,
         source_verification=verification,
         prompt_validation=prompt_validation,
         artifacts=artifacts,

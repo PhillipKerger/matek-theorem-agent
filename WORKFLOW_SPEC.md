@@ -61,15 +61,15 @@ Before every non-replayed coordinator request, query the graph frontier. Before 
 delegation, an existing graph is explicitly marked as requiring review, and the coordinator uses
 its overview, prior results, failures, gaps, audits, and tasks to shape the portfolio. Coordinator
 assignments name stable target IDs and are materialized as graph task nodes before worker
-reservations. Each
-worker request freezes a bounded graph context and base revision. A worker may propose a typed
-patch but cannot write the vault. Once its raw report and independent source verification are
-durable, the deterministic graph service validates/merges the patch and distilled report, then
-publishes the worker event. Valid partial and blocked results therefore survive interruption.
-The scientific report transaction and the optional graph mutation are separate: an invalid or
-stale patch produces a durable warning while the proof, counterexample, or partial result remains
-available. MATEK binds graph content hashes from the frozen revision rather than trusting hashes
-supplied by a worker.
+reservations. Each worker request freezes a bounded graph context and base revision. A worker
+returns a schema-v2 typed scientific report and cannot author persistence identities, relation
+directions, status promotions, or vault writes. Once its raw report and independent source
+verification are durable, the deterministic graph service constructs and commits the application-
+owned admission plan, then publishes the worker event. Valid partial and blocked results therefore
+survive interruption. The scientific report transaction and graph admission are separate: an
+admission failure produces a durable warning while the proof attempt, counterexample, or partial
+result remains available. MATEK binds graph content hashes from the frozen revision rather than
+trusting hashes supplied by a worker.
 
 Every new coordinator payload includes an activation context. It distinguishes bootstrap,
 existing-graph bootstrap, continuation, and process resume; says explicitly that no provider
@@ -200,9 +200,10 @@ and any counterexample found.
 The approach registry and graph preserve one entry per assignment branch rather than collapsing
 all work sharing an approach-family label. Blocked and ruled-out branches retain their exact gap,
 counterexamples, and reopen condition even when another branch in the same family remains
-productive. Automatically distilled worker counterexamples are linked to their approach branch,
-not promoted to refutations of the main theorem. A claim-level refutation requires an explicit
-typed graph proposal and still passes through independent scientific review.
+productive. Automatically admitted worker counterexamples are linked to their approach branch,
+not promoted to refutations of the main theorem. A claim-level refutation requires a complete
+typed main-scope scientific result matching the frozen target and a deterministic, independently
+recomputed verifier/hostile-falsifier gate; only application code may add the main `REFUTES` edge.
 
 There is no cumulative research-worker ceiling. Total-open-assignment, active-concurrency,
 coordinator-decision, model-call, cost, token, and optional active-wall-clock limits remain
@@ -223,6 +224,13 @@ foundational auditor independently checks that classification; falsely clearing 
 so the packager cannot suppress an applicable complexity audit. The package and every audit are
 also bound to the exact-target policy: a proof of a reduced or weaker problem cannot pass even when
 that result is mathematically valid in its own right.
+
+Before packaging, MATEK validates every triggering report's acyclic `dependency_result_keys` DAG.
+Every replay-backed computation must be in the transitive closure of a separate exact-main lemma or
+reduction. With a knowledge graph active, the frozen support binding includes each closure result's
+application-resolved premise edges and versions plus the computation derivation and canonical
+manifest/replay artifact pair. An unrelated replay or a live obligation anywhere in that bound
+slice stops the gate before a model audit.
 
 Launch fresh agents for:
 

@@ -13,7 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .accounting import AccountingModelClient
 from .budget import BudgetExceeded, BudgetTracker, UsageRecord
@@ -50,6 +50,7 @@ from .reporting import (
     write_final_report,
 )
 from .resources import resource_path, resource_paths
+from .scientific import validate_target_contract
 from .source_provenance import (
     BoundedHttpSourceVerifier,
     IdentifierVerifier,
@@ -57,10 +58,12 @@ from .source_provenance import (
 )
 from .stages.compile_prompt import (
     EXPECTED_FRAMEWORK_SHA256,
+    ClaimContract,
     CompiledProblem,
     PromptCompilationResult,
     compile_prompt,
 )
+from .stages.computation_artifacts import ComputationReplayIsolation
 from .stages.lean import (
     AlignmentStatus,
     LeanOutcome,
@@ -79,6 +82,7 @@ from .stages.research import (
     ResearchWorkflowSettings,
     run_adaptive_research,
 )
+from .stages.scientific_phase import ScientificPhasePolicy
 from .state import (
     StateCorruptionError,
     StateStore,
@@ -122,7 +126,18 @@ class WorkflowOptions(BaseModel):
     research_only: bool = False
     allow_project_edits: bool = False
     knowledge_graph: str | None = None
+    target_migration_reason: str | None = None
     invocation: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target_migration_reason")
+    @classmethod
+    def target_migration_reason_is_explicit(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("target migration reason must not be blank")
+        return normalized
 
 
 LEAN_CONSENT_TIMEOUT_SECONDS = 5 * 60
@@ -363,6 +378,79 @@ class WorkflowRunner:
             raise StateCorruptionError("knowledge_graph metadata must be an object")
         raw["revision"] = graph.load_state().revision
         raw["status"] = graph.status().model_dump(mode="json")
+
+    def _bind_frozen_compiled_target(
+        self,
+        *,
+        state: RunState,
+        graph: KnowledgeGraph,
+        compiled: CompiledProblem,
+        persist_prompt_artifacts: bool,
+    ) -> CompiledProblem:
+        """Rebind compiler output to the source-hash target before research.
+
+        Prompt compilation may be nondeterministic even when the source problem is
+        unchanged.  The graph registry owns the canonical theorem bytes; literature
+        and source-verification fields remain run-local refresh artifacts.
+        """
+
+        if compiled.needs_clarification:
+            return compiled
+        source_hash = str(state.metadata.get("problem_normalized_sha256") or "").strip()
+        if not source_hash:
+            raise StateCorruptionError(
+                "compiled target cannot be frozen without the normalized source hash"
+            )
+        frozen = graph.frozen_target_for_source(source_hash)
+        try:
+            contract = ClaimContract.model_validate(json.loads(frozen.canonical_contract_json))
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise StateCorruptionError(
+                "immutable target registry contains an invalid claim contract"
+            ) from exc
+        rebound = compiled.model_copy(
+            deep=True,
+            update={
+                "title": frozen.title,
+                "normalized_statement": frozen.exact_statement,
+                "claim_contract": contract,
+                "compiled_prompt": frozen.compiled_prompt,
+            },
+        )
+        alignment = validate_target_contract(
+            rebound.normalized_statement,
+            rebound.claim_contract.as_dict(),
+        )
+        if not alignment.passed:
+            raise StateCorruptionError(
+                "immutable target no longer aligns with its canonical claim contract: "
+                + " ".join(alignment.blocking_issues)
+            )
+        if persist_prompt_artifacts:
+            prompts_root = state.run_root / "prompts"
+            atomic_write_json(
+                prompts_root / "compiled_problem.json",
+                rebound,
+                confinement_root=state.run_root,
+            )
+            atomic_write_text(
+                prompts_root / "compiled_research_prompt.md",
+                rebound.compiled_prompt,
+                confinement_root=state.run_root,
+            )
+            atomic_write_json(
+                prompts_root / "target_alignment.json",
+                alignment,
+                confinement_root=state.run_root,
+            )
+        state.metadata["frozen_target"] = {
+            "normalized_source_sha256": source_hash,
+            "target_node_id": frozen.target_node_id,
+            "statement_sha256": frozen.statement_sha256,
+            "contract_sha256": frozen.contract_sha256,
+            "statement_version": frozen.statement_version,
+        }
+        return rebound
 
     def _record_lean_graph_result(
         self,
@@ -630,6 +718,7 @@ class WorkflowRunner:
                     "custom_framework_path": (
                         str(selected.framework_path.resolve()) if selected.framework_path else None
                     ),
+                    "target_migration_reason": selected.target_migration_reason,
                 }
             )
             graph = self._ensure_graph(
@@ -993,6 +1082,11 @@ class WorkflowRunner:
             no_lean=bool(state.metadata.get("no_lean", False)),
             research_only=bool(state.metadata.get("research_only", False)),
             allow_project_edits=bool(state.metadata.get("allow_project_edits", False)),
+            target_migration_reason=(
+                str(state.metadata["target_migration_reason"])
+                if state.metadata.get("target_migration_reason")
+                else None
+            ),
         )
         return await self._execute(state, options)
 
@@ -1681,11 +1775,24 @@ class WorkflowRunner:
         if not self._begin(state, store, logger, StageName.PROMPT_COMPILATION):
             compiled = CompiledProblem.model_validate_json(result_path.read_text(encoding="utf-8"))
             graph = self._knowledge_graph_for_state(state)
-            graph.record_compiled_problem(
-                problem_id=self._graph_problem_id(state),
-                run_id=state.run_id,
-                compiled_problem=compiled.model_dump(mode="json"),
-            )
+            if not compiled.needs_clarification:
+                graph.record_compiled_problem(
+                    problem_id=self._graph_problem_id(state),
+                    run_id=state.run_id,
+                    compiled_problem=compiled.model_dump(mode="json"),
+                    normalized_source_sha256=str(
+                        state.metadata.get("problem_normalized_sha256") or ""
+                    )
+                    or None,
+                    allow_target_migration=bool(options.target_migration_reason),
+                    target_migration_reason=options.target_migration_reason,
+                )
+                compiled = self._bind_frozen_compiled_target(
+                    state=state,
+                    graph=graph,
+                    compiled=compiled,
+                    persist_prompt_artifacts=False,
+                )
             self._refresh_graph_metadata(state, graph)
             store.save(state)
             return compiled
@@ -1785,11 +1892,22 @@ class WorkflowRunner:
             state.scientific_status = ScientificStatus.PROMPT_COMPILED
             state.metadata["research_status"] = ScientificStatus.PROMPT_COMPILED.value
         graph = self._knowledge_graph_for_state(state)
-        graph.record_compiled_problem(
-            problem_id=self._graph_problem_id(state),
-            run_id=state.run_id,
-            compiled_problem=result.compiled_problem.model_dump(mode="json"),
-        )
+        if not result.needs_clarification:
+            graph.record_compiled_problem(
+                problem_id=self._graph_problem_id(state),
+                run_id=state.run_id,
+                compiled_problem=result.compiled_problem.model_dump(mode="json"),
+                normalized_source_sha256=str(state.metadata.get("problem_normalized_sha256") or "")
+                or None,
+                allow_target_migration=bool(options.target_migration_reason),
+                target_migration_reason=options.target_migration_reason,
+            )
+            result.compiled_problem = self._bind_frozen_compiled_target(
+                state=state,
+                graph=graph,
+                compiled=result.compiled_problem,
+                persist_prompt_artifacts=True,
+            )
         self._refresh_graph_metadata(state, graph)
         self._checkpoint(
             state,
@@ -1889,6 +2007,9 @@ class WorkflowRunner:
                         maximum_coordinator_requested_artifacts=(
                             self.config.research.maximum_coordinator_requested_artifacts
                         ),
+                        scientific_phase_policy=ScientificPhasePolicy.model_validate(
+                            self.config.research.scientific_phase.model_dump(mode="python")
+                        ),
                     ),
                     coordinator_settings=self._model_settings("research_coordinator"),
                     worker_settings=self._model_settings("research_worker"),
@@ -1912,6 +2033,18 @@ class WorkflowRunner:
                     run_id=state.run_id,
                     coordinator_can_read_files=(self.config.backend.provider == "codex"),
                     graph_replay_dir=graph_replay_dir,
+                    computation_backend=self.dependencies.execution_backend,
+                    computation_replay_isolation=ComputationReplayIsolation(
+                        filesystem_write_confined=(self.config.lean.execution_backend == "docker"),
+                        network_disabled=(self.config.lean.execution_backend == "docker"),
+                        description=(
+                            "Restricted Docker replay with a single assignment-stage bind and "
+                            "network disabled."
+                            if self.config.lean.execution_backend == "docker"
+                            else "Native execution is not independently filesystem or network "
+                            "confined; replay is refused."
+                        ),
+                    ),
                     progress=self.dependencies.progress,
                 )
         except Exception as exc:
@@ -2002,14 +2135,18 @@ class WorkflowRunner:
         logger: RunLogger,
         result: ResearchResult,
     ) -> None:
-        if result.final_verdict is not None:
+        if result.final_verdict is not None or result.refutation_gate is not None:
             if self._begin(state, store, logger, StageName.RESEARCH_AUDIT):
                 for path in result.artifacts.paths.values():
                     if "audit" in path.parts or path.name == "verdict.json":
                         record_artifact_file(state, StageName.RESEARCH_AUDIT, path)
                 succeed_stage(state, StageName.RESEARCH_AUDIT)
         else:
-            self._skip_pending(state, StageName.RESEARCH_AUDIT, "no candidate reached audit")
+            self._skip_pending(
+                state,
+                StageName.RESEARCH_AUDIT,
+                "no proof candidate or exact counterexample reached independent audit",
+            )
         store.save(state)
 
     async def _manuscript_stage(

@@ -1,0 +1,116 @@
+{
+  "$defs": {
+    "CounterexampleAuditDecision": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ],
+      "title": "CounterexampleAuditDecision",
+      "type": "string"
+    },
+    "CounterexampleAuditRole": {
+      "enum": [
+        "counterexample-verifier",
+        "counterexample-falsifier"
+      ],
+      "title": "CounterexampleAuditRole",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "audit_id": {
+      "title": "Audit Id",
+      "type": "string"
+    },
+    "audit_role": {
+      "$ref": "#/$defs/CounterexampleAuditRole"
+    },
+    "certificate_valid": {
+      "title": "Certificate Valid",
+      "type": "boolean"
+    },
+    "checks_performed": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Checks Performed",
+      "type": "array"
+    },
+    "claimed_failure_demonstrated": {
+      "title": "Claimed Failure Demonstrated",
+      "type": "boolean"
+    },
+    "conclusion_evaluation": {
+      "title": "Conclusion Evaluation",
+      "type": "string"
+    },
+    "decision": {
+      "$ref": "#/$defs/CounterexampleAuditDecision"
+    },
+    "every_hypothesis_satisfied": {
+      "title": "Every Hypothesis Satisfied",
+      "type": "boolean"
+    },
+    "hostile_or_boundary_tests": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Hostile Or Boundary Tests",
+      "type": "array"
+    },
+    "hypothesis_check": {
+      "title": "Hypothesis Check",
+      "type": "string"
+    },
+    "obligations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Obligations",
+      "type": "array"
+    },
+    "rationale": {
+      "title": "Rationale",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "statement_aligned": {
+      "title": "Statement Aligned",
+      "type": "boolean"
+    },
+    "target_statement_sha256": {
+      "title": "Target Statement Sha256",
+      "type": "string"
+    },
+    "witness_or_instance": {
+      "title": "Witness Or Instance",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "audit_role",
+    "audit_id",
+    "target_statement_sha256",
+    "decision",
+    "statement_aligned",
+    "every_hypothesis_satisfied",
+    "claimed_failure_demonstrated",
+    "certificate_valid",
+    "witness_or_instance",
+    "hypothesis_check",
+    "conclusion_evaluation",
+    "checks_performed",
+    "hostile_or_boundary_tests",
+    "rationale",
+    "obligations"
+  ],
+  "title": "CounterexampleAuditResponse",
+  "type": "object"
+}

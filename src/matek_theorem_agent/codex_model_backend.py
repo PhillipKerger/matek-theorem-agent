@@ -777,8 +777,19 @@ class CodexCliModelClient:
         _stage: str = "model",
         _role: str = "agent",
         _resume_session_id: str | None = None,
+        _confinement_root: Path | None = None,
+        _bound_writable_paths: tuple[Path, ...] | None = None,
     ) -> None:
+        self._confinement_root = _existing_directory(
+            _confinement_root or workspace_root,
+            "Codex confinement root",
+        )
         self._workspace_root = _existing_directory(workspace_root, "Codex workspace root")
+        if not (
+            self._workspace_root == self._confinement_root
+            or self._workspace_root.is_relative_to(self._confinement_root)
+        ):
+            raise ValueError("Codex workspace root must be contained by its confinement root")
         if not executable.strip() or "\x00" in executable:
             raise ValueError("Codex executable must be one non-empty argument")
         if model is not None and not model.strip():
@@ -808,6 +819,11 @@ class CodexCliModelClient:
         self._stage = _safe_component(_stage, "model")
         self._role = _safe_component(_role, "agent")
         self._resume_session_id = _validate_session_id(_resume_session_id)
+        if _bound_writable_paths is not None and (
+            self._stage != "research" or self._role != "research-worker"
+        ):
+            raise ValueError("bound writable paths are restricted to the research-worker role")
+        self._bound_writable_paths = _bound_writable_paths
         self._shared = _shared or _SharedRuntime(backend=backend or NativeBackend())
         if _shared is not None and backend is not None and backend is not _shared.backend:
             raise ValueError("a context-bound Codex clone cannot replace its execution backend")
@@ -820,6 +836,13 @@ class CodexCliModelClient:
         role: str | None = None,
     ) -> Self:
         """Return a cheap context-bound clone sharing probe and subprocess state."""
+
+        next_role = role or "agent"
+        bound_writable_paths = (
+            self._bound_writable_paths
+            if stage == "research" and _safe_component(next_role, "agent") == "research-worker"
+            else None
+        )
 
         return type(self)(
             self._workspace_root,
@@ -839,8 +862,62 @@ class CodexCliModelClient:
             extra_args=self._extra_args,
             _shared=self._shared,
             _stage=stage,
-            _role=role or "agent",
+            _role=next_role,
             _resume_session_id=self._resume_session_id,
+            _confinement_root=self._confinement_root,
+            _bound_writable_paths=bound_writable_paths,
+        )
+
+    def for_workspace(
+        self,
+        workspace_root: Path,
+        *,
+        writable_paths: Sequence[Path] = (),
+    ) -> Self:
+        """Bind one research worker to an existing private workspace.
+
+        This is an explicit authority grant available only after the client has been bound to
+        the ``research-worker`` role.  Codex receives ``workspace-write`` for the private ``-C``
+        root, while MATEK's post-call guard accepts changes only beneath the declared writable
+        subdirectories.  Trace artifacts may remain in the original run root.
+        """
+
+        if self._stage != "research" or self._role != "research-worker":
+            raise ValueError("writable workspace binding is restricted to the research-worker role")
+        workspace = _existing_directory(workspace_root, "Codex bound workspace root")
+        workspace = ensure_path_confined(self._confinement_root, workspace)
+        if not writable_paths:
+            raise ValueError("Codex bound workspace requires an explicit writable path set")
+        resolved_writable: list[Path] = []
+        for path in writable_paths:
+            writable = _existing_directory(path, "Codex bound writable path")
+            writable = ensure_path_confined(workspace, writable)
+            if not os.access(writable, os.W_OK):
+                raise ValueError(f"Codex bound writable path is not writable: {path}")
+            if writable not in resolved_writable:
+                resolved_writable.append(writable)
+        return type(self)(
+            workspace,
+            executable=self._executable,
+            run_root=self._run_root,
+            model=self._model,
+            stage_policies=self._stage_policies,
+            timeout_seconds=self._timeout_seconds,
+            max_attempts=self._max_attempts,
+            initial_backoff_seconds=self._initial_backoff_seconds,
+            maximum_backoff_seconds=self._maximum_backoff_seconds,
+            sleep=self._sleep,
+            jitter=self._jitter,
+            max_output_bytes=self._max_output_bytes,
+            persist_sessions=self._persist_sessions,
+            skip_git_repo_check=self._skip_git_repo_check,
+            extra_args=self._extra_args,
+            _shared=self._shared,
+            _stage=self._stage,
+            _role=self._role,
+            _resume_session_id=self._resume_session_id,
+            _confinement_root=self._confinement_root,
+            _bound_writable_paths=tuple(resolved_writable),
         )
 
     def with_session(self, session_id: str) -> Self:
@@ -866,6 +943,8 @@ class CodexCliModelClient:
             _stage=self._stage,
             _role=self._role,
             _resume_session_id=session_id,
+            _confinement_root=self._confinement_root,
+            _bound_writable_paths=self._bound_writable_paths,
         )
 
     async def probe(self, *, refresh_authentication: bool = True) -> CodexProbeResult:
@@ -1031,7 +1110,13 @@ class CodexCliModelClient:
                     confinement_root=run_root,
                 )
                 before = (
-                    _workspace_snapshot(self._workspace_root, run_root)
+                    _workspace_snapshot(
+                        self._confinement_root,
+                        run_root,
+                        included_root=(
+                            self._workspace_root if self._bound_writable_paths is not None else None
+                        ),
+                    )
                     if policy.sandbox == "workspace-write"
                     else None
                 )
@@ -1044,7 +1129,13 @@ class CodexCliModelClient:
                 )
                 result = await self._run_command(command, artifacts, run_root)
                 after = (
-                    _workspace_snapshot(self._workspace_root, run_root)
+                    _workspace_snapshot(
+                        self._confinement_root,
+                        run_root,
+                        included_root=(
+                            self._workspace_root if self._bound_writable_paths is not None else None
+                        ),
+                    )
                     if before is not None
                     else None
                 )
@@ -1052,8 +1143,12 @@ class CodexCliModelClient:
                     unauthorized = _unauthorized_changes(
                         before,
                         after,
-                        workspace=self._workspace_root,
-                        allowed_roots=(run_root, *policy.allowed_write_paths),
+                        workspace=self._confinement_root,
+                        allowed_roots=(
+                            policy.allowed_write_paths
+                            if self._bound_writable_paths is not None
+                            else (run_root, *policy.allowed_write_paths)
+                        ),
                     )
                     if unauthorized:
                         raise _AttemptException(
@@ -1530,14 +1625,22 @@ class CodexCliModelClient:
         # Always pass the request's explicit model. Inheriting a mutable CLI default
         # would make an on-disk cache key insufficient to identify the actual call.
         model = requested_model
+        configured_write_paths = (
+            self._bound_writable_paths
+            if self._bound_writable_paths is not None
+            else policy.allowed_write_paths
+        )
+        sandbox: SandboxMode = (
+            "workspace-write" if self._bound_writable_paths is not None else policy.sandbox
+        )
         paths: list[Path] = []
-        for path in policy.allowed_write_paths:
+        for path in configured_write_paths:
             resolved = path.expanduser().resolve(strict=True)
             if not resolved.is_dir() or not resolved.is_relative_to(self._workspace_root):
                 raise ValueError(f"Codex writable path is outside the workspace: {path}")
             paths.append(resolved)
         return _ResolvedPolicy(
-            sandbox=policy.sandbox,
+            sandbox=sandbox,
             web_search=(
                 request.settings.web_search if policy.web_search is None else policy.web_search
             ),
@@ -1562,10 +1665,10 @@ class CodexCliModelClient:
     def _validate_run_root(self, run_root: Path) -> Path:
         resolved = _existing_directory(run_root, "Codex run root")
         try:
-            resolved.relative_to(self._workspace_root)
+            resolved.relative_to(self._confinement_root)
         except ValueError as exc:
-            raise ValueError("Codex run root must be contained by the workspace") from exc
-        return ensure_path_confined(self._workspace_root, resolved)
+            raise ValueError("Codex run root must be contained by the confinement root") from exc
+        return ensure_path_confined(self._confinement_root, resolved)
 
     def _new_call_artifacts(self, run_root: Path, attempt: int) -> CodexCallArtifacts:
         relative = (
@@ -1860,29 +1963,70 @@ def _public_url_citations(item: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return citations
 
 
-def _workspace_snapshot(workspace: Path, run_root: Path) -> dict[Path, tuple[str, int]]:
+def _workspace_snapshot(
+    workspace: Path,
+    run_root: Path,
+    *,
+    included_root: Path | None = None,
+) -> dict[Path, tuple[str, int]]:
+    """Snapshot model-visible state while excluding application-owned run traces.
+
+    A private assignment workspace may itself live below ``run_root``.  ``included_root``
+    re-includes exactly that subtree while retaining the exclusion for sibling trace and state
+    files written by MATEK during the call.
+    """
+
+    resolved_workspace = workspace.resolve(strict=True)
+    resolved_run_root = run_root.resolve(strict=True)
+    resolved_included = included_root.resolve(strict=True) if included_root is not None else None
+    reincluded = (
+        resolved_included
+        if resolved_included is not None
+        and (
+            resolved_included == resolved_run_root
+            or resolved_included.is_relative_to(resolved_run_root)
+        )
+        else None
+    )
+
+    def disposition(path: Path) -> Literal["include", "traverse", "exclude"]:
+        if not (path == resolved_run_root or path.is_relative_to(resolved_run_root)):
+            return "include"
+        if reincluded is None:
+            return "exclude"
+        if path == reincluded or path.is_relative_to(reincluded):
+            return "include"
+        if reincluded.is_relative_to(path):
+            return "traverse"
+        return "exclude"
+
     snapshot: dict[Path, tuple[str, int]] = {}
-    for root, directory_names, file_names in os.walk(workspace, followlinks=False):
+    for root, directory_names, file_names in os.walk(resolved_workspace, followlinks=False):
         root_path = Path(root)
         retained_directories: list[str] = []
         for name in directory_names:
             path = root_path / name
-            if path == run_root or path.is_relative_to(run_root):
+            path_disposition = disposition(path)
+            if path_disposition == "exclude":
                 continue
-            relative = path.relative_to(workspace)
+            relative = path.relative_to(resolved_workspace)
             try:
                 entry = path.lstat()
             except OSError:
+                continue
+            retained_directories.append(name)
+            if path_disposition == "traverse":
                 continue
             if stat.S_ISLNK(entry.st_mode):
                 snapshot[relative] = (f"symlink:{os.readlink(path)}", entry.st_mode)
                 continue
             snapshot[relative] = ("directory", entry.st_mode)
-            retained_directories.append(name)
         directory_names[:] = retained_directories
         for name in file_names:
             path = root_path / name
-            relative = path.relative_to(workspace)
+            if disposition(path) != "include":
+                continue
+            relative = path.relative_to(resolved_workspace)
             try:
                 entry = path.lstat()
             except OSError:

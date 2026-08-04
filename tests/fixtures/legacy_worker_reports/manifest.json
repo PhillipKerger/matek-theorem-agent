@@ -1,0 +1,45 @@
+{
+  "fixture_schema_version": 1,
+  "provenance": {
+    "classification": "synthetic-derived",
+    "actual_archive_replay": false,
+    "original_archives_available": false,
+    "basis": "Documented pathologies and snapshot identifiers in the Improvements for Matek implementation brief.",
+    "sanitization": "No original report bodies, user data, secrets, or large computation artifacts are included."
+  },
+  "cases": [
+    {
+      "slug": "atsp",
+      "snapshot_reference": "00000315-96a705c853a887d3",
+      "worker_report": "atsp.worker-report-v1.json",
+      "graph_fixture": "atsp.graph-v1.json",
+      "documented_pathologies": [
+        "model-authored graph_patch dialect",
+        "exact proof gap",
+        "mixed stable and free-text dependencies"
+      ]
+    },
+    {
+      "slug": "matroid-secretary",
+      "snapshot_reference": "00000285-5d876a716ce013ce",
+      "worker_report": "matroid-secretary.worker-report-v1.json",
+      "graph_fixture": "matroid-secretary.graph-v1.json",
+      "documented_pathologies": [
+        "blocked exchange argument",
+        "exact negative-correlation obligation",
+        "legacy proof node with an exact gap"
+      ]
+    },
+    {
+      "slug": "k-server",
+      "snapshot_reference": "00000369-846a4dd539f2cac3",
+      "worker_report": "k-server.worker-report-v1.json",
+      "graph_fixture": "k-server.graph-v1.json",
+      "documented_pathologies": [
+        "mechanism-only small-instance counterexample",
+        "model-authored graph_patch dialect",
+        "direct legacy refutation edge aimed at the main target"
+      ]
+    }
+  ]
+}

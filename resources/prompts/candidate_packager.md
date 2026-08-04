@@ -13,6 +13,11 @@ the field is mandatory and must not be omitted.
 Do not hide unresolved obligations. If the route is incomplete, return an incomplete package
 with a precise obligation list rather than presenting it as solved.
 
+Follow each triggering report's `dependency_result_keys` DAG exactly. A replayed computation is
+usable only when it lies in the exact-main result's bound transitive closure and its canonical
+derivation, manifest, and replay artifacts are present; never attach an unrelated calculation to
+an otherwise unsupported proof.
+
 There are no allowed terminal reductions. Reject any attempt to package a proper subclass,
 weaker conclusion, added hypothesis, equivalent restatement without proof, or unresolved reduced
 claim as the exact theorem. A reduction is usable only when the downstream result and complete

@@ -46,14 +46,26 @@ from .execution.native import NativeBackend
 from .initialization import InitializationError, initialize_project
 from .intake import IntakeError, normalize_problem_text
 from .knowledge_graph import (
+    GraphNode,
     GraphNotInitializedError,
     GraphValidationError,
     KnowledgeGraph,
     KnowledgeGraphError,
+    NodeType,
     RelationType,
     list_graph_names,
     normalize_graph_name,
     problem_graph_name,
+)
+from .knowledge_graph.migration import (
+    LegacyMigrationApplicationRecord,
+    LegacyMigrationError,
+    LegacyMigrationReport,
+    load_legacy_migration_report,
+    migration_application_sha256,
+    migration_report_sha256,
+    plan_legacy_graph_backfill,
+    write_legacy_migration_report,
 )
 from .logging import JournalCorruptionError
 from .models import RunState, StageName, StageStatus
@@ -78,6 +90,7 @@ from .state import (
 from .workspace import (
     RunLock,
     WorkspaceError,
+    atomic_write_bytes,
     discover_project_root,
     latest_run_root_for_problem,
     sha256_file,
@@ -254,7 +267,7 @@ def _error_code(exc: BaseException) -> int:
         return 5
     if isinstance(exc, (ArtifactIntegrityError, StateCorruptionError, JournalCorruptionError)):
         return 6
-    if isinstance(exc, GraphValidationError):
+    if isinstance(exc, (GraphValidationError, LegacyMigrationError)):
         return 6
     if isinstance(exc, CodexBackendError):
         return 3
@@ -795,6 +808,222 @@ def graph_frontier(
         _abort(exc)
 
 
+def _read_legacy_migration_source(graph: KnowledgeGraph) -> tuple[str, list[GraphNode]]:
+    """Read one consistent archive revision without triggering transaction recovery."""
+
+    with graph._locked():
+        if graph.pending_path.exists():
+            raise GraphValidationError(
+                "legacy migration planning is read-only and cannot recover a pending graph "
+                "transaction; run another graph read command to recover it first"
+            )
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+    return state.revision, nodes
+
+
+def _migration_problem_id(nodes: Sequence[GraphNode], requested: str | None) -> str:
+    problem_ids = sorted(node.matek_id for node in nodes if node.node_type is NodeType.PROBLEM)
+    if requested is not None:
+        normalized = requested.strip()
+        if normalized not in problem_ids:
+            raise GraphValidationError(f"unknown graph problem ID: {normalized}")
+        return normalized
+    if len(problem_ids) == 1:
+        return problem_ids[0]
+    if not problem_ids:
+        raise GraphValidationError("knowledge graph has no problem node")
+    raise GraphValidationError(
+        "knowledge graph tracks multiple problems; pass --problem-id explicitly"
+    )
+
+
+def _migration_target_claim_id(
+    graph: KnowledgeGraph,
+    nodes: Sequence[GraphNode],
+    *,
+    problem_id: str,
+    requested: str | None,
+) -> str:
+    claims = {
+        node.matek_id: node
+        for node in nodes
+        if node.problem_id == problem_id and node.node_type is NodeType.CLAIM
+    }
+    if requested is not None:
+        normalized = requested.strip()
+        if normalized not in claims:
+            raise GraphValidationError(
+                f"target claim {normalized!r} is not a claim for problem {problem_id}"
+            )
+        return normalized
+
+    tagged = sorted(node.matek_id for node in claims.values() if "matek/main-target" in node.tags)
+    if len(tagged) == 1:
+        return tagged[0]
+    if len(tagged) > 1:
+        raise GraphValidationError(
+            "multiple claims are tagged as the main target; pass --target-claim-id explicitly"
+        )
+    canonical = graph.main_claim_id(problem_id)
+    if canonical in claims:
+        return canonical
+    raise GraphValidationError(
+        "no main target claim is identifiable; pass --target-claim-id explicitly"
+    )
+
+
+def _legacy_migration_payload(report: LegacyMigrationReport) -> dict[str, Any]:
+    payload = report.model_dump(mode="json")
+    payload["integrity_sha256"] = migration_report_sha256(report)
+    return payload
+
+
+def _legacy_migration_application_payload(
+    record: LegacyMigrationApplicationRecord,
+) -> dict[str, Any]:
+    payload = record.model_dump(mode="json")
+    payload["integrity_sha256"] = migration_application_sha256(record)
+    return payload
+
+
+def _migration_output_path(graph: KnowledgeGraph, requested: Path) -> Path:
+    expanded = requested.expanduser()
+    if expanded.is_symlink():
+        raise WorkspaceError(f"refusing symlinked migration report output: {expanded}")
+    try:
+        destination = expanded.resolve(strict=False)
+        knowledge_root = graph.collection_root.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise WorkspaceError(f"cannot resolve migration report output {expanded}: {exc}") from exc
+    if destination == knowledge_root or knowledge_root in destination.parents:
+        raise WorkspaceError(
+            "migration reports must be written outside .matek/knowledge so the archival "
+            "vault and snapshots remain unchanged"
+        )
+    return destination
+
+
+def _migration_input_path(graph: KnowledgeGraph, requested: Path) -> Path:
+    expanded = requested.expanduser()
+    if expanded.is_symlink():
+        raise WorkspaceError(f"refusing symlinked migration plan input: {expanded}")
+    try:
+        source = expanded.resolve(strict=True)
+        knowledge_root = graph.collection_root.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise WorkspaceError(f"cannot resolve migration plan input {expanded}: {exc}") from exc
+    if source == knowledge_root or knowledge_root in source.parents:
+        raise WorkspaceError("reviewed migration plans must remain outside .matek/knowledge")
+    if not source.is_file():
+        raise WorkspaceError(f"migration plan input is not a regular file: {source}")
+    return source
+
+
+@graph_app.command("migrate-legacy")
+def graph_migrate_legacy(
+    problem_id: str | None = typer.Option(
+        None,
+        "--problem-id",
+        help="Problem node to plan; required only when the graph contains several problems.",
+    ),
+    target_claim_id: str | None = typer.Option(
+        None,
+        "--target-claim-id",
+        help="Main claim to plan; otherwise infer the uniquely tagged/canonical main target.",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        dir_okay=False,
+        help="Write integrity-protected JSON outside the graph vault; otherwise print it.",
+    ),
+    apply_plan: Path | None = typer.Option(
+        None,
+        "--apply-plan",
+        dir_okay=False,
+        help="Apply one externally reviewed integrity-protected plan.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Confirm application without an interactive prompt.",
+    ),
+    audit_nomination_limit: int = typer.Option(
+        25,
+        "--audit-nomination-limit",
+        min=1,
+        help="Maximum number of strong intermediate results nominated for fresh audit.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run",
+        help="Build a read-only plan when --apply-plan is omitted (the default).",
+    ),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
+    """Plan a legacy backfill, or explicitly apply one reviewed external plan.
+
+    Dry-run planning is the default. Applying a plan requires --apply-plan plus an
+    interactive confirmation or --yes. Existing snapshots and legacy note identities
+    remain archived.
+    """
+
+    try:
+        graph = _project_graph(knowledge_graph)
+        if apply_plan is not None:
+            if output is not None:
+                raise KnowledgeGraphError("--output cannot be combined with --apply-plan")
+            source = _migration_input_path(graph, apply_plan)
+            report = load_legacy_migration_report(source)
+            if not yes:
+                typer.confirm(
+                    "Apply this reviewed legacy migration plan to the selected graph?",
+                    abort=True,
+                )
+            record = graph.apply_legacy_migration(report)
+            sys.stdout.write(
+                json.dumps(
+                    _legacy_migration_application_payload(record),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            return
+        if not dry_run:  # pragma: no cover - Typer exposes only the affirmative flag
+            raise KnowledgeGraphError("pass --apply-plan to apply a reviewed migration")
+        revision, nodes = _read_legacy_migration_source(graph)
+        selected_problem = _migration_problem_id(nodes, problem_id)
+        selected_target = _migration_target_claim_id(
+            graph,
+            nodes,
+            problem_id=selected_problem,
+            requested=target_claim_id,
+        )
+        report = plan_legacy_graph_backfill(
+            nodes,
+            graph_revision=revision,
+            problem_id=selected_problem,
+            target_claim_id=selected_target,
+            audit_nomination_limit=audit_nomination_limit,
+            graph_name=graph.graph_name,
+        )
+        if output is None:
+            sys.stdout.write(
+                json.dumps(_legacy_migration_payload(report), indent=2, sort_keys=True) + "\n"
+            )
+        else:
+            destination = _migration_output_path(graph, output)
+            written = write_legacy_migration_report(destination, report)
+            console.print(f"Wrote read-only migration plan: {written}")
+            console.print(f"Integrity SHA-256: {migration_report_sha256(report)}")
+    except BaseException as exc:
+        _abort(exc)
+
+
 @graph_app.command("rebuild-index")
 def graph_rebuild_index(
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
@@ -852,6 +1081,51 @@ def graph_diff(
     try:
         difference = _project_graph(knowledge_graph).diff(revision_a, revision_b)
         console.print(json.dumps(difference.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("reconstruct")
+def graph_reconstruct(
+    revision: str,
+    output: Path | None = typer.Option(None, "--output", dir_okay=False),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
+    """Reconstruct and integrity-check one immutable graph revision snapshot."""
+
+    try:
+        contents = _project_graph(knowledge_graph).reconstruct_snapshot(revision)
+        if output is None:
+            sys.stdout.write(contents.decode("utf-8"))
+        else:
+            requested = output.expanduser()
+            if requested.is_symlink():
+                raise WorkspaceError(f"refusing symlinked reconstruction output: {requested}")
+            destination = atomic_write_bytes(requested, contents)
+            console.print(f"Wrote {destination}")
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("verify-snapshots")
+def graph_verify_snapshots(
+    revision: str | None = typer.Argument(
+        None,
+        help="Optional revision; omit it to verify the complete snapshot history.",
+    ),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
+    """Verify manifests, parent roots, checkpoints, and live content blobs."""
+
+    try:
+        results = _project_graph(knowledge_graph).verify_snapshots(revision)
+        console.print(
+            json.dumps(
+                [item.model_dump(mode="json") for item in results],
+                indent=2,
+                sort_keys=True,
+            )
+        )
     except BaseException as exc:
         _abort(exc)
 
@@ -1073,6 +1347,15 @@ def run(
         "-g",
         help="Reuse an existing named graph instead of the problem filename's graph.",
     ),
+    migrate_target: str | None = typer.Option(
+        None,
+        "--migrate-target",
+        metavar="REASON",
+        help=(
+            "Explicitly authorize a material canonical-target migration and record REASON; "
+            "otherwise target changes fail closed."
+        ),
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept safety confirmations."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
@@ -1153,6 +1436,7 @@ def run(
                     f"{config.graph.maximum_context_nodes} nodes / "
                     f"{config.graph.maximum_context_characters} characters"
                 ),
+                "target migration": migrate_target or "not authorized",
             }
             _print_settings_table("Resolved MATEK plan", plan)
             console.print(
@@ -1167,6 +1451,12 @@ def run(
                 "Allow Codex to edit files outside .matek/ in this project?",
                 abort=True,
             )
+        if migrate_target is not None and not yes:
+            typer.confirm(
+                "Authorize a versioned canonical theorem migration and invalidate affected "
+                "proof evidence?",
+                abort=True,
+            )
         result = _run_async(
             _live_runner(config).run_new(
                 problem_file,
@@ -1178,6 +1468,7 @@ def run(
                     research_only=research_only,
                     allow_project_edits=allow_project_edits,
                     knowledge_graph=knowledge_graph,
+                    target_migration_reason=migrate_target,
                     invocation={
                         "config": str(config_path) if config_path else None,
                         "backend": config.backend.provider,
@@ -1192,6 +1483,7 @@ def run(
                         "no_web_search": no_web_search,
                         "sandbox": sandbox.value if sandbox else None,
                         "knowledge_graph": knowledge_graph,
+                        "target_migration_reason": migrate_target,
                     },
                 ),
             )

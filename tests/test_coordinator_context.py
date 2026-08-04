@@ -503,7 +503,7 @@ def test_schema_v3_uses_intentional_top_level_order_and_replays_legacy_sorting()
     assert keys.index("z_future_section") < keys.index("decision_brief")
     assert built.manifest.schema_version == 3
     assert built.manifest.payload_schema_version == 3
-    assert built.manifest.section_order_version == 1
+    assert built.manifest.section_order_version == 2
     assert built.manifest.section_positions["compiled_prompt"] == 1
     assert built.manifest.unused_headroom_characters > 0
     assert tuple(key for key in COORDINATOR_SECTION_ORDER if key in keys) != tuple(sorted(keys))

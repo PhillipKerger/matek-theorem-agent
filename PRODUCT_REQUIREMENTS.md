@@ -33,7 +33,8 @@ formalization, and generates a reproducible final report.
   target, and essential constraints; do not require a user-supplied literature review or proof
   plan.
 - Preserve the original bytes and a normalized copy.
-- Record a content hash, timestamp, CLI arguments, config snapshot, and tool versions.
+- Record the normalized source bytes' SHA-256, timestamp, CLI arguments, config snapshot, and
+  tool versions. This source hash is the durable identity of the problem's canonical target.
 - Reject empty input and provide a useful diagnostic.
 
 ### FR-2 Framework compilation
@@ -64,6 +65,18 @@ formalization, and generates a reproducible final report.
   support acceptance or the final bibliography. Unavailable target-identification evidence must
   not be guessed around.
 - Resolve arXiv identifiers through both `export.arxiv.org` and `arxiv.org/abs/<id>`.
+- Before research, deterministically compare the compiled statement with every applicable claim-
+  contract clause, including quantifiers, constants, additive terms, domains, edge cases,
+  polarity, and conclusion. Persist `prompts/target_alignment.json`; any material mismatch blocks
+  research instead of being repaired by assumption.
+- Bind the first aligned statement, canonical contract, and compiled prompt for a normalized
+  source hash in `.matek/knowledge/<graph-name>/target-registry.json`. Later runs with the same
+  source hash reuse those canonical bytes while refreshing literature separately. A new aligned
+  wording with the unchanged contract is recorded as a cosmetic paraphrase and does not replace
+  them. Contract-changing drift fails closed unless the user explicitly runs with
+  `--migrate-target REASON`; that versioned migration requires confirmation unless `--yes` is
+  present, persists its authorization through resume, emits the target-migration event, and
+  invalidates affected evidence.
 
 ### FR-3 Adaptive research
 
@@ -137,6 +150,31 @@ formalization, and generates a reproducible final report.
   `--no-web-search` policy disables search for them.
 - Maintain an approach registry containing mechanism, result, assumptions, bottleneck,
   counterexamples, dependencies, and status.
+- Require new workers to return only schema-v2 `ResearchWorkerReport` mathematics:
+  `ScientificResult` records, explicit obligations, a source ledger, computation declarations,
+  and a branch outcome. Same-report premises use an acyclic `dependency_result_keys` graph; stable
+  node IDs are reserved for graph records that predate the report. Workers do not return
+  `GraphPatch`, graph revisions, status promotions, or relation directions. MATEK validates the
+  report and constructs graph admission deterministically from application-owned run, assignment,
+  task, approach, and source identity.
+- Reserve `kind = "definition"` for dependency-free, branch-scoped explicit notation
+  declarations (`Define …`, `Let … denote …`, `… is defined as …`, or `:=`). Mathematical
+  assertions and imported facts use claim-bearing result kinds and remain subject to audit.
+- Drive durable `explore`, `consolidate`, `bottleneck`, `adversarial_audit`, and `synthesize`
+  scientific phases from audited progress, repeated gaps, assignment similarity, and the current
+  minimal open cut. Screen exact duplicate assignments for merge and near-duplicate mechanisms
+  for redirection. Select one durable exact cut obligation per bottleneck coordinator portfolio,
+  rotate prover, falsifier, small-case-computation, transfer-auditor, and synthesizer roles across
+  activations, and retire still-queued work when the phase changes. Synthesis is serialized and may
+  cite only audited premises. Persist the phase state and configure thresholds/concurrency under
+  `[research.scientific_phase]`.
+- Give every worker a private `0700` workspace beneath its run. Collect only declared regular
+  files under quotas into a run-local content-addressed store, reject traversal, symlinks,
+  hardlinks, special or undeclared files, and independently replay computation certificates only
+  with attested filesystem confinement and networking disabled. The current trusted replay path is
+  Docker; native execution is refused as an unsafe replay backend. Unreplayed computations remain
+  experiments outside the canonical proof ledger, while a successful replay creates only a
+  proposed derivation that still requires mathematical/domain audit.
 - Support cost, token, active wall-clock, total-open-assignment, concurrency,
   coordinator-decision, and explicit call-count limits without turning any limit into a
   synchronization barrier.
@@ -163,7 +201,13 @@ formalization, and generates a reproducible final report.
   counterexamples, blocked routes and exact gaps, dependencies, prior directives, and audit repair
   obligations. Ordinary resume must fail truthfully if the canonical scheduler checkpoint is
   missing or invalid rather than claiming it can be reconstructed from evidence alone.
-- Launch targeted counterexample and lemma-audit tasks when promising claims arise.
+- Nominate only uniquely admitted, gap-free, non-main intermediate results that explicitly reduce
+  the current uncapped smallest open cut. Run a fresh blind verifier and independent falsifier on
+  the exact statement, proof steps, dependency versions/hashes, and source artifacts; omit origin
+  confidence and desired-verdict fields. Persist each response independently and resume only the
+  missing role. A passing gate promotes a reusable intermediate claim/derivation to
+  `audit_passed`, but cannot accept the main target, authorize a manuscript, or satisfy the main
+  research gate.
 - Persist categorized `integrity`, `execution`, `evidence`, `scientific`, and `resource` issues
   with trace paths and recovery obligations. Only integrity/security/state-corruption and
   immutable-artifact failures hard-stop; recoverable worker failures receive one bounded repair
@@ -191,15 +235,15 @@ formalization, and generates a reproducible final report.
   selected graph shall be frozen in run metadata for resume.
 - Portable Markdown with flat typed YAML frontmatter is authoritative. The SQLite index is a
   disposable acceleration layer rebuildable from Markdown.
-- The graph shall represent problem, definition, claim, proof, approach, task, counterexample,
-  experiment, source, audit, formalization, run, artifact, and human-note nodes with immutable
-  stable IDs and typed, constraint-checked relations.
+- The graph shall represent problem, definition, claim, proof attempt, derivation, obligation,
+  proof, approach, task, counterexample, experiment, source, audit, formalization, run, artifact,
+  and human-note nodes with immutable stable IDs and typed, constraint-checked relations.
 - Epistemic and workflow statuses are separate. Only deterministic Lean verification may assign
-  `lean_verified`; worker proposals cannot bypass research/audit gates.
+  `lean_verified`; model reports cannot bypass research/audit gates.
 - Before initial delegation, the coordinator shall review a problem-scoped graph overview and
   research frontier when prior graph memory exists, then use prior results, failures, gaps,
   audits, and tasks to shape graph-scoped assignments. Workers receive bounded context slices and
-  return structured optimistic-concurrency patches rather than mutating the shared vault.
+  return typed scientific reports rather than persistence mutations or writes to the shared vault.
 - Every fresh-context coordinator activation, especially after `resume`, shall receive an explicit
   activation kind, the current and previously observed graph revisions, and a no-hidden-memory
   reconstruction instruction. It shall attest the exact reviewed graph revision in its decision
@@ -208,19 +252,53 @@ formalization, and generates a reproducible final report.
 - Every new graph-scoped assignment shall name at least one existing, problem-scoped, live stable
   target node. Unknown, cross-problem, tombstoned, or non-research targets shall fail validation;
   MATEK shall not silently substitute the main claim for an invalid target.
-- Patch merges shall validate types, IDs, relation constraints, dependency acyclicity, duplicate
-  likelihood, node hashes, status transitions, and base revisions before an atomic commit and
-  snapshot/index update.
+- Scientific admission shall preserve the raw report first, reject unknown dependency/target IDs,
+  reject unknown, self-referential, or cyclic local-result dependencies, resolve local keys to
+  stable node identities and real relation directions in ordinary Python, and atomically commit
+  only application-owned mutations. Admission is idempotent on `(run_id, assignment_id,
+  local_key, result_schema_version)` and rejects a changed payload under the same identity. A
+  result with an exact gap creates a proof attempt and obligation, never a derivation. A gap-free
+  lemma, reduction, or source fact creates a canonical claim, proof attempt, and proposed version-
+  bound derivation regardless of branch disposition; a computation does so only after independent
+  replay. `proposed_complete` enables nomination or exact-candidate packaging, not trust.
+  Counterexamples remain branch-local unless an exact-contract audit authorizes a main-target
+  refutation.
+- The Markdown vault remains the complete searchable archive. A rebuildable integrity-protected
+  projection at `ledgers/<problem-id>/canonical-ledger.json` contains only exact canonical claims,
+  AND-premise derivations, OR alternative derivations, and typed obligations. Ambiguous legacy
+  prose remains archive evidence and is never guessed into proof support.
+- The frontier shall report trusted claims and the deterministic smallest known open cut between
+  them and the main target. If bounded antichain search is capped, report that fact instead of
+  claiming optimality. Dashboards shall show the main target and cut even when no trusted
+  derivation reaches the target.
+- Existing schema-v1 full snapshots shall remain immutable and readable. New revisions shall use
+  content-addressed immutable node/edge blobs, delta manifests, integrity roots, and periodic full
+  checkpoints. Offline commands shall reconstruct any revision deterministically and verify its
+  complete live blob set without a model or network call.
 - Dependency and exact-statement changes shall propagate staleness. Lean evidence is bound to an
   exact claim ID, statement version/hash, declaration, source hash, toolchain, mathlib revision,
   build result, and axiom report.
 - Distilled failed/blocked work and valid partial results shall persist across incomplete runs;
   raw transcripts remain run artifacts rather than first-class graph nodes.
+- Verified source records shall use deterministic canonical identity precedence (DOI, base arXiv
+  ID, MR, ISBN, then stable URL), retain arXiv revisions and worker aliases, and merge only an
+  identical entity key. Same-title works with distinct identifiers remain separate and unverified
+  records remain open under a provisional title/author fingerprint. Worker-result `CITES` edges
+  are created only from explicit result-source references; separately verified compiler-literature
+  citations remain attached to the frozen target.
+- `matek graph migrate-legacy` shall default to an integrity-protected, read-only plan outside the
+  vault. Applying requires that exact external plan through `--apply-plan`, interactive confirmation
+  or `--yes`, and successful integrity, graph-name, source-revision, and archive-digest checks.
+  Application shall be one atomic idempotent graph commit: retain legacy nodes and every prior
+  snapshot as archive evidence, create typed proof attempts and proposed derivations, record exact-
+  statement aliases, quarantine unsafe main refutations, and leave ambiguous dependencies/scope
+  conflicts unapplied. Audit nominations become queued verifier/falsifier tasks; migration itself
+  makes no model call and grants no audit trust.
 - Approach families are taxonomic groupings, not branch identities. Each assignment branch or
   sub-branch shall retain its own approach record and node so a later report in the same family
   cannot overwrite a prior blocked or ruled-out route. Automatically distilled counterexamples
-  are branch-local; claim-level refutation requires an explicit typed proposal and remains subject
-  to independent scientific audit.
+  are branch-local; claim-level refutation requires a typed counterexample result naming the exact
+  claim contract and remains subject to independent scientific audit.
 - Humans may rename notes and edit prose outside generated blocks. Exact-statement/proof edits
   trigger versioning/re-audit; machine-field conflicts fail validation instead of being silently
   overwritten.
@@ -241,8 +319,8 @@ formalization, and generates a reproducible final report.
 - Checkpoint each completed audit immediately with its response ID and hash. An unavailable audit
   leaves the candidate awaiting audits and resume retries only missing checks; it is neither a
   candidate rejection nor permission to run the final judge.
-- Validate and persist scientific worker output before independently validating an optional graph
-  proposal. MATEK, not the model, binds graph content hashes from the frozen revision.
+- Validate and persist the schema-v2 scientific worker output before deterministic graph admission.
+  MATEK, not the model, owns persistence identities, graph relations, and frozen content hashes.
 - Preserve valuable partial results under truthful statuses.
 
 ### FR-5 Manuscript
