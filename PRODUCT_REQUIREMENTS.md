@@ -95,9 +95,14 @@ formalization, and generates a reproducible final report.
 - Have the coordinator create eight initial assignments by default, spanning at least four
   materially different approaches unless the configured budget is lower.
 - Keep initial workers independent; do not reveal the favored route to all workers.
-- Use Codex hierarchical mode by default. The user configures the first-level MATEK worker
-  concurrency (eight by default) and a per-worker nested-agent allowance (also eight). Give both
-  limits to the coordinator and every first-level worker. A worker with a positive allowance may
+- Use Codex hierarchical mode by default. The user configures the bootstrap first-level portfolio
+  (`num_first_level_agents`, eight by default), the per-worker nested-agent allowance
+  (`subagents_per_agent`, four by default), and one conservative across-tier research-agent
+  capacity (`max_concurrent_agents`, 24 by default). Give all three limits and the derived
+  first-level concurrency to the coordinator and every first-level worker. Because Codex child
+  activity is internal to each worker session, reserve one parent slot plus the complete child
+  allowance for every admitted hierarchical worker; the defaults therefore admit four first-level
+  workers concurrently while retaining all eight bootstrap assignments. A worker with a positive allowance may
   delegate bounded independent subtasks one tier deep, but must check and synthesize them into its
   own `ResearchWorkerReport`; its children cannot bypass MATEK checkpoints or acceptance gates.
   A zero nested allowance makes the worker a regular subagent and the prompt must say so without
@@ -144,8 +149,9 @@ formalization, and generates a reproducible final report.
   envelope cannot fit; report repeated provider rejection separately.
 - Refill useful work dynamically after completions instead of waiting for a batch barrier. Use
   1,024 total open assignments (queued plus running) as a high default safety ceiling. Permit up
-  to eight of that open set to be active first-level research workers, each with up to eight
-  nested Codex agents, subject to backend and budget limits. Initial workers and
+  to the derived first-level limit of that open set to be active research workers—four under the
+  default 24-slot capacity and four-child allowance—subject to scientific-phase, backend, and
+  budget limits. The initial portfolio still contains eight independent assignments. Initial workers and
   later refills share that pool and use web search by default; only the explicit global
   `--no-web-search` policy disables search for them.
 - Maintain an approach registry containing mechanism, result, assumptions, bottleneck,
@@ -178,8 +184,9 @@ formalization, and generates a reproducible final report.
 - Support cost, token, active wall-clock, total-open-assignment, concurrency,
   coordinator-decision, and explicit call-count limits without turning any limit into a
   synchronization barrier.
-- Name the primary scheduler controls `research.maximum_pending_assignments` and
-  `research.maximum_coordinator_decisions`. Migrate legacy fixed-round settings and
+- Name the primary scheduler controls `research.max_pending_assignments` and
+  `research.max_coordinator_decisions`. Migrate legacy fixed-round settings and older verbose
+  scheduler names, including the former first-level-only `maximum_concurrent_agents`, and
   `--max-rounds` into scaled decision budgets for compatibility without restoring round
   semantics.
 - Do not impose a cumulative research-worker count ceiling. Do not impose a global Codex

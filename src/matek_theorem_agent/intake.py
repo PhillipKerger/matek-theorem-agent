@@ -268,13 +268,16 @@ def ingest_problem(
                     if backend_provider == "codex"
                     else config.models.research_worker.reasoning_effort
                 ),
-                "minimum_initial_agents": config.research.minimum_initial_agents,
+                "num_first_level_agents": config.research.num_first_level_agents,
                 "research_orchestration_mode": config.effective_research_orchestration_mode,
                 "configured_research_orchestration_mode": (config.research.orchestration_mode),
-                "maximum_subagents_per_agent": (config.effective_hierarchical_subagent_limit),
-                "maximum_pending_assignments": (config.research.maximum_pending_assignments),
-                "maximum_coordinator_decisions": (config.research.maximum_coordinator_decisions),
-                "maximum_concurrent_agents": config.research.maximum_concurrent_agents,
+                "subagents_per_agent": config.effective_hierarchical_subagent_limit,
+                "max_pending_assignments": config.research.max_pending_assignments,
+                "max_coordinator_decisions": config.research.max_coordinator_decisions,
+                "max_concurrent_agents": config.research.max_concurrent_agents,
+                "max_concurrent_first_level_agents": (
+                    config.effective_max_concurrent_first_level_agents
+                ),
                 "knowledge_graph_collection": ".matek/knowledge",
                 "graph_maximum_context_nodes": config.graph.maximum_context_nodes,
                 "graph_maximum_context_characters": config.graph.maximum_context_characters,

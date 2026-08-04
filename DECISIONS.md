@@ -34,8 +34,10 @@ intake, and graph maintenance requires explicit selection whenever more than one
 - Research uses one durable logical coordinator with a completion-driven mailbox and live worker
   pool, not fixed rounds or wait-for-all worker batches.
 - The coordinator creates an initial diverse portfolio of eight, then reacts to persisted
-  worker/audit events and dynamically refills the eight-worker first-level pool by default.
-  Each first-level Codex worker may use eight one-tier nested agents (64 nested slots total).
+  worker/audit events and dynamically refills the live first-level pool. Each first-level Codex
+  worker may use four one-tier nested agents. The default across-tier research capacity is 24;
+  conservatively reserving one parent plus four child slots admits four hierarchical workers at
+  once while keeping all eight independent bootstrap assignments queued and durable.
 - The canonical atomic coordinator checkpoint owns scheduler state and a pending-event write-ahead
   record. Full raw reports, per-assignment source verification, and atomically created immutable
   event/decision files validate that checkpoint. The mailbox, assignment files, approach registry,

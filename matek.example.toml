@@ -12,8 +12,9 @@ research_worker_effort = "xhigh"
 audit_effort = "xhigh"
 manuscript_effort = "high"
 formalization_effort = "xhigh"
-max_parallel_agents = 64
-max_parallel_web_agents = 64
+# Outer MATEK model calls. Internal Codex descendants are budgeted separately below.
+max_concurrent_model_calls = 24
+max_concurrent_web_model_calls = 24
 persist_sessions = true
 skip_git_repo_check = false
 extra_args = []
@@ -26,7 +27,7 @@ max_wall_clock_minutes = 900
 max_formalization_iterations = 10000
 
 [api]
-max_parallel_agents = 64
+max_concurrent_model_calls = 24
 
 [api.models.prompt_compiler]
 model = "gpt-5.6-sol"
@@ -70,19 +71,21 @@ max_output_tokens = 120000
 
 [research]
 orchestration_mode = "hierarchical"
-# Each of the eight first-level Codex workers may use up to eight nested agents.
-maximum_subagents_per_agent = 8
-minimum_initial_agents = 8
-maximum_concurrent_agents = 8
+# Queue eight independent first-level approaches at bootstrap. Each active hierarchical
+# worker reserves one parent slot plus its complete four-child allowance from the 24-slot
+# capacity, so at most four first-level workers run concurrently by default.
+num_first_level_agents = 8
+subagents_per_agent = 4
+max_concurrent_agents = 24
 # These are high safety ceilings; the 15-hour active-time allowance should stop normal runs first.
-maximum_pending_assignments = 1024
-maximum_coordinator_decisions = 100000
+max_pending_assignments = 1024
+max_coordinator_decisions = 100000
 # Hard ceiling on the final serialized coordinator provider input, including framing.
-maximum_coordinator_context_characters = 800000
+max_coordinator_context_characters = 800000
 # Explicit requests bypass this optional graph section cap, not the provider-input ceiling.
-maximum_unrequested_full_graph_node_characters = 120000
+max_unrequested_full_graph_node_characters = 120000
 # Maximum omitted artifacts or graph nodes the coordinator may request per activation.
-maximum_coordinator_requested_artifacts = 32
+max_coordinator_requested_artifacts = 32
 require_foundational_audit = true
 require_domain_audit = true
 require_hostile_audit = true

@@ -35,7 +35,7 @@ maximum_concurrent_agents = 5
 
     assert config.research.minimum_initial_agents == 8  # default
     assert config.research.maximum_concurrent_agents == 5  # project
-    assert config.research.maximum_rounds == 4  # CLI beats environment
+    assert config.research.max_coordinator_decisions == 128  # CLI beats environment
 
 
 def test_backend_precedence_is_cli_environment_toml_then_codex(tmp_path: Path) -> None:
@@ -133,11 +133,18 @@ def test_role_specific_research_defaults() -> None:
     assert config.research.scientific_phase.bottleneck_concurrency == 3
     assert config.research.scientific_phase.adversarial_concurrency == 2
     assert config.research.orchestration_mode == "hierarchical"
-    assert config.research.maximum_subagents_per_agent == 8
-    assert config.research.hierarchical_subagent_limit == 8
-    assert config.effective_hierarchical_subagent_limit == 8
+    assert config.research.num_first_level_agents == 8
+    assert config.research.subagents_per_agent == 4
+    assert config.research.max_concurrent_agents == 24
+    assert config.effective_max_concurrent_first_level_agents == 4
+    assert config.research.hierarchical_subagent_limit == 4
+    assert config.effective_hierarchical_subagent_limit == 4
+    assert config.codex.max_concurrent_model_calls == 24
+    assert config.codex.max_concurrent_web_model_calls == 24
     assert config.codex.limits.max_research_coordinator_decisions == 100_000
     assert "maximum_subagents =" not in config_as_toml(config)
+    assert "maximum_subagents_per_agent" not in config_as_toml(config)
+    assert "maximum_concurrent_agents" not in config_as_toml(config)
 
 
 def test_hierarchical_research_configuration_resolves_to_provider_capability() -> None:
@@ -159,6 +166,46 @@ def test_hierarchical_research_configuration_resolves_to_provider_capability() -
     assert api_config.research.orchestration_mode == "hierarchical"
     assert api_config.effective_research_orchestration_mode == "flat"
     assert api_config.effective_hierarchical_subagent_limit == 0
+
+
+def test_clear_topology_names_derive_first_level_concurrency() -> None:
+    config = merge_config(
+        AppConfig(),
+        {
+            "num_first_level_agents": 8,
+            "subagents_per_agent": 4,
+            "max_concurrent_agents": 24,
+        },
+    )
+
+    assert config.research.num_first_level_agents == 8
+    assert config.research.subagents_per_agent == 4
+    assert config.research.max_concurrent_agents == 24
+    assert config.effective_max_concurrent_first_level_agents == 4
+
+
+def test_legacy_first_level_concurrency_migrates_to_equivalent_total_capacity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "matek.toml"
+    path.write_text(
+        "[research]\nmaximum_subagents_per_agent = 3\nmaximum_concurrent_agents = 6\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path, env={})
+
+    assert config.research.subagents_per_agent == 3
+    assert config.research.max_concurrent_agents == 24
+    assert config.effective_max_concurrent_first_level_agents == 6
+
+
+def test_unrelated_legacy_key_inherits_new_topology_defaults() -> None:
+    config = AppConfig.model_validate({"research": {"maximum_pending_assignments": 20}})
+
+    assert config.research.num_first_level_agents == 8
+    assert config.research.subagents_per_agent == 4
+    assert config.research.max_concurrent_agents == 24
 
 
 def test_zero_nested_limit_keeps_hierarchical_workers_regular() -> None:
@@ -291,8 +338,7 @@ def test_total_time_limit_rejects_invalid_cli_values(value: object) -> None:
 def test_nested_and_dotted_cli_overrides_are_supported() -> None:
     nested = merge_config(AppConfig(), {"research": {"maximum_rounds": 3}})
     dotted = merge_config(AppConfig(), {"models.audit.web_search": False})
-    assert nested.research.maximum_rounds == 3
-    assert nested.research.maximum_coordinator_decisions == 3_072
+    assert nested.research.maximum_coordinator_decisions == 96
     assert not dotted.models.audit.web_search
 
 
@@ -336,7 +382,7 @@ def test_transitional_role_config_uses_legacy_base_and_explicit_role_overrides()
 def test_toml_values_are_not_silently_coerced(tmp_path: Path) -> None:
     path = tmp_path / "matek.toml"
     path.write_text('[research]\nmaximum_rounds = "4"\n', encoding="utf-8")
-    with pytest.raises(ConfigError, match="maximum_coordinator_decisions"):
+    with pytest.raises(ConfigError, match="max_coordinator_decisions"):
         load_config(path, env={})
 
 
@@ -403,7 +449,7 @@ def test_config_validates_numeric_ranges(tmp_path: Path) -> None:
         "[research]\nmaximum_concurrent_agents = 0\n",
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="maximum_concurrent_agents"):
+    with pytest.raises(ConfigError, match="max_concurrent_agents"):
         load_config(path, env={})
 
 
@@ -508,13 +554,15 @@ def test_checked_in_example_config_loads() -> None:
 
     assert config.config_version == 2
     assert config.backend.provider == "codex"
-    assert config.codex.max_parallel_agents == 64
-    assert config.codex.max_parallel_web_agents == 64
+    assert config.codex.max_concurrent_model_calls == 24
+    assert config.codex.max_concurrent_web_model_calls == 24
     assert config.codex.limits.max_agent_calls is None
     assert config.codex.limits.max_codex_threads is None
-    assert config.api.max_parallel_agents == 64
-    assert config.research.minimum_initial_agents == 8
-    assert config.research.maximum_concurrent_agents == 8
+    assert config.api.max_concurrent_model_calls == 24
+    assert config.research.num_first_level_agents == 8
+    assert config.research.subagents_per_agent == 4
+    assert config.research.max_concurrent_agents == 24
+    assert config.effective_max_concurrent_first_level_agents == 4
     assert config.research.maximum_pending_assignments == 1_024
     assert config.research.maximum_coordinator_decisions == 100_000
     assert config.research.maximum_coordinator_context_characters == 800_000

@@ -117,8 +117,11 @@ With the default Codex hierarchical mode, the
 coordinator still creates and observes the durable first-level assignments, while each
 first-level research-worker process receives Codex's collaboration tools and a configured
 per-session nested-thread limit. The defaults, equivalent to
-`--max-agents 8 --subagents-per-agent 8`, permit up to eight active MATEK workers, each of which may use up to
-eight nested agents for bounded parts of its assignment. Nested agents inherit the parent's
+`--num-first-level-agents 8 --subagents-per-agent 4 --max-concurrent-agents 24`, create eight
+independent bootstrap assignments and admit up to four hierarchical MATEK workers at once. Each
+active worker may use up to four nested agents for bounded parts of its assignment. MATEK reserves
+one parent slot plus the complete child allowance because Codex descendant activity is internal
+to the parent session. Nested agents inherit the parent's
 sandbox and search policy. The first-level worker must tell its children not to delegate further,
 validate their work, and return one normal scientific report. MATEK checkpoints that report and
 the aggregate provider usage at the existing worker boundary.
@@ -134,9 +137,9 @@ MATEK runs a durable event loop with no round barrier:
 
 1. Validate and persist each coordinator decision and assignment before admitting work.
 2. Admit useful queued assignments while the applicable concurrency, backend, and budget ceilings
-   have capacity. The live pool starts from the diverse eight and refills up to eight active
-   first-level workers by default, each with up to eight nested agents. The high
-   `maximum_pending_assignments` safety ceiling limits the total open set—queued plus running—to
+   have capacity. The live pool starts from the diverse eight and refills up to the derived active
+   first-level limit—four by default—with up to four nested agents per worker. The high
+   `max_pending_assignments` safety ceiling limits the total open set—queued plus running—to
    1,024 by default, while concurrency limits the active subset.
 3. When any worker finishes, atomically preserve its complete raw `ResearchWorkerReport`, hash and
    per-assignment source verification. Atomically checkpoint the scheduler transition with the
@@ -209,10 +212,10 @@ There is no cumulative research-worker ceiling. Total-open-assignment, active-co
 coordinator-decision, model-call, cost, token, and optional active-wall-clock limits remain
 independent controls. None introduces a wait-for-all barrier. Explicit Codex call-count limits
 remain available but are unset by default. Public scheduler controls are
-`research.maximum_pending_assignments` (default safety ceiling 1,024) and
-`research.maximum_coordinator_decisions` (default safety ceiling 100,000). Legacy round controls are converted to a
+`research.max_pending_assignments` (default safety ceiling 1,024) and
+`research.max_coordinator_decisions` (default safety ceiling 100,000). Legacy round controls are converted to a
 scaled decision budget only; they do not change event-driven execution. Initial workers and later
-refills use the same worker settings and eight-slot first-level pool. Web search is enabled for both by
+refills use the same worker settings and across-tier capacity. Web search is enabled for both by
 default and disabled only by the frozen global `--no-web-search` policy.
 
 ## Stage 3 — Candidate proof and audits

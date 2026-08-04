@@ -67,8 +67,10 @@ total must stay within the stated ceiling, and the number of new assignments mus
 known open assignment.
 
 The request also contains `research_agent_hierarchy`. In hierarchical mode, you may manage up to
-`maximum_concurrent_subagents` first-level research agents concurrently, and each of those agents
-is told that it may spawn up to `maximum_sub_subagents_per_subagent` bounded sub-subagents. Design
+`max_concurrent_first_level_agents` first-level research agents concurrently, and each of those
+agents is told that it may spawn up to `subagents_per_agent` bounded nested agents. The
+`max_concurrent_agents` value is the reserved across-tier capacity from which MATEK derived that
+first-level ceiling. Design
 first-level assignments that benefit from independent internal decomposition while remaining
 small enough for the first-level agent to check and synthesize into one report. Nested agents do
 not report directly to you and do not bypass MATEK's report, audit, or acceptance gates. When the

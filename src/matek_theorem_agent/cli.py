@@ -310,6 +310,8 @@ def _config_overrides(
     budget_usd: float | None = None,
     max_coordinator_decisions: int | None = None,
     max_rounds: int | None = None,
+    num_first_level_agents: int | None = None,
+    max_concurrent_agents: int | None = None,
     max_agents: int | None = None,
     hierarchical: bool | None = None,
     flat: bool | None = None,
@@ -324,6 +326,8 @@ def _config_overrides(
         raise ConfigError(
             "--max-coordinator-decisions and deprecated --max-rounds cannot be combined"
         )
+    if max_concurrent_agents is not None and max_agents is not None:
+        raise ConfigError("--max-concurrent-agents and deprecated --max-agents cannot be combined")
     if hierarchical and flat:
         raise ConfigError("--hierarchical and --flat cannot be combined")
     return {
@@ -331,6 +335,8 @@ def _config_overrides(
         "budget_usd": budget_usd,
         "max_coordinator_decisions": max_coordinator_decisions,
         "max_rounds": max_rounds,
+        "num_first_level_agents": num_first_level_agents,
+        "max_concurrent_agents": max_concurrent_agents,
         "max_agents": max_agents,
         "research_mode": (
             "flat"
@@ -384,20 +390,25 @@ def _model_role_display(config: AppConfig, role: str) -> str:
 
 
 def _effective_research_concurrency(config: AppConfig) -> tuple[int, str]:
-    configured = config.research.maximum_concurrent_agents
+    configured = config.effective_max_concurrent_first_level_agents
     if config.backend.provider == "codex":
         effective = min(
             configured,
-            config.codex.max_parallel_agents,
-            config.codex.max_parallel_web_agents,
+            config.codex.max_concurrent_model_calls,
+            config.codex.max_concurrent_web_model_calls,
         )
         ceilings = (
-            f"research {configured}, Codex {config.codex.max_parallel_agents}, "
-            f"web {config.codex.max_parallel_web_agents}"
+            f"research-agent capacity {config.research.max_concurrent_agents} "
+            f"=> {configured} first-level, Codex "
+            f"{config.codex.max_concurrent_model_calls}, "
+            f"web {config.codex.max_concurrent_web_model_calls}"
         )
     else:
-        effective = min(configured, config.api.max_parallel_agents)
-        ceilings = f"research {configured}, API {config.api.max_parallel_agents}"
+        effective = min(configured, config.api.max_concurrent_model_calls)
+        ceilings = (
+            f"research-agent capacity {config.research.max_concurrent_agents} "
+            f"=> {configured} first-level, API {config.api.max_concurrent_model_calls}"
+        )
     return effective, ceilings
 
 
@@ -412,7 +423,7 @@ def _resolved_run_summary(
     """Return the important effective settings shown before a run starts."""
 
     concurrency, concurrency_ceilings = _effective_research_concurrency(config)
-    coordinator_decisions = config.research.maximum_coordinator_decisions
+    coordinator_decisions = config.research.max_coordinator_decisions
     if config.backend.provider == "codex":
         coordinator_decisions = min(
             coordinator_decisions,
@@ -433,9 +444,9 @@ def _resolved_run_summary(
     )
     nested_limit = config.effective_hierarchical_subagent_limit
     research_organization = (
-        f"hierarchical · up to {concurrency} concurrent first-level agents · "
+        f"hierarchical · {config.research.max_concurrent_agents} total reserved agent slots · "
+        f"up to {concurrency} concurrent first-level agents · "
         f"up to {nested_limit} Codex subagents per first-level agent · "
-        f"up to {concurrency * nested_limit} nested agents across the first-level pool · "
         "one nested tier"
         if nested_limit > 0
         else (
@@ -459,18 +470,20 @@ def _resolved_run_summary(
             f"{web_state} · coordinator {coordinator_web} · research agents {worker_web} · "
             f"source lookup {source_web}"
         ),
-        "initial research agents": (
-            f"minimum {config.research.minimum_initial_agents}; may fill available pool"
+        "initial first-level assignments": (
+            f"{config.research.num_first_level_agents} first-level assignments"
         ),
         "research organization": research_organization,
-        "concurrent research agents": (f"up to {concurrency} effective ({concurrency_ceilings})"),
-        "maximum pending assignments": config.research.maximum_pending_assignments,
+        "concurrent first-level agents": (
+            f"up to {concurrency} effective ({concurrency_ceilings})"
+        ),
+        "maximum pending assignments": config.research.max_pending_assignments,
         "coordinator decision limit": coordinator_decisions,
         "coordinator context budget": (
-            f"{config.research.maximum_coordinator_context_characters:,} serialized provider "
-            f"characters; up to {config.research.maximum_coordinator_requested_artifacts} "
+            f"{config.research.max_coordinator_context_characters:,} serialized provider "
+            f"characters; up to {config.research.max_coordinator_requested_artifacts} "
             "on-demand evidence requests; "
-            f"{config.research.maximum_unrequested_full_graph_node_characters:,} optional "
+            f"{config.research.max_unrequested_full_graph_node_characters:,} optional "
             "full-graph characters"
         ),
         "total active time limit": _time_limit_display(config),
@@ -1308,7 +1321,27 @@ def run(
         min=1,
         help="Deprecated: migrate each historical round to one pending-window of decisions.",
     ),
-    max_agents: int | None = typer.Option(None, "--max-agents", min=1),
+    num_first_level_agents: int | None = typer.Option(
+        None,
+        "--num-first-level-agents",
+        min=4,
+        help="Initial independent first-level research assignments (default 8).",
+    ),
+    max_concurrent_agents: int | None = typer.Option(
+        None,
+        "--max-concurrent-agents",
+        min=1,
+        help=(
+            "Across-tier research-agent capacity (default 24); a hierarchical worker "
+            "reserves one parent slot plus its configured nested allowance."
+        ),
+    ),
+    max_agents: int | None = typer.Option(
+        None,
+        "--max-agents",
+        min=1,
+        help="Deprecated first-level-only concurrency option; use --max-concurrent-agents.",
+    ),
     hierarchical: bool = typer.Option(
         False,
         "--hierarchical",
@@ -1324,7 +1357,7 @@ def run(
         "--subagents-per-agent",
         min=0,
         max=32,
-        help="Nested agents available to each first-level agent (default 8 in hierarchical mode).",
+        help="Nested agents available to each first-level agent (default 4 in hierarchical mode).",
     ),
     time_limit_minutes: int | None = typer.Option(
         None,
@@ -1369,6 +1402,8 @@ def run(
             budget_usd=budget_usd,
             max_coordinator_decisions=max_coordinator_decisions,
             max_rounds=max_rounds,
+            num_first_level_agents=num_first_level_agents,
+            max_concurrent_agents=max_concurrent_agents,
             max_agents=max_agents,
             hierarchical=hierarchical,
             flat=flat,
@@ -1475,6 +1510,8 @@ def run(
                         "budget_usd": budget_usd,
                         "max_coordinator_decisions": max_coordinator_decisions,
                         "max_rounds": max_rounds,
+                        "num_first_level_agents": num_first_level_agents,
+                        "max_concurrent_agents": max_concurrent_agents,
                         "max_agents": max_agents,
                         "hierarchical": hierarchical,
                         "flat": flat,
@@ -1578,13 +1615,36 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
                 f"at {configuration.get('research_worker_effort', 'unobserved')}"
             )
             hierarchy_mode = configuration.get("research_orchestration_mode", "flat")
-            nested_limit = configuration.get("maximum_subagents_per_agent", 0)
+            nested_limit = configuration.get(
+                "subagents_per_agent",
+                configuration.get("maximum_subagents_per_agent", 0),
+            )
+            total_capacity = configuration.get("max_concurrent_agents")
+            first_level_capacity = configuration.get(
+                "max_concurrent_first_level_agents",
+                configuration.get("maximum_concurrent_agents"),
+            )
+            capacity_prefix = (
+                f"{total_capacity} total reserved agent slots; "
+                if total_capacity is not None
+                else ""
+            )
+            first_level_text = (
+                f"up to {first_level_capacity} concurrent first-level agents; "
+                if first_level_capacity is not None
+                else ""
+            )
             console.print(
                 "Research organization: "
                 + (
-                    f"hierarchical; up to {nested_limit} nested subagents per first-level agent"
+                    f"hierarchical; {capacity_prefix}{first_level_text}"
+                    f"up to {nested_limit} nested subagents per first-level agent"
                     if hierarchy_mode == "hierarchical" and nested_limit
-                    else "flat; regular research agents"
+                    else (
+                        f"flat; up to {first_level_capacity} concurrent research agents"
+                        if first_level_capacity is not None
+                        else "flat; regular research agents"
+                    )
                 )
             )
         scheduler_path = state.run_root / "research" / "coordinator" / "state.json"
@@ -1697,7 +1757,24 @@ def resume(
     max_rounds: int | None = typer.Option(
         None, "--max-rounds", min=1, help="Deprecated compatibility option."
     ),
-    max_agents: int | None = typer.Option(None, "--max-agents", min=1),
+    num_first_level_agents: int | None = typer.Option(
+        None,
+        "--num-first-level-agents",
+        min=4,
+        help="Set the initial first-level portfolio if research has not started.",
+    ),
+    max_concurrent_agents: int | None = typer.Option(
+        None,
+        "--max-concurrent-agents",
+        min=1,
+        help="Set the across-tier research-agent capacity for remaining work.",
+    ),
+    max_agents: int | None = typer.Option(
+        None,
+        "--max-agents",
+        min=1,
+        help="Deprecated first-level-only concurrency option; use --max-concurrent-agents.",
+    ),
     hierarchical: bool = typer.Option(
         False,
         "--hierarchical",
@@ -1771,6 +1848,8 @@ def resume(
             budget_usd=budget_usd,
             max_coordinator_decisions=max_coordinator_decisions,
             max_rounds=max_rounds,
+            num_first_level_agents=num_first_level_agents,
+            max_concurrent_agents=max_concurrent_agents,
             max_agents=max_agents,
             hierarchical=hierarchical,
             flat=flat,

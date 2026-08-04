@@ -1089,7 +1089,7 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     assert "research agents" in invocation.output
     assert "xhigh effort" in invocation.output
     assert "web access" in invocation.output
-    assert "up to 8 effective" in invocation.output
+    assert "up to 4 effective" in invocation.output
     assert "no automatic API fallback" in invocation.output
     assert "MATEK run summary" in invocation.output
     assert "Problem solved?" in invocation.output
@@ -2395,20 +2395,22 @@ def test_cli_heavy_research_defaults_are_resolved_in_dry_run(
     )
 
     assert result.exit_code == 0, result.output
-    assert "initial research agents" in result.output
-    assert "minimum 8" in " ".join(result.output.replace("│", " ").split())
+    assert "initial first-level assignments" in result.output
+    assert "8 first-level assignments" in " ".join(result.output.replace("│", " ").split())
     assert "maximum pending assignments" in result.output
     assert "coordinator decision limit" in result.output
     assert "coordinator context budget" in result.output
     assert "800,000 serialized provider" in result.output
     assert "32 on-demand evidence requests" in result.output
-    assert "concurrent research agents" in result.output
-    assert "up to 8 effective" in result.output
+    assert "concurrent first-level agents" in result.output
+    assert "up to 4 effective" in result.output
     assert "research coordinator" in result.output
     assert "max effort" in result.output
     assert "research agents" in result.output
     assert "xhigh effort" in result.output
-    assert "up to 64 nested agents" in " ".join(result.output.replace("│", " ").split())
+    normalized = " ".join(result.output.replace("│", " ").split())
+    assert "24 total reserved agent slots" in normalized
+    assert "up to 4 Codex subagents per first-level agent" in normalized
     assert "15 hours" in result.output
     assert "total research-subagent limit" not in result.output
     assert not (tmp_path / ".matek").exists()
@@ -2428,10 +2430,12 @@ def test_cli_hierarchical_mode_prints_both_agent_limits(
             "run",
             str(problem),
             "--hierarchical",
-            "--max-agents",
+            "--num-first-level-agents",
             "8",
             "--subagents-per-agent",
             "6",
+            "--max-concurrent-agents",
+            "24",
             "--dry-run",
         ],
     )
@@ -2440,7 +2444,8 @@ def test_cli_hierarchical_mode_prints_both_agent_limits(
     normalized = " ".join(result.output.replace("│", " ").split())
     assert "research organization" in result.output
     assert "hierarchical" in result.output
-    assert "up to 8 concurrent first-level agents" in normalized
+    assert "24 total reserved agent slots" in normalized
+    assert "up to 3 concurrent first-level agents" in normalized
     assert "up to 6 Codex subagents per first-level agent" in normalized
     assert not (tmp_path / ".matek").exists()
 

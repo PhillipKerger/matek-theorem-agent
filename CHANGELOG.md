@@ -2,6 +2,13 @@
 
 ## 0.5.0 — Unreleased
 
+- Clarified every public research-topology control. New configurations use
+  `num_first_level_agents`, `subagents_per_agent`, and the across-tier
+  `max_concurrent_agents`, with defaults `8`, `4`, and `24`. Hierarchical workers reserve one
+  parent plus their complete child allowance, yielding four concurrent first-level workers by
+  default. Backend ceilings are now named `max_concurrent_model_calls`; the former configuration
+  names and `--max-agents` remain compatibility inputs, while the CLI exposes
+  `--num-first-level-agents` and `--max-concurrent-agents`.
 - Replaced new full-copy graph snapshots with schema-v2 content-addressed node/edge blobs, compact
   delta manifests, parent/content integrity roots, and periodic full checkpoints. Existing
   schema-v1 snapshots remain byte-preserving and read-only; offline reconstruct and verification

@@ -10,7 +10,7 @@ The assignment narrows your route but never overrides the compiled prompt or cla
 Do not coordinate with, imitate, or assume the conclusions of concurrent workers.
 
 Follow the supplied `agent_hierarchy` contract exactly. If your role is
-`hierarchical_research_subagent`, you may spawn no more than `maximum_sub_subagents` agents for
+`hierarchical_research_subagent`, you may spawn no more than `subagents_per_agent` agents for
 independent, bounded parts of your assignment. Give each spawned agent its precise task and tell
 it not to delegate further. You remain responsible for checking, reconciling, and synthesizing
 all nested work into your single `ResearchWorkerReport`; a nested agent's assertion is not proof

@@ -82,10 +82,11 @@ Without a backend flag, a new installation uses Codex. Important options:
 --run-name TEXT
 --budget-usd FLOAT
 --max-coordinator-decisions INTEGER
---max-agents INTEGER
+--num-first-level-agents INTEGER
+--subagents-per-agent INTEGER
+--max-concurrent-agents INTEGER
 --hierarchical
 --flat
---subagents-per-agent INTEGER
 --time-limit-minutes INTEGER
 --no-web-search
 --no-lean
@@ -122,8 +123,8 @@ coordinator and live pool, not a provider parameter.
 
 `--no-web-search` disables web search in every model stage and disables MATEK's deterministic
 public-identifier HTTP resolver. Search remains enabled by default. The resolved setting is
-saved with the run; initial research workers and later refills share the default eight-slot
-first-level pool and the same search policy. The same flag on `matek resume` disables it for all
+saved with the run; initial research workers and later refills share the same derived first-level
+pool and search policy. The same flag on `matek resume` disables it for all
 remaining stages.
 Unverifiable citations remain unverified, so this option never weakens the bibliography gate and
 a fully offline run should normally also use `--research-only`.
@@ -150,18 +151,25 @@ and carried into resume; time while MATEK is not running is excluded. The remain
 also bounds each in-flight model call. The default is 900 minutes (15 active hours).
 `MATEK_TIME_LIMIT_MINUTES=N` is the environment form.
 
-`--max-agents N` caps simultaneous first-level research workers. The built-in default is eight.
-`research.maximum_pending_assignments` defaults to a high 1,024-open-assignment safety ceiling,
-and `research.maximum_coordinator_decisions` defaults to 100,000 event-indexed decisions. The
-concurrency limit controls the active subset of that open set. None of these settings imposes a
-separate cumulative logical-worker limit. Codex global call-count limits remain configurable in
-TOML but are unset by default.
+`--num-first-level-agents N` sets the independent bootstrap portfolio size; the default is eight
+and the safety floor is four. `--max-concurrent-agents N` sets an across-tier research-agent
+capacity; the default is 24. In hierarchical mode each admitted first-level worker conservatively
+reserves one parent slot plus its complete `--subagents-per-agent` allowance because internal
+Codex descendant activity is not visible to MATEK's application semaphore. The default child
+allowance is four, so the 24-slot capacity admits four first-level workers at once while all eight
+bootstrap assignments remain queued. `--max-agents` remains a deprecated compatibility input for
+the former first-level-only ceiling.
+
+`research.max_pending_assignments` defaults to a high 1,024-open-assignment safety ceiling, and
+`research.max_coordinator_decisions` defaults to 100,000 event-indexed decisions. The derived
+first-level concurrency limit controls the active subset of that open set. None of these settings
+imposes a separate cumulative logical-worker limit. Codex global call-count limits remain
+configurable in TOML but are unset by default.
 
 Hierarchical execution is the Codex default. `--hierarchical` explicitly enables it and `--flat`
 disables nested delegation.
-`--max-agents X` remains the first-level MATEK worker-concurrency limit, while
-`--subagents-per-agent X_PRIME` sets the maximum concurrently open Codex subagents available to
-each such worker. The hierarchical default is eight nested agents per first-level worker; zero
+`--subagents-per-agent X` sets the maximum concurrently open Codex subagents available to each
+first-level worker. The hierarchical default is four nested agents per first-level worker; zero
 means that workers are explicitly instructed to operate as regular subagents and Codex nested
 tools are not enabled. The coordinator and worker inputs contain both resolved limits. Nested
 agents inherit the parent worker's sandbox and web policy, cannot delegate further under MATEK's
@@ -169,7 +177,7 @@ contract, and must be checked and synthesized by the parent into its ordinary du
 The Responses API adapter has no nested-agent tool and visibly resolves to portable flat
 execution.
 
-`research.maximum_coordinator_context_characters` defaults to 800,000 and applies to the final
+`research.max_coordinator_context_characters` defaults to 800,000 and applies to the final
 serialized provider input rather than raw report text alone. Compact requests reserve at least 5%
 or 40,000 characters, so the normal target is at most 760,000. `matek run` displays this ceiling
 and the bounded on-demand evidence-request limit. Exhaustive artifact and graph indexes stay on
@@ -228,8 +236,8 @@ worker completion. A full run may show:
 ASCENSION 0: Fetching problem.
 ASCENSION 1: Formulating technical research prompt.
 ASCENSION 2: Starting continuous research coordinator.
-ASCENSION 3: Managing adaptive research pool: 8 initial assignments, up to 8 active agents,
-each with up to 8 nested subagents.
+ASCENSION 3: Managing adaptive research pool: 8 initial assignments, up to 4 active
+first-level agents, each with up to 4 nested subagents, within 24 reserved agent slots.
 ASCENSION 4: Packaging the candidate solution for independent audits.
 ASCENSION 5: Writing manuscript and verifying bibliography.
 ASCENSION 6: Assessing and verifying the Lean formalization.

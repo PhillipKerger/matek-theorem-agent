@@ -181,8 +181,8 @@ class CodexSettings(_StrictSettings):
     formalization_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = (
         "xhigh"
     )
-    max_parallel_agents: int = Field(default=64, gt=0)
-    max_parallel_web_agents: int = Field(default=64, gt=0)
+    max_concurrent_model_calls: int = Field(default=24, gt=0)
+    max_concurrent_web_model_calls: int = Field(default=24, gt=0)
     persist_sessions: bool = True
     skip_git_repo_check: bool = False
     extra_args: list[str] = Field(default_factory=list)
@@ -191,14 +191,21 @@ class CodexSettings(_StrictSettings):
     @model_validator(mode="before")
     @classmethod
     def accept_legacy_research_effort(cls, value: Any) -> Any:
-        """Use a legacy shared effort for both research roles unless specialized."""
+        """Normalize older Codex names without changing their behavior."""
 
-        if not isinstance(value, Mapping) or "research_effort" not in value:
+        if not isinstance(value, Mapping):
             return value
         normalized = copy.deepcopy(dict(value))
-        legacy = normalized.pop("research_effort")
-        normalized.setdefault("research_coordinator_effort", legacy)
-        normalized.setdefault("research_worker_effort", legacy)
+        if "research_effort" in normalized:
+            legacy = normalized.pop("research_effort")
+            normalized.setdefault("research_coordinator_effort", legacy)
+            normalized.setdefault("research_worker_effort", legacy)
+        _move_legacy_key(normalized, "max_parallel_agents", "max_concurrent_model_calls")
+        _move_legacy_key(
+            normalized,
+            "max_parallel_web_agents",
+            "max_concurrent_web_model_calls",
+        )
         return normalized
 
     @field_validator("executable")
@@ -261,11 +268,24 @@ class CodexSettings(_StrictSettings):
 
     @model_validator(mode="after")
     def web_parallelism_does_not_exceed_total(self) -> CodexSettings:
-        if self.max_parallel_web_agents > self.max_parallel_agents:
+        if self.max_concurrent_web_model_calls > self.max_concurrent_model_calls:
             raise ValueError(
-                "codex.max_parallel_web_agents cannot exceed codex.max_parallel_agents"
+                "codex.max_concurrent_web_model_calls cannot exceed "
+                "codex.max_concurrent_model_calls"
             )
         return self
+
+    @property
+    def max_parallel_agents(self) -> int:
+        """Compatibility name for the former backend model-call ceiling."""
+
+        return self.max_concurrent_model_calls
+
+    @property
+    def max_parallel_web_agents(self) -> int:
+        """Compatibility name for the former web-enabled model-call ceiling."""
+
+        return self.max_concurrent_web_model_calls
 
     @property
     def research_effort(
@@ -292,16 +312,94 @@ class ScientificPhaseSettings(_StrictSettings):
     adversarial_concurrency: int = Field(default=2, ge=1)
 
 
+_RESEARCH_SETTING_ALIASES: dict[str, str] = {
+    "maximum_subagents_per_agent": "subagents_per_agent",
+    "minimum_initial_agents": "num_first_level_agents",
+    "maximum_pending_assignments": "max_pending_assignments",
+    "maximum_coordinator_decisions": "max_coordinator_decisions",
+    "maximum_coordinator_context_characters": "max_coordinator_context_characters",
+    "maximum_unrequested_full_graph_node_characters": (
+        "max_unrequested_full_graph_node_characters"
+    ),
+    "maximum_coordinator_requested_artifacts": "max_coordinator_requested_artifacts",
+}
+
+_LEGACY_PENDING_ASSIGNMENT_CAPACITY = 32
+_DEFAULT_PENDING_ASSIGNMENT_CAPACITY = 1_024
+
+
+def _legacy_pending_capacity_for(current_capacity: int) -> int:
+    """Choose the old round width unless a non-default pending cap is explicit."""
+
+    if current_capacity == _DEFAULT_PENDING_ASSIGNMENT_CAPACITY:
+        return _LEGACY_PENDING_ASSIGNMENT_CAPACITY
+    return current_capacity
+
+
+def _move_legacy_key(values: dict[str, Any], old: str, new: str) -> None:
+    """Move one compatibility key and reject contradictory duplicate settings."""
+
+    if old not in values:
+        return
+    legacy_value = values.pop(old)
+    if new in values and values[new] != legacy_value:
+        raise ValueError(f"configuration cannot set both {old} and {new} to different values")
+    values.setdefault(new, legacy_value)
+
+
+def _normalize_research_setting_names(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Return canonical scheduler names while preserving legacy concurrency.
+
+    The old ``maximum_concurrent_agents`` setting counted only first-level
+    workers. The canonical ``max_concurrent_agents`` setting is an across-tier
+    capacity: one hierarchical worker reserves one parent slot plus its complete
+    configured child allowance. Translating the old value here prevents existing
+    projects and frozen run snapshots from unexpectedly losing first-level
+    concurrency after the clearer semantics are introduced.
+    """
+
+    normalized = copy.deepcopy(dict(values))
+    legacy_first_level_present = "maximum_concurrent_agents" in normalized
+    for old, new in _RESEARCH_SETTING_ALIASES.items():
+        _move_legacy_key(normalized, old, new)
+    legacy_first_level = normalized.pop("maximum_concurrent_agents", None)
+    if legacy_first_level_present:
+        # ``maximum_concurrent_agents`` was interpreted against the former
+        # hierarchical child default of eight. Preserve that complete topology
+        # only when the old first-level ceiling is actually present. Other old
+        # scheduler keys should inherit today's 8/4/24 topology defaults.
+        normalized.setdefault("subagents_per_agent", 8)
+        if "max_concurrent_agents" in normalized:
+            raise ValueError(
+                "configuration cannot combine legacy maximum_concurrent_agents with "
+                "canonical max_concurrent_agents"
+            )
+        multiplier = (
+            1 + normalized["subagents_per_agent"]
+            if normalized.get("orchestration_mode", "hierarchical") == "hierarchical"
+            else 1
+        )
+        if (
+            isinstance(legacy_first_level, int)
+            and not isinstance(legacy_first_level, bool)
+            and isinstance(multiplier, int)
+        ):
+            normalized["max_concurrent_agents"] = legacy_first_level * multiplier
+        else:
+            normalized["max_concurrent_agents"] = legacy_first_level
+    return normalized
+
+
 class ResearchSettings(_StrictSettings):
     orchestration_mode: Literal["flat", "hierarchical"] = "hierarchical"
-    maximum_subagents_per_agent: int = Field(default=8, ge=0, le=32)
-    minimum_initial_agents: int = Field(default=8, ge=4)
-    maximum_concurrent_agents: int = Field(default=8, gt=0)
-    maximum_pending_assignments: int = Field(default=1_024, gt=0)
-    maximum_coordinator_decisions: int = Field(default=100_000, gt=0)
-    maximum_coordinator_context_characters: int = Field(default=800_000, ge=100_000)
-    maximum_unrequested_full_graph_node_characters: int = Field(default=120_000, ge=1_000)
-    maximum_coordinator_requested_artifacts: int = Field(default=32, ge=1, le=32)
+    subagents_per_agent: int = Field(default=4, ge=0, le=32)
+    num_first_level_agents: int = Field(default=8, ge=4)
+    max_concurrent_agents: int = Field(default=24, gt=0)
+    max_pending_assignments: int = Field(default=1_024, gt=0)
+    max_coordinator_decisions: int = Field(default=100_000, gt=0)
+    max_coordinator_context_characters: int = Field(default=800_000, ge=100_000)
+    max_unrequested_full_graph_node_characters: int = Field(default=120_000, ge=1_000)
+    max_coordinator_requested_artifacts: int = Field(default=32, ge=1, le=32)
     scientific_phase: ScientificPhaseSettings = Field(default_factory=ScientificPhaseSettings)
     require_foundational_audit: Literal[True] = True
     require_domain_audit: Literal[True] = True
@@ -315,14 +413,14 @@ class ResearchSettings(_StrictSettings):
 
         if not isinstance(value, Mapping):
             return value
-        normalized = copy.deepcopy(dict(value))
+        normalized = _normalize_research_setting_names(value)
         missing = object()
         legacy_pending = normalized.pop("maximum_assignments_per_round", missing)
         legacy_rounds = normalized.pop("maximum_rounds", missing)
         if legacy_pending is not missing:
-            normalized.setdefault("maximum_pending_assignments", legacy_pending)
+            normalized.setdefault("max_pending_assignments", legacy_pending)
         if legacy_rounds is not missing:
-            pending = normalized.get("maximum_pending_assignments", 32)
+            pending = normalized.get("max_pending_assignments", 32)
             migrated = (
                 legacy_rounds * pending
                 if isinstance(legacy_rounds, int)
@@ -331,37 +429,92 @@ class ResearchSettings(_StrictSettings):
                 and not isinstance(pending, bool)
                 else legacy_rounds
             )
-            normalized.setdefault("maximum_coordinator_decisions", migrated)
+            normalized.setdefault("max_coordinator_decisions", migrated)
         return normalized
 
     @model_validator(mode="after")
     def pending_assignment_cap_funds_initial_portfolio(self) -> ResearchSettings:
-        if self.maximum_pending_assignments < self.minimum_initial_agents:
+        if self.max_pending_assignments < self.num_first_level_agents:
             raise ValueError(
-                "research.maximum_pending_assignments (legacy "
+                "research.max_pending_assignments (legacy "
                 "maximum_assignments_per_round) cannot be less than "
-                "research.minimum_initial_agents"
+                "research.num_first_level_agents"
+            )
+        minimum_worker_reservation = 1 + self.hierarchical_subagent_limit
+        if self.max_concurrent_agents < minimum_worker_reservation:
+            raise ValueError(
+                "research.max_concurrent_agents must fund at least one first-level worker "
+                f"and its configured nested allowance ({minimum_worker_reservation} slots)"
             )
         return self
+
+    @property
+    def maximum_subagents_per_agent(self) -> int:
+        """Compatibility name for ``subagents_per_agent``."""
+
+        return self.subagents_per_agent
+
+    @property
+    def minimum_initial_agents(self) -> int:
+        """Compatibility name for ``num_first_level_agents``."""
+
+        return self.num_first_level_agents
+
+    @property
+    def maximum_concurrent_agents(self) -> int:
+        """Compatibility view of the effective first-level worker ceiling."""
+
+        divisor = 1 + self.hierarchical_subagent_limit
+        return max(1, self.max_concurrent_agents // divisor)
+
+    @property
+    def maximum_pending_assignments(self) -> int:
+        """Compatibility name for ``max_pending_assignments``."""
+
+        return self.max_pending_assignments
+
+    @property
+    def maximum_coordinator_decisions(self) -> int:
+        """Compatibility name for ``max_coordinator_decisions``."""
+
+        return self.max_coordinator_decisions
+
+    @property
+    def maximum_coordinator_context_characters(self) -> int:
+        """Compatibility name for ``max_coordinator_context_characters``."""
+
+        return self.max_coordinator_context_characters
+
+    @property
+    def maximum_unrequested_full_graph_node_characters(self) -> int:
+        """Compatibility name for the unrequested full-node section ceiling."""
+
+        return self.max_unrequested_full_graph_node_characters
+
+    @property
+    def maximum_coordinator_requested_artifacts(self) -> int:
+        """Compatibility name for ``max_coordinator_requested_artifacts``."""
+
+        return self.max_coordinator_requested_artifacts
 
     @property
     def maximum_assignments_per_round(self) -> int:
         """Compatibility name for the pending assignment-window limit."""
 
-        return self.maximum_pending_assignments
+        return self.max_pending_assignments
 
     @property
     def maximum_rounds(self) -> int:
         """Compatibility estimate in full pending-window equivalents."""
 
-        pending = self.maximum_pending_assignments
-        return (self.maximum_coordinator_decisions + pending - 1) // pending
+        pending = self.max_pending_assignments
+        return (self.max_coordinator_decisions + pending - 1) // pending
 
     @property
     def hierarchical_subagent_limit(self) -> int:
         """Return the active per-worker Codex subagent allowance."""
 
-        return self.maximum_subagents_per_agent if self.orchestration_mode == "hierarchical" else 0
+        return self.subagents_per_agent if self.orchestration_mode == "hierarchical" else 0
 
 
 class ManuscriptSettings(_StrictSettings):
@@ -496,10 +649,25 @@ class PricingSettings(_StrictSettings):
 class ApiSettings(_StrictSettings):
     """Existing Responses API configuration, namespaced without changing semantics."""
 
-    max_parallel_agents: int = Field(default=64, gt=0)
+    max_concurrent_model_calls: int = Field(default=24, gt=0)
     models: ModelsSettings = Field(default_factory=ModelsSettings)
     limits: Limits = Field(default_factory=Limits)
     pricing: PricingSettings = Field(default_factory=PricingSettings)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_parallel_name(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = copy.deepcopy(dict(value))
+        _move_legacy_key(normalized, "max_parallel_agents", "max_concurrent_model_calls")
+        return normalized
+
+    @property
+    def max_parallel_agents(self) -> int:
+        """Compatibility name for the former API model-call ceiling."""
+
+        return self.max_concurrent_model_calls
 
 
 class GraphSettings(_StrictSettings):
@@ -613,7 +781,20 @@ class AppConfig(_StrictSettings):
 
         if self.effective_research_orchestration_mode != "hierarchical":
             return 0
-        return self.research.maximum_subagents_per_agent
+        return self.research.subagents_per_agent
+
+    @property
+    def effective_max_concurrent_first_level_agents(self) -> int:
+        """Derive safe outer-worker concurrency from the across-tier capacity.
+
+        A Codex hierarchical worker reserves one slot for itself and its entire
+        configured nested allowance because internal descendant activity is not
+        observable by MATEK's application-level semaphore. Flat/API workers reserve
+        one slot each.
+        """
+
+        slots_per_worker = 1 + self.effective_hierarchical_subagent_limit
+        return max(1, self.research.max_concurrent_agents // slots_per_worker)
 
     @property
     def web_search_enabled(self) -> bool:
@@ -641,14 +822,16 @@ _CONVENIENCE_PATHS: dict[str, tuple[str, ...]] = {
     "BACKEND": ("backend", "provider"),
     "BUDGET_USD": ("api", "limits", "maximum_cost_usd"),
     "MAXIMUM_COST_USD": ("api", "limits", "maximum_cost_usd"),
-    "MAX_COORDINATOR_DECISIONS": ("research", "maximum_coordinator_decisions"),
-    "MAXIMUM_COORDINATOR_DECISIONS": ("research", "maximum_coordinator_decisions"),
+    "NUM_FIRST_LEVEL_AGENTS": ("research", "num_first_level_agents"),
+    "MAX_COORDINATOR_DECISIONS": ("research", "max_coordinator_decisions"),
+    "MAXIMUM_COORDINATOR_DECISIONS": ("research", "max_coordinator_decisions"),
     "MAX_ROUNDS": ("research", "maximum_rounds"),
     "MAXIMUM_ROUNDS": ("research", "maximum_rounds"),
     "MAX_AGENTS": ("research", "maximum_concurrent_agents"),
+    "MAX_CONCURRENT_AGENTS": ("research", "max_concurrent_agents"),
     "MAXIMUM_CONCURRENT_AGENTS": ("research", "maximum_concurrent_agents"),
     "RESEARCH_MODE": ("research", "orchestration_mode"),
-    "SUBAGENTS_PER_AGENT": ("research", "maximum_subagents_per_agent"),
+    "SUBAGENTS_PER_AGENT": ("research", "subagents_per_agent"),
     "LEAN_ENABLED": ("lean", "enabled"),
     "SANDBOX": ("lean", "execution_backend"),
 }
@@ -656,11 +839,13 @@ _CONVENIENCE_PATHS: dict[str, tuple[str, ...]] = {
 _CLI_PATHS: dict[str, tuple[str, ...]] = {
     "backend": ("backend", "provider"),
     "budget_usd": ("api", "limits", "maximum_cost_usd"),
-    "max_coordinator_decisions": ("research", "maximum_coordinator_decisions"),
+    "num_first_level_agents": ("research", "num_first_level_agents"),
+    "max_coordinator_decisions": ("research", "max_coordinator_decisions"),
     "max_rounds": ("research", "maximum_rounds"),
+    "max_concurrent_agents": ("research", "max_concurrent_agents"),
     "max_agents": ("research", "maximum_concurrent_agents"),
     "research_mode": ("research", "orchestration_mode"),
-    "subagents_per_agent": ("research", "maximum_subagents_per_agent"),
+    "subagents_per_agent": ("research", "subagents_per_agent"),
     "sandbox": ("lean", "execution_backend"),
     "no_lean": ("lean", "enabled"),
 }
@@ -732,6 +917,12 @@ def _normalize_continuous_research_aliases(
     codex = normalized.get("codex")
     if isinstance(codex, Mapping):
         codex_data = copy.deepcopy(dict(codex))
+        _move_legacy_key(codex_data, "max_parallel_agents", "max_concurrent_model_calls")
+        _move_legacy_key(
+            codex_data,
+            "max_parallel_web_agents",
+            "max_concurrent_web_model_calls",
+        )
         if "research_effort" in codex_data:
             legacy_effort = codex_data.pop("research_effort")
             codex_data.setdefault("research_coordinator_effort", legacy_effort)
@@ -749,16 +940,22 @@ def _normalize_continuous_research_aliases(
             codex_data["limits"] = limit_data
         normalized["codex"] = codex_data
 
+    api = normalized.get("api")
+    if isinstance(api, Mapping):
+        api_data = copy.deepcopy(dict(api))
+        _move_legacy_key(api_data, "max_parallel_agents", "max_concurrent_model_calls")
+        normalized["api"] = api_data
+
     research = normalized.get("research")
     if isinstance(research, Mapping):
-        research_data = copy.deepcopy(dict(research))
+        research_data = _normalize_research_setting_names(research)
         missing = object()
         legacy_pending = research_data.pop("maximum_assignments_per_round", missing)
         legacy_rounds = research_data.pop("maximum_rounds", missing)
         if legacy_pending is not missing:
-            research_data.setdefault("maximum_pending_assignments", legacy_pending)
+            research_data.setdefault("max_pending_assignments", legacy_pending)
         if legacy_rounds is not missing:
-            pending = research_data.get("maximum_pending_assignments", legacy_pending_capacity)
+            pending = research_data.get("max_pending_assignments", legacy_pending_capacity)
             migrated_decisions = (
                 legacy_rounds * pending
                 if isinstance(legacy_rounds, int)
@@ -767,7 +964,7 @@ def _normalize_continuous_research_aliases(
                 and not isinstance(pending, bool)
                 else legacy_rounds
             )
-            research_data.setdefault("maximum_coordinator_decisions", migrated_decisions)
+            research_data.setdefault("max_coordinator_decisions", migrated_decisions)
         normalized["research"] = research_data
 
     return normalized
@@ -966,25 +1163,77 @@ def environment_overrides(
                 ("codex", "limits", "max_research_rounds"),
                 ("codex", "limits", "max_research_coordinator_decisions"),
             ),
+            "MAX_AGENTS": (
+                ("research", "maximum_concurrent_agents"),
+                ("research", "max_concurrent_agents"),
+            ),
+            "MAXIMUM_CONCURRENT_AGENTS": (
+                ("research", "maximum_concurrent_agents"),
+                ("research", "max_concurrent_agents"),
+            ),
+            "RESEARCH_MAXIMUM_CONCURRENT_AGENTS": (
+                ("research", "maximum_concurrent_agents"),
+                ("research", "max_concurrent_agents"),
+            ),
+            "RESEARCH_MAXIMUM_SUBAGENTS_PER_AGENT": (
+                ("research", "maximum_subagents_per_agent"),
+                ("research", "subagents_per_agent"),
+            ),
+            "RESEARCH_MINIMUM_INITIAL_AGENTS": (
+                ("research", "minimum_initial_agents"),
+                ("research", "num_first_level_agents"),
+            ),
+            "RESEARCH_MAXIMUM_PENDING_ASSIGNMENTS": (
+                ("research", "maximum_pending_assignments"),
+                ("research", "max_pending_assignments"),
+            ),
+            "RESEARCH_MAXIMUM_COORDINATOR_DECISIONS": (
+                ("research", "maximum_coordinator_decisions"),
+                ("research", "max_coordinator_decisions"),
+            ),
+            "RESEARCH_MAXIMUM_COORDINATOR_CONTEXT_CHARACTERS": (
+                ("research", "maximum_coordinator_context_characters"),
+                ("research", "max_coordinator_context_characters"),
+            ),
+            "RESEARCH_MAXIMUM_UNREQUESTED_FULL_GRAPH_NODE_CHARACTERS": (
+                ("research", "maximum_unrequested_full_graph_node_characters"),
+                ("research", "max_unrequested_full_graph_node_characters"),
+            ),
+            "RESEARCH_MAXIMUM_COORDINATOR_REQUESTED_ARTIFACTS": (
+                ("research", "maximum_coordinator_requested_artifacts"),
+                ("research", "max_coordinator_requested_artifacts"),
+            ),
             "RESEARCH_MAXIMUM_ASSIGNMENTS_PER_ROUND": (
                 ("research", "maximum_assignments_per_round"),
-                ("research", "maximum_pending_assignments"),
+                ("research", "max_pending_assignments"),
             ),
             "MAXIMUM_ASSIGNMENTS_PER_ROUND": (
                 ("research", "maximum_assignments_per_round"),
-                ("research", "maximum_pending_assignments"),
+                ("research", "max_pending_assignments"),
             ),
             "RESEARCH_MAXIMUM_ROUNDS": (
                 ("research", "maximum_rounds"),
-                ("research", "maximum_coordinator_decisions"),
+                ("research", "max_coordinator_decisions"),
             ),
             "MAX_ROUNDS": (
                 ("research", "maximum_rounds"),
-                ("research", "maximum_coordinator_decisions"),
+                ("research", "max_coordinator_decisions"),
             ),
             "MAXIMUM_ROUNDS": (
                 ("research", "maximum_rounds"),
-                ("research", "maximum_coordinator_decisions"),
+                ("research", "max_coordinator_decisions"),
+            ),
+            "CODEX_MAX_PARALLEL_AGENTS": (
+                ("codex", "max_parallel_agents"),
+                ("codex", "max_concurrent_model_calls"),
+            ),
+            "CODEX_MAX_PARALLEL_WEB_AGENTS": (
+                ("codex", "max_parallel_web_agents"),
+                ("codex", "max_concurrent_web_model_calls"),
+            ),
+            "API_MAX_PARALLEL_AGENTS": (
+                ("api", "max_parallel_agents"),
+                ("api", "max_concurrent_model_calls"),
             ),
         }
         legacy_paths = legacy_environment_paths.get(canonical_suffix)
@@ -1095,7 +1344,9 @@ def merge_config(config: AppConfig, overrides: ConfigMapping | None) -> AppConfi
         data,
         normalize_cli_overrides(
             overrides,
-            legacy_pending_capacity=config.research.maximum_pending_assignments,
+            legacy_pending_capacity=_legacy_pending_capacity_for(
+                config.research.max_pending_assignments
+            ),
         ),
     )
     try:
@@ -1163,12 +1414,13 @@ def load_config(
 
     file_research = data.get("research")
     file_pending = (
-        file_research.get("maximum_pending_assignments", 32)
+        file_research.get("max_pending_assignments", 32)
         if isinstance(file_research, Mapping)
         else 32
     )
     if not isinstance(file_pending, int) or isinstance(file_pending, bool):
         file_pending = 32
+    file_pending = _legacy_pending_capacity_for(file_pending)
     data = _deep_merge(
         data,
         environment_overrides(
@@ -1179,12 +1431,13 @@ def load_config(
     )
     resolved_research = data.get("research")
     resolved_pending = (
-        resolved_research.get("maximum_pending_assignments", 32)
+        resolved_research.get("max_pending_assignments", 32)
         if isinstance(resolved_research, Mapping)
         else 32
     )
     if not isinstance(resolved_pending, int) or isinstance(resolved_pending, bool):
         resolved_pending = 32
+    resolved_pending = _legacy_pending_capacity_for(resolved_pending)
     data = _deep_merge(
         data,
         normalize_cli_overrides(

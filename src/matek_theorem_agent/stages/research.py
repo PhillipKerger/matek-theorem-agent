@@ -1656,9 +1656,10 @@ class ResearchWorkflowSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     orchestration_mode: Literal["flat", "hierarchical"] = "hierarchical"
-    maximum_subagents_per_agent: int = Field(default=8, ge=0, le=32)
+    maximum_subagents_per_agent: int = Field(default=4, ge=0, le=32)
     minimum_initial_assignments: int = Field(default=8, ge=4)
-    maximum_concurrent_agents: int = Field(default=8, ge=1)
+    maximum_concurrent_agents: int = Field(default=4, ge=1)
+    max_concurrent_agents: int = Field(default=24, ge=1)
     maximum_pending_assignments: int = Field(default=1_024, ge=1)
     maximum_coordinator_decisions: int = Field(default=100_000, ge=1)
     maximum_coordinator_context_characters: int = Field(default=800_000, ge=100_000)
@@ -3380,11 +3381,10 @@ async def run_adaptive_research(
             "agent_hierarchy": (
                 {
                     "role": "hierarchical_research_subagent",
-                    "coordinator_maximum_concurrent_subagents": (
-                        settings.maximum_concurrent_agents
-                    ),
-                    "maximum_sub_subagents": nested_limit,
-                    "maximum_sub_subagent_depth": 1,
+                    "max_concurrent_agents": settings.max_concurrent_agents,
+                    "max_concurrent_first_level_agents": settings.maximum_concurrent_agents,
+                    "subagents_per_agent": nested_limit,
+                    "max_nested_agent_depth": 1,
                     "instruction": (
                         f"You may spawn up to {nested_limit} sub-subagents for independent "
                         "bounded parts of this assignment. You remain responsible for "
@@ -6565,11 +6565,10 @@ async def run_adaptive_research(
             "coordinator_mode": "continuous_event_driven",
             "research_agent_hierarchy": {
                 "mode": settings.orchestration_mode,
-                "maximum_concurrent_subagents": settings.maximum_concurrent_agents,
-                "maximum_sub_subagents_per_subagent": (settings.hierarchical_subagent_limit),
-                "maximum_sub_subagent_depth": (
-                    1 if settings.hierarchical_subagent_limit > 0 else 0
-                ),
+                "max_concurrent_agents": settings.max_concurrent_agents,
+                "max_concurrent_first_level_agents": settings.maximum_concurrent_agents,
+                "subagents_per_agent": settings.hierarchical_subagent_limit,
+                "max_nested_agent_depth": (1 if settings.hierarchical_subagent_limit > 0 else 0),
                 "instruction": (
                     "Each research subagent may use its bounded sub-subagent pool and must "
                     "synthesize nested work into its own report."

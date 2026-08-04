@@ -114,7 +114,11 @@ one-time notice.
 
 Legacy research keys `maximum_assignments_per_round`, `maximum_rounds`,
 `max_research_rounds`, and the CLI `--max-rounds` input migrate to
-`maximum_pending_assignments` and a scaled `maximum_coordinator_decisions` budget. Compatibility
+`max_pending_assignments` and a scaled `max_coordinator_decisions` budget. Older scheduler names
+also migrate to `num_first_level_agents`, `subagents_per_agent`, and the across-tier
+`max_concurrent_agents`. The former `maximum_concurrent_agents` counted only first-level workers;
+its migration multiplies by the applicable parent-plus-child reservation so frozen runs retain
+their effective concurrency. Compatibility
 never reintroduces fixed-round scheduling or a batch barrier.
 
 ### Workspace
@@ -187,8 +191,9 @@ The event loop is:
    contract. Its first decision supplies a diverse portfolio of eight assignments by default.
 2. Persist and validate the decision, then admit independent workers under research and
    backend-specific semaphores. The default open-work safety ceiling is 1,024
-   queued-plus-running assignments; the first-level concurrency limit permits up to eight members
-   of that set to be active, each with up to eight nested Codex agents.
+   queued-plus-running assignments. The eight-assignment bootstrap, four-child allowance, and
+   24-slot across-tier capacity conservatively permit four members of that set to be active
+   first-level workers at once.
 3. On each completion, atomically persist the entire raw report and its hash, checkpoint the
    transition with a pending-event write-ahead record, create one monotonically sequenced immutable
    event file, clear the pending record, and refresh the mailbox view. The ordering ensures every

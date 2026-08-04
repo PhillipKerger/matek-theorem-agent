@@ -1048,8 +1048,12 @@ class WorkflowRunner:
                 "automatic_fallback": False,
                 "research_orchestration_mode": (self.config.effective_research_orchestration_mode),
                 "configured_research_orchestration_mode": (self.config.research.orchestration_mode),
-                "maximum_subagents_per_agent": (self.config.effective_hierarchical_subagent_limit),
-                "maximum_concurrent_agents": (self.config.research.maximum_concurrent_agents),
+                "num_first_level_agents": self.config.research.num_first_level_agents,
+                "subagents_per_agent": self.config.effective_hierarchical_subagent_limit,
+                "max_concurrent_agents": self.config.research.max_concurrent_agents,
+                "max_concurrent_first_level_agents": (
+                    self.config.effective_max_concurrent_first_level_agents
+                ),
             }
         )
         state.metadata["configuration_summary"] = summary
@@ -1967,45 +1971,42 @@ class WorkflowRunner:
                     research_dir=state.run_root / "research",
                     workflow_settings=ResearchWorkflowSettings(
                         orchestration_mode=(self.config.effective_research_orchestration_mode),
-                        maximum_subagents_per_agent=(
-                            self.config.research.maximum_subagents_per_agent
-                        ),
+                        maximum_subagents_per_agent=(self.config.research.subagents_per_agent),
                         minimum_initial_assignments=max(
-                            4, self.config.research.minimum_initial_agents
+                            4, self.config.research.num_first_level_agents
                         ),
                         maximum_concurrent_agents=(
                             # Initial workers and later refills share this effective pool.
                             # Search-enabled Codex calls must satisfy both backend ceilings.
                             min(
-                                self.config.research.maximum_concurrent_agents,
-                                self.config.codex.max_parallel_agents,
-                                self.config.codex.max_parallel_web_agents,
+                                self.config.effective_max_concurrent_first_level_agents,
+                                self.config.codex.max_concurrent_model_calls,
+                                self.config.codex.max_concurrent_web_model_calls,
                             )
                             if self.config.backend.provider == "codex"
                             else min(
-                                self.config.research.maximum_concurrent_agents,
-                                self.config.api.max_parallel_agents,
+                                self.config.effective_max_concurrent_first_level_agents,
+                                self.config.api.max_concurrent_model_calls,
                             )
                         ),
-                        maximum_pending_assignments=(
-                            self.config.research.maximum_pending_assignments
-                        ),
+                        max_concurrent_agents=self.config.research.max_concurrent_agents,
+                        maximum_pending_assignments=(self.config.research.max_pending_assignments),
                         maximum_coordinator_decisions=(
                             min(
-                                self.config.research.maximum_coordinator_decisions,
+                                self.config.research.max_coordinator_decisions,
                                 self.config.codex.limits.max_research_coordinator_decisions,
                             )
                             if self.config.backend.provider == "codex"
-                            else self.config.research.maximum_coordinator_decisions
+                            else self.config.research.max_coordinator_decisions
                         ),
                         maximum_coordinator_context_characters=(
-                            self.config.research.maximum_coordinator_context_characters
+                            self.config.research.max_coordinator_context_characters
                         ),
                         maximum_unrequested_full_graph_node_characters=(
-                            self.config.research.maximum_unrequested_full_graph_node_characters
+                            self.config.research.max_unrequested_full_graph_node_characters
                         ),
                         maximum_coordinator_requested_artifacts=(
-                            self.config.research.maximum_coordinator_requested_artifacts
+                            self.config.research.max_coordinator_requested_artifacts
                         ),
                         scientific_phase_policy=ScientificPhasePolicy.model_validate(
                             self.config.research.scientific_phase.model_dump(mode="python")

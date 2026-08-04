@@ -4734,10 +4734,11 @@ def test_research_workflow_defaults_use_a_large_continuous_pending_window() -> N
     settings = ResearchWorkflowSettings()
 
     assert settings.orchestration_mode == "hierarchical"
-    assert settings.maximum_subagents_per_agent == 8
-    assert settings.hierarchical_subagent_limit == 8
+    assert settings.maximum_subagents_per_agent == 4
+    assert settings.hierarchical_subagent_limit == 4
     assert settings.minimum_initial_assignments == 8
-    assert settings.maximum_concurrent_agents == 8
+    assert settings.maximum_concurrent_agents == 4
+    assert settings.max_concurrent_agents == 24
     assert settings.maximum_pending_assignments == 1_024
     assert settings.maximum_coordinator_decisions == 100_000
     assert settings.maximum_coordinator_context_characters == 800_000
@@ -4776,6 +4777,7 @@ async def test_hierarchical_limits_are_given_to_coordinator_and_workers(
             maximum_subagents_per_agent=8,
             minimum_initial_assignments=4,
             maximum_concurrent_agents=4,
+            max_concurrent_agents=36,
             maximum_pending_assignments=4,
         ),
     )
@@ -4787,16 +4789,19 @@ async def test_hierarchical_limits_are_given_to_coordinator_and_workers(
             "Each research subagent may use its bounded sub-subagent pool and must "
             "synthesize nested work into its own report."
         ),
-        "maximum_concurrent_subagents": 4,
-        "maximum_sub_subagent_depth": 1,
-        "maximum_sub_subagents_per_subagent": 8,
+        "max_concurrent_agents": 36,
+        "max_concurrent_first_level_agents": 4,
+        "max_nested_agent_depth": 1,
+        "subagents_per_agent": 8,
         "mode": "hierarchical",
     }
     assert client.worker_hierarchies
     assert all(
         hierarchy["role"] == "hierarchical_research_subagent"
-        and hierarchy["maximum_sub_subagents"] == 8
-        and hierarchy["maximum_sub_subagent_depth"] == 1
+        and hierarchy["max_concurrent_agents"] == 36
+        and hierarchy["max_concurrent_first_level_agents"] == 4
+        and hierarchy["subagents_per_agent"] == 8
+        and hierarchy["max_nested_agent_depth"] == 1
         for hierarchy in client.worker_hierarchies
     )
 
@@ -5091,7 +5096,7 @@ async def test_model_only_refutation_stop_is_declined_and_research_continues(
 
 
 @pytest.mark.asyncio
-async def test_default_pool_runs_8_hierarchical_web_enabled_initial_research_workers(
+async def test_default_pool_queues_8_and_runs_4_hierarchical_workers_at_once(
     tmp_path: Path,
 ) -> None:
     class ThirtyTwoWorkerClient:
@@ -5109,10 +5114,9 @@ async def test_default_pool_runs_8_hierarchical_web_enabled_initial_research_wor
             assert request.settings.web_search is True
             payload = json.loads(request.input_text)
             if output_type is ResearchCoordinatorDecision:
-                assert payload["maximum_concurrent_workers"] == 8
-                assert (
-                    payload["research_agent_hierarchy"]["maximum_sub_subagents_per_subagent"] == 8
-                )
+                assert payload["maximum_concurrent_workers"] == 4
+                assert payload["research_agent_hierarchy"]["max_concurrent_agents"] == 24
+                assert payload["research_agent_hierarchy"]["subagents_per_agent"] == 4
                 assert payload["worker_web_search_enabled"] is True
                 if payload["initial_portfolio"]:
                     parsed: BaseModel = ResearchCoordinatorDecision(
@@ -5145,7 +5149,7 @@ async def test_default_pool_runs_8_hierarchical_web_enabled_initial_research_wor
                 self.worker_ids.add(assignment_id)
                 self.active_workers += 1
                 self.maximum_active_workers = max(self.maximum_active_workers, self.active_workers)
-                if self.active_workers == 8:
+                if self.active_workers == 4:
                     self.all_workers_started.set()
                 try:
                     await asyncio.wait_for(self.all_workers_started.wait(), timeout=2)
@@ -5172,8 +5176,10 @@ async def test_default_pool_runs_8_hierarchical_web_enabled_initial_research_wor
     )
 
     assert result.outcome is ResearchOutcome.BUDGET_EXHAUSTED
-    assert client.maximum_active_workers == 8
-    assert len(client.worker_ids) == 8
+    assert client.maximum_active_workers == 4
+    assert len(client.worker_ids) == 4
+    scheduler = json.loads((tmp_path / "coordinator" / "state.json").read_text())
+    assert len(scheduler["assignments"]) == 8
 
 
 @pytest.mark.asyncio
@@ -5301,9 +5307,10 @@ async def test_oversized_mandatory_scheduler_history_uses_indexed_context_and_co
                             "Each research subagent may use its bounded sub-subagent pool and "
                             "must synthesize nested work into its own report."
                         ),
-                        "maximum_concurrent_subagents": 4,
-                        "maximum_sub_subagent_depth": 1,
-                        "maximum_sub_subagents_per_subagent": 6,
+                        "max_concurrent_agents": 28,
+                        "max_concurrent_first_level_agents": 4,
+                        "max_nested_agent_depth": 1,
+                        "subagents_per_agent": 6,
                         "mode": "hierarchical",
                     }
                     assert payload["scheduler_state_index"]["assignment_count"] == 4
@@ -5348,6 +5355,7 @@ async def test_oversized_mandatory_scheduler_history_uses_indexed_context_and_co
             maximum_subagents_per_agent=6,
             minimum_initial_assignments=4,
             maximum_concurrent_agents=4,
+            max_concurrent_agents=28,
             maximum_pending_assignments=4,
             maximum_coordinator_decisions=2,
             maximum_coordinator_context_characters=100_000,

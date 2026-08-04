@@ -109,7 +109,11 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   research still starts; target-identification evidence remains fail closed.
 - Event-driven research configuration defaults and migration of legacy
   `maximum_assignments_per_round`/`maximum_rounds` and `--max-rounds` inputs to
-  `maximum_pending_assignments`/`maximum_coordinator_decisions` without reintroducing barriers.
+  `max_pending_assignments`/`max_coordinator_decisions` without reintroducing barriers.
+- Clear scheduling controls and compatibility migration: eight bootstrap first-level assignments,
+  four children per hierarchical worker, a 24-slot across-tier capacity, conservative
+  parent-plus-child reservation, canonical CLI/config names, and preservation of the former
+  first-level-only `maximum_concurrent_agents` and `--max-agents` semantics.
 - Budget accounting, the total-open queued-plus-running assignment limit, coordinator-decision
   limits, and active concurrency limits; no separate cumulative research-worker cap.
 - Hierarchical configuration and CLI precedence; both tier limits reach coordinator and worker
@@ -196,8 +200,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 13. Post-manuscript Lean confirmation: approve, decline, five-minute timeout-to-proceed,
     noninteractive auto-proceed, and crash-safe decision reuse.
 14. Live-pool refill: one of eight initial workers finishes while others run, the coordinator
-    consumes that completion and admits targeted work up to the eight-worker first-level ceiling
-    (with eight nested agents per parent) without a batch
+    consumes that completion and admits targeted work up to the derived four-worker first-level
+    ceiling (with four nested agents per parent and 24 reserved agent slots) without a batch
     barrier.
 15. More logical workers complete over time than the configured total-open ceiling while open and
     active-concurrency ceilings remain respected, demonstrating that no cumulative worker cap
