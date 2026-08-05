@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.5.0 — Unreleased
+## 0.6.0 — 2026-08-05
+
+- Reused the graph's live canonical target whenever the normalized user problem is unchanged.
+  Repeat runs now rematerialize the previously frozen statement, contract, and compiled prompt;
+  stochastic compiler prose or JSON layout cannot trigger a contract-drift pause. A changed
+  user-authored problem still requires `--migrate-target REASON`, and reports identify the target
+  as created, reused, or migrated with its stable ID and contract hash.
+- Split the offline tests into a focused default suite and an explicit `comprehensive` workflow
+  tier. Ordinary `pytest -q` now runs fewer than 500 focused checks in roughly a quarter of the
+  former workflow-heavy feedback time, while `pytest -q -o addopts=-ra` retains the complete
+  offline release suite.
 
 - Replaced brittle prompt-alignment token coverage with a smaller contradiction-only guard. It
   still blocks explicit reversed symbolic quantifiers or polarity, opposing qualifiers, changed

@@ -15,6 +15,8 @@ MATEK should be cited in any scholarly, technical, or public work in which it is
 produced work should contain a clear statement of AI usage. Users are also encouraged to share
 knowledge graphs that can serve as starting points for future work.
 
+The current package version is **0.6.0**.
+
 | At a glance | Default behavior |
 | --- | --- |
 | Model access | Official Codex CLI with ChatGPT sign-in; no OpenAI API key required |
@@ -514,10 +516,13 @@ available for later synthesis.
 The normalized source file hash freezes the theorem before research. The prompt compiler first
 writes `prompts/target_alignment.json`, which hash-binds the statement and contract and checks each
 clause for explicit contradictions. The graph then stores the aligned statement, canonical
-contract, and compiled prompt in `target-registry.json`. A later
-run with the same source bytes reuses them byte-for-byte while refreshing literature separately.
-An aligned same-contract rewording is recorded as a cosmetic paraphrase without replacing those
-bytes. Contract drift fails closed; use
+contract, and compiled prompt in `target-registry.json`. On a later run, an unchanged normalized
+source hash is the deliberately cheap deterministic sanity check: MATEK treats the graph entry as
+authoritative and rematerializes its statement, contract, and prompt byte-for-byte while allowing
+run-local literature evidence to refresh. A fresh compiler response may still refresh source and
+literature information, but its stochastic wording and JSON layout are not compared with or
+allowed to replace the canonical theorem contract. If the user-authored problem changes, MATEK
+does not attempt semantic equivalence or migrate silently; use
 `matek run problem.md --migrate-target "reason"` only for an intentional versioned migration.
 MATEK asks for confirmation unless `--yes` is supplied and marks affected proof evidence stale.
 The reason and authorization persist through resume and feed the durable target-migration event;
@@ -645,6 +650,10 @@ matek graph open -g problem
 The graph commands omit `-g` safely when exactly one graph exists. If several exist, selection is
 required. `matek graph init NAME` can create an empty named graph for later explicit reuse;
 ordinary `matek init` leaves graph creation to the first problem run.
+
+Every completed report records the canonical-target disposition (`created`, `reused`, or
+`migrated`), stable target ID, and contract SHA-256. This makes repeat-run reuse visible without
+requiring inspection of the graph transaction files.
 
 Graph revision storage is content-addressed: unchanged node and edge records are shared across
 small delta manifests, with full checkpoints every 64 revisions by default for bounded replay.
@@ -973,6 +982,11 @@ re-runs frozen deterministic checks natively.
   replayed from the run-local model journal and deterministically rechecked rather than purchased
   again. Use `--force-stage prompt_compilation` only when you intentionally want a fresh bounded
   prompt-repair generation.
+- **Repeat run reports a canonical-contract change although `problem.md` is unchanged:** version
+  0.6.0 and later select the frozen target by normalized source hash before considering fresh
+  compiler wording. Upgrade MATEK and run `matek resume RUN_ID`; the saved compiler work can be
+  replayed without replacing the graph contract. Use `--migrate-target` only when the user-authored
+  problem was intentionally edited.
 - **Live search unavailable:** literature-support claims are quarantined or qualified so research
   can continue, but target identification may pause and final citation/bibliography gates remain
   strict. Restore Codex search or network access, then resume any missing source audits. To
@@ -1019,6 +1033,13 @@ ruff format --check .
 mypy src
 pytest -q
 python scripts/verify_project.py
+```
+
+The default command runs fewer than 500 focused scenarios. Before a pull request or release, run
+the slower comprehensive workflow banks as well by overriding the default marker filter:
+
+```bash
+pytest -q -o addopts=-ra
 ```
 
 Live smoke tests require explicit opt-in and may consume Codex allowance or API funds:

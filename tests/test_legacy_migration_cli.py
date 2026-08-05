@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
 
 from matek_theorem_agent.cli import app
@@ -240,10 +241,11 @@ def test_migrate_legacy_help_describes_safe_plan_and_apply_modes() -> None:
     )
 
     assert result.exit_code == 0
-    assert "explicitly apply one reviewed" in result.output
-    assert "--dry-run" in result.output
-    assert "read-only plan" in result.output
-    assert "--apply-plan" in result.output
-    assert "--yes" in result.output
-    assert "--target-claim-id" in result.output
-    assert "--output" in result.output
+    help_text = Text.from_ansi(result.output).plain
+    assert "explicitly apply one reviewed" in help_text
+    assert "--dry-run" in help_text
+    assert "read-only plan" in help_text
+    assert "--apply-plan" in help_text
+    assert "--yes" in help_text
+    assert "--target-claim-id" in help_text
+    assert "--output" in help_text
