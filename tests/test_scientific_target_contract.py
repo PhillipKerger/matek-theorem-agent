@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from matek_theorem_agent.scientific import TargetClauseCategory, validate_target_contract
+from matek_theorem_agent.scientific import (
+    TargetClauseCategory,
+    TargetPolarity,
+    classify_requested_polarity,
+    validate_target_contract,
+)
 
 
 @pytest.mark.parametrize(
@@ -259,3 +264,111 @@ def test_long_prose_conclusion_still_blocks_reversed_comparison() -> None:
 
     assert alignment.passed is False
     assert "reversed comparison direction" in " ".join(alignment.blocking_issues)
+
+
+# --- Structured polarity alignment (P0 reliability fix) ---------------------------------
+
+
+_INCIDENT_POLARITY_CLAUSE = (
+    "The requested outcome is an affirmative proof and algorithm. A survey, a "
+    "restricted-family barrier theorem, a weaker variant, or a counterexample to a "
+    "restricted algorithm class does not satisfy it."
+)
+_INCIDENT_STATEMENT = (
+    "Affirmatively prove the following exact theorem. There exist one real universal "
+    "constant C and one randomized online algorithm ALG such that, for every finite matroid, "
+    "the expected weight of ALG is at least OPT/C. The requested polarity is an affirmative "
+    "proof and algorithm, not a survey, restricted-family barrier, or weaker variant. A "
+    "counterexample to a restricted algorithm class does not resolve the target."
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("prove", TargetPolarity.AFFIRMATIVE_PROOF),
+        ("Affirmatively prove the following exact theorem.", TargetPolarity.AFFIRMATIVE_PROOF),
+        (_INCIDENT_POLARITY_CLAUSE, TargetPolarity.AFFIRMATIVE_PROOF),
+        (_INCIDENT_STATEMENT, TargetPolarity.AFFIRMATIVE_PROOF),
+        ("affirmative_proof", TargetPolarity.AFFIRMATIVE_PROOF),
+        ("Disprove the stated conjecture.", TargetPolarity.DISPROOF),
+        ("refute the conjecture by a counterexample", TargetPolarity.DISPROOF),
+        ("disproof", TargetPolarity.DISPROOF),
+        ("Prove or disprove the conjecture.", TargetPolarity.INVESTIGATION),
+        ("Classify all finite simple groups with the property.", TargetPolarity.CLASSIFICATION),
+        ("Construct an explicit family of expanders.", TargetPolarity.CONSTRUCTION),
+        (
+            "Prove the theorem; a counterexample to an intermediate lemma is only progress.",
+            TargetPolarity.AFFIRMATIVE_PROOF,
+        ),
+        ("The remaining obstruction is unclear.", TargetPolarity.AMBIGUOUS),
+    ],
+)
+def test_classify_requested_polarity_uses_leading_directive(
+    text: str,
+    expected: TargetPolarity,
+) -> None:
+    assert classify_requested_polarity(text) is expected
+
+
+def test_incident_affirmative_polarity_passes_despite_excluded_counterexample() -> None:
+    alignment = validate_target_contract(
+        _INCIDENT_STATEMENT,
+        {"polarity": _INCIDENT_POLARITY_CLAUSE},
+    )
+
+    assert alignment.passed is True
+    assert alignment.blocking_issues == []
+    assert alignment.polarity is not None
+    assert alignment.polarity.contract_polarity is TargetPolarity.AFFIRMATIVE_PROOF
+    assert alignment.polarity.statement_polarity is TargetPolarity.AFFIRMATIVE_PROOF
+    assert alignment.polarity.material_contradiction is False
+    assert alignment.polarity.gate == "target_polarity_alignment"
+
+
+@pytest.mark.parametrize(
+    "clause_value",
+    [
+        "counterexample",
+        "A counterexample to a natural intermediate conjecture is an insufficient outcome.",
+        "The affirmative proof stands even if a formal barrier for a method family is disproved.",
+        "Prove the target; excluded outcomes include a refuted method family and a barrier.",
+    ],
+)
+def test_excluded_or_framework_disproof_words_alone_do_not_fail_polarity(
+    clause_value: str,
+) -> None:
+    alignment = validate_target_contract(
+        "Affirmatively prove the following exact theorem for every finite matroid.",
+        {"polarity": clause_value},
+    )
+
+    assert alignment.passed is True
+
+
+def test_explicit_structured_polarity_mismatch_still_blocks() -> None:
+    alignment = validate_target_contract(
+        "Disprove the stated conjecture by exhibiting a counterexample.",
+        {"polarity": "affirmative_proof"},
+    )
+
+    assert alignment.passed is False
+    assert "refute/disprove polarity" in " ".join(alignment.blocking_issues)
+    assert alignment.polarity is not None
+    assert alignment.polarity.material_contradiction is True
+    assert alignment.polarity.contract_polarity is TargetPolarity.AFFIRMATIVE_PROOF
+    assert alignment.polarity.statement_polarity is TargetPolarity.DISPROOF
+
+
+def test_non_material_polarity_uncertainty_warns_and_passes() -> None:
+    alignment = validate_target_contract(
+        "Construct an explicit algorithm achieving the guarantee.",
+        {"polarity": "Prove the guarantee holds."},
+    )
+
+    assert alignment.passed is True
+    assert alignment.warnings
+    assert alignment.polarity is not None
+    assert alignment.polarity.material_contradiction is False
+    assert alignment.polarity.contract_polarity is TargetPolarity.AFFIRMATIVE_PROOF
+    assert alignment.polarity.statement_polarity is TargetPolarity.CONSTRUCTION

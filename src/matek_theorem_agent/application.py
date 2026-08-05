@@ -426,6 +426,12 @@ class WorkflowRunner:
                 "immutable target no longer aligns with its canonical claim contract: "
                 + " ".join(alignment.blocking_issues)
             )
+        if alignment.warnings:
+            existing = state.metadata.get("prompt_validation_warnings")
+            merged = list(existing) if isinstance(existing, list) else []
+            state.metadata["prompt_validation_warnings"] = list(
+                dict.fromkeys([*merged, *alignment.warnings])
+            )
         if persist_prompt_artifacts:
             prompts_root = state.run_root / "prompts"
             atomic_write_json(
@@ -1995,7 +2001,18 @@ class WorkflowRunner:
                 "source_provenance_warnings": list(
                     dict.fromkeys([*source_warnings, *result.source_verification.warnings])
                 ),
-                "prompt_validation_warnings": result.prompt_validation.warnings,
+                "prompt_validation_warnings": list(
+                    dict.fromkeys(
+                        [
+                            *result.prompt_validation.warnings,
+                            *(
+                                result.target_alignment.warnings
+                                if result.target_alignment is not None
+                                else []
+                            ),
+                        ]
+                    )
+                ),
                 "prompt_validation_generation": result.prompt_validation.repair_generation,
             }
         )

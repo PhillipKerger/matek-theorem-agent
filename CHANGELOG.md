@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Made pre-research polarity alignment structured and local. Requested-outcome polarity is now a
+  compact structured value (`affirmative_proof`, `disproof`, `classification`, `construction`,
+  `investigation`, or `ambiguous`) derived only from the leading directive of the `polarity`
+  clause and the normalized statement. The validator no longer scans framework templates,
+  literature summaries, excluded-outcome enumerations, or audit vocabulary, so `counterexample`,
+  `disproof`, `refuted`, and `barrier` in intermediate or excluded contexts can never on their own
+  fail polarity. A hard stop fires only for an explicit affirmative-proof-versus-disproof mismatch;
+  non-material or ambiguous polarity wording records a `prompt_validation_warning`, reuses the
+  frozen canonical target, and continues to research without a manual resume. The structured
+  polarity decision (gate name, compared fields, decision rule, material flag, and root cause) is
+  persisted in `prompts/target_alignment.json` and surfaced in reports. Added a documented
+  pre-research gate inventory to `WORKFLOW_SPEC.md`.
+
 ## 0.6.0 — 2026-08-05
 
 - Added a deterministic graph-hygiene preflight for generated source metadata. Inconsistent

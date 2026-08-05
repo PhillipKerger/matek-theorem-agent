@@ -40,9 +40,12 @@ Requirements:
 - Give applicable contract clauses clear keys for `quantifiers`, `constants`, `additive_terms`,
   `domain`, `edge_cases`, `polarity`, and `conclusion`. Preserve all quantified variables,
   constants and additive terms (for example `+ beta`), deterministic versus randomized
-  qualifiers, finite versus arbitrary domains, exceptional cases, and prove-versus-refute
-  posture. If the input does not settle one of these material choices, request clarification
-  instead of strengthening or weakening the theorem.
+  qualifiers, finite versus arbitrary domains, and exceptional cases. Set the `polarity` clause to
+  a single compact structured value — `affirmative_proof`, `disproof`, `classification`,
+  `construction`, or `investigation` — that names the requested outcome. State excluded or
+  insufficient outcomes elsewhere (for example in `edge_cases`), never inside `polarity`. If the
+  input does not settle one of these material choices, request clarification instead of
+  strengthening or weakening the theorem.
 - Use public web search aggressively to verify definitions, known results, primary sources,
   exact bottlenecks, and bibliographic metadata.
 - Classify the exact target's relationship to existing literature as `unknown`,

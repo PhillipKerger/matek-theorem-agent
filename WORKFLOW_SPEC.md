@@ -45,11 +45,41 @@ verified sources and an exact statement-and-hypothesis comparison.
 
 Before admission, deterministic target alignment interprets each clause from its explicit key and
 records a hash-bound check. It blocks only an explicit high-confidence contradiction: reversed
-symbolic quantifiers or polarity, opposing qualifiers, a changed structured numeric value, or
-drift in a compact formal comparison. Missing token overlap in generated prose is nonblocking;
-negative examples such as “no `+β` is permitted” are never converted into positive requirements.
-This guard is deliberately narrow because the same frontier compiler authors the statement and
-contract. Later research, manuscript, and Lean gates still audit the actual mathematical claim.
+symbolic quantifiers, a changed structured numeric value, opposing qualifiers, drift in a compact
+formal comparison, or a material polarity contradiction. Polarity is compared as a compact
+structured value (`affirmative_proof`, `disproof`, `classification`, `construction`,
+`investigation`, or `ambiguous`) derived only from the leading requested-outcome directive of the
+`polarity` clause and the normalized statement. It never scans framework templates, literature
+summaries, excluded-outcome enumerations, or audit vocabulary, so overloaded words such as
+`counterexample`, `refuted`, `disproof`, and `barrier` can never on their own flip an affirmative
+request into a disproof. A hard stop fires only for an affirmative-proof-versus-disproof mismatch.
+Missing token overlap in generated prose is nonblocking; negative examples such as “no `+β` is
+permitted” are never converted into positive requirements; and non-material or ambiguous polarity
+wording produces a recorded `prompt_validation_warning`, reuses the frozen canonical target, and
+continues to research without a manual resume. This guard is deliberately narrow because the same
+frontier compiler authors the statement and contract. Later research, manuscript, and Lean gates
+still audit the actual mathematical claim.
+
+### Pre-research gate inventory
+
+Every hard gate that can stop a run before worker research is enumerated below with its input,
+stop condition, deterministic alternative, and behavior on uncertainty. The owner for all of
+these is the prompt-compilation/target-binding stage in `application.py` and `stages/compile_prompt.py`.
+
+| Gate | Input | Hard stop only when | On uncertainty |
+| --- | --- | --- | --- |
+| Canonical target binding | normalized source hash, frozen registry target | user input changed and requires an explicit migration | reuse the stored frozen target |
+| Target alignment (quantifier/qualifier/numeric/comparison) | normalized statement, structured contract clauses | an explicit structured material contradiction | pass; record a warning |
+| Target alignment (polarity) | compact structured polarity of the `polarity` clause and statement | contract `affirmative_proof` versus statement `disproof` (or the reverse) | warn, reuse canonical target, continue |
+| Source validation | source ledger, active proof dependencies | an active proof dependency truly requires a source that cannot be resolved | auto-repair once, then warn and continue |
+| Graph schema/index validation | knowledge-graph store and index | corruption that local repair/rebuild cannot fix | repair/rebuild locally, retry once |
+| Provider response validation | structured model output | schema-invalid output after a bounded regenerate | bounded regenerate/retry |
+| Literature/provenance lookup | source verification report | never for research scheduling | warn; never imply a mathematical failure |
+
+The alignment polarity decision (gate name, compared structured fields, decision rule, material
+flag, and root-cause detail) is persisted in `prompts/target_alignment.json` and surfaced through
+`matek status` and the final report's prompt-validation warnings.
+
 
 Every source states whether it identifies the target or supports a literature claim. Failure to
 verify target-identification evidence pauses for clarification. Failure to resolve literature-only

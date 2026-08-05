@@ -399,6 +399,29 @@ class TargetClauseCategory(StrEnum):
     OTHER = "other"
 
 
+class TargetPolarity(StrEnum):
+    """Structured requested-outcome value used for local polarity comparison."""
+
+    AFFIRMATIVE_PROOF = "affirmative_proof"
+    DISPROOF = "disproof"
+    CLASSIFICATION = "classification"
+    CONSTRUCTION = "construction"
+    INVESTIGATION = "investigation"
+    AMBIGUOUS = "ambiguous"
+
+
+class PolarityDecision(_ScientificModel):
+    """Auditable record of the local, structured polarity-alignment decision."""
+
+    gate: Literal["target_polarity_alignment"] = "target_polarity_alignment"
+    contract_clause_key: str
+    contract_polarity: TargetPolarity
+    statement_polarity: TargetPolarity
+    decision_rule: str
+    material_contradiction: bool
+    detail: str
+
+
 class TargetClauseCheck(_ScientificModel):
     key: str
     category: TargetClauseCategory
@@ -412,6 +435,8 @@ class TargetContractAlignment(_ScientificModel):
     passed: bool
     checks: list[TargetClauseCheck]
     blocking_issues: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    polarity: PolarityDecision | None = None
 
 
 _QUANTIFIER_KEYS = ("quantifier", "uniformity")
@@ -760,6 +785,140 @@ def _is_compact_formal_clause(fragment: str) -> bool:
     )
 
 
+# Ordered structured requested-outcome signals. Detection inspects only the leading
+# requested-outcome sentence of a compact ``polarity`` clause or normalized statement, never
+# broad framework prose, literature summaries, excluded-outcome enumerations, or audit
+# vocabulary. Overloaded words such as ``counterexample``, ``refuted``, and ``barrier`` are
+# intentionally absent: they routinely and legitimately describe intermediate lemmas and
+# excluded outcomes inside an affirmative proof request and must never, on their own, imply a
+# disproof polarity.
+_POLARITY_SIGNALS: tuple[tuple[TargetPolarity, tuple[str, ...]], ...] = (
+    (TargetPolarity.DISPROOF, ("disprove", "refute", "disproof")),
+    (
+        TargetPolarity.AFFIRMATIVE_PROOF,
+        (
+            "affirmatively prove",
+            "affirmative proof",
+            "prove",
+            "proof of",
+            "establish",
+            "demonstrate",
+            "show that",
+            "verify that",
+            "confirm that",
+        ),
+    ),
+    (
+        TargetPolarity.CLASSIFICATION,
+        ("classify", "characterize", "determine whether", "decide whether"),
+    ),
+    (TargetPolarity.CONSTRUCTION, ("construct", "exhibit", "design")),
+    (TargetPolarity.INVESTIGATION, ("investigate", "study", "explore")),
+)
+_POLARITY_EXCLUSION_MARKERS = (
+    "not ",
+    "non ",
+    "rather than",
+    "instead of",
+    "without",
+    "excluding",
+    "does not",
+    "do not",
+    "cannot",
+    "can not",
+    "neither",
+    "nor ",
+    "fails to",
+)
+_OPEN_QUESTION_PATTERNS = (
+    re.compile(r"\b(?:prove|establish)\b[^.]{0,24}\bor\b[^.]{0,24}\b(?:disprove|refute)\b"),
+    re.compile(r"\b(?:disprove|refute)\b[^.]{0,24}\bor\b[^.]{0,24}\b(?:prove|establish)\b"),
+)
+
+
+def classify_requested_polarity(text: str) -> TargetPolarity:
+    """Map an explicit requested outcome to a compact structured polarity value.
+
+    Only the explicit requested-outcome sentence is examined, and only the first
+    non-excluded directive within it decides the polarity. This deliberately ignores
+    excluded/insufficient outcomes, negated clauses, and overloaded audit vocabulary so that
+    stochastic framework prose cannot flip an affirmative request into a disproof request.
+    Ambiguous prose returns :attr:`TargetPolarity.AMBIGUOUS` rather than guessing.
+    """
+
+    plain = _plain_math(text)
+    if not plain:
+        return TargetPolarity.AMBIGUOUS
+    token = plain.replace(" ", "_")
+    for polarity in TargetPolarity:
+        if polarity is not TargetPolarity.AMBIGUOUS and token == polarity.value:
+            return polarity
+    first_sentence = re.split(r"(?<=[.!?])\s", plain)[0]
+    if any(pattern.search(first_sentence) for pattern in _OPEN_QUESTION_PATTERNS):
+        return TargetPolarity.INVESTIGATION
+    best_position: int | None = None
+    best_polarity = TargetPolarity.AMBIGUOUS
+    for polarity, signals in _POLARITY_SIGNALS:
+        for signal in signals:
+            for match in re.finditer(rf"\b{re.escape(signal)}\b", first_sentence):
+                window = first_sentence[max(0, match.start() - 40) : match.start()]
+                if any(marker in window for marker in _POLARITY_EXCLUSION_MARKERS):
+                    continue
+                if best_position is None or match.start() < best_position:
+                    best_position = match.start()
+                    best_polarity = polarity
+    return best_polarity
+
+
+def _evaluate_polarity(
+    normalized_statement: str,
+    claim_contract: dict[str, str],
+    polarity_clause_key: str,
+) -> PolarityDecision:
+    """Compare structured contract and statement polarity for one polarity clause."""
+
+    contract_polarity = classify_requested_polarity(claim_contract[polarity_clause_key])
+    statement_polarity = classify_requested_polarity(normalized_statement)
+    material = {contract_polarity, statement_polarity} == {
+        TargetPolarity.AFFIRMATIVE_PROOF,
+        TargetPolarity.DISPROOF,
+    }
+    if material:
+        detail = (
+            f"Structured polarity mismatch: contract requests {contract_polarity.value}, "
+            f"statement requests {statement_polarity.value} (refute/disprove polarity)."
+        )
+        rule = "material contradiction: affirmative_proof versus disproof blocks research"
+    elif (
+        contract_polarity is TargetPolarity.AMBIGUOUS
+        or statement_polarity is TargetPolarity.AMBIGUOUS
+    ):
+        detail = (
+            "Requested-outcome polarity is ambiguous from prose "
+            f"(contract={contract_polarity.value}, statement={statement_polarity.value}); "
+            "reusing the canonical target and continuing."
+        )
+        rule = "ambiguous prose polarity: warn and reuse canonical target"
+    elif contract_polarity != statement_polarity:
+        detail = (
+            "Non-material polarity wording difference "
+            f"(contract={contract_polarity.value}, statement={statement_polarity.value}); "
+            "reusing the canonical target and continuing."
+        )
+        rule = "non-material polarity difference: warn and continue"
+    else:
+        detail = f"Structured polarity aligned: {contract_polarity.value}."
+        rule = "structured polarity values match"
+    return PolarityDecision(
+        contract_clause_key=polarity_clause_key,
+        contract_polarity=contract_polarity,
+        statement_polarity=statement_polarity,
+        decision_rule=rule,
+        material_contradiction=material,
+        detail=detail,
+    )
+
+
 def validate_target_contract(
     normalized_statement: str,
     claim_contract: dict[str, str],
@@ -778,28 +937,42 @@ def validate_target_contract(
     )
     checks: list[TargetClauseCheck] = []
     issues: list[str] = []
+    warnings: list[str] = []
+
+    polarity_clause_key: str | None = None
+    if "polarity" in claim_contract:
+        polarity_clause_key = "polarity"
+    else:
+        for key, raw_value in claim_contract.items():
+            if _clause_category(key, raw_value) is TargetClauseCategory.POLARITY:
+                polarity_clause_key = key
+                break
+    polarity_decision = (
+        _evaluate_polarity(normalized_statement, claim_contract, polarity_clause_key)
+        if polarity_clause_key is not None
+        else None
+    )
 
     for key, raw_value in claim_contract.items():
-        value = _plain_math(raw_value)
         fragments = _clause_fragments(raw_value, clause_key=key)
         category = _clause_category(key, raw_value)
         conflicts: list[str] = []
+        clause_warnings: list[str] = []
 
         for fragment in fragments:
             conflicts.extend(_quantifier_conflicts(normalized_statement, fragment))
         conflicts.extend(_qualifier_conflicts(statement, fragments))
 
-        if category is TargetClauseCategory.POLARITY:
-            requested_refutation = bool(re.search(r"\b(?:refute|disprove|counterexample)\b", value))
-            requested_proof = bool(re.search(r"\b(?:prove|establish|show)\b", value))
-            statement_refutation = bool(
-                re.search(r"\b(?:refute|disprove|counterexample)\b", statement)
-            )
-            if requested_refutation and not statement_refutation:
-                if re.search(r"\b(?:prove|establish|show)\b", statement):
-                    conflicts.append("refute/disprove polarity")
-            if requested_proof and statement_refutation:
-                conflicts.append("prove polarity")
+        is_polarity_clause = polarity_decision is not None and key == polarity_clause_key
+        if is_polarity_clause:
+            assert polarity_decision is not None
+            if polarity_decision.material_contradiction:
+                conflicts.append("refute/disprove polarity")
+            elif (
+                polarity_decision.contract_polarity != polarity_decision.statement_polarity
+                or polarity_decision.contract_polarity is TargetPolarity.AMBIGUOUS
+            ):
+                clause_warnings.append(polarity_decision.detail)
 
         for fragment in fragments:
             fragment_value = _plain_math(fragment)
@@ -818,14 +991,17 @@ def validate_target_contract(
 
         conflicts = list(dict.fromkeys(conflicts))
         passed = not conflicts
-        detail = (
-            "No high-confidence contradiction detected."
-            if passed
-            else "Explicit contradiction(s): " + ", ".join(conflicts)
-        )
+        if is_polarity_clause and passed:
+            detail = polarity_decision.detail  # type: ignore[union-attr]
+        elif passed:
+            detail = "No high-confidence contradiction detected."
+        else:
+            detail = "Explicit contradiction(s): " + ", ".join(conflicts)
         checks.append(TargetClauseCheck(key=key, category=category, passed=passed, detail=detail))
         if not passed:
             issues.append(f"Claim-contract clause {key!r} is not aligned: {detail}")
+        for warning in clause_warnings:
+            warnings.append(f"Claim-contract clause {key!r} polarity: {warning}")
 
     return TargetContractAlignment(
         statement_sha256=sha256(normalized_statement.encode("utf-8")).hexdigest(),
@@ -833,11 +1009,14 @@ def validate_target_contract(
         passed=not issues,
         checks=checks,
         blocking_issues=issues,
+        warnings=warnings,
+        polarity=polarity_decision,
     )
 
 
 __all__ = [
     "BranchOutcome",
+    "PolarityDecision",
     "ScientificArtifactDeclaration",
     "ScientificObligationDeclaration",
     "ScientificResult",
@@ -847,6 +1026,8 @@ __all__ = [
     "TargetClauseCategory",
     "TargetClauseCheck",
     "TargetContractAlignment",
+    "TargetPolarity",
+    "classify_requested_polarity",
     "exact_statement_fingerprint",
     "is_explicit_definition_declaration",
     "normalize_exact_statement",
