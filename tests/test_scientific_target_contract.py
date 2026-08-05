@@ -8,32 +8,27 @@ from matek_theorem_agent.scientific import TargetClauseCategory, validate_target
 
 
 @pytest.mark.parametrize(
-    ("contract", "expected_category", "missing_markers"),
+    ("contract", "expected_category"),
     [
-        ({"domain": "planar graphs"}, TargetClauseCategory.DOMAIN, {"planar", "graph"}),
+        ({"domain": "planar graphs"}, TargetClauseCategory.DOMAIN),
         (
             {"edge_cases": "including empty instances"},
             TargetClauseCategory.EDGE_CASES,
-            {"empty", "instance"},
         ),
     ],
 )
-def test_generic_statement_cannot_satisfy_specific_domain_or_edge_case(
+def test_missing_domain_or_edge_prose_is_not_treated_as_a_contradiction(
     contract: dict[str, str],
     expected_category: TargetClauseCategory,
-    missing_markers: set[str],
 ) -> None:
     alignment = validate_target_contract("Prove P for every object.", contract)
 
-    assert alignment.passed is False
+    assert alignment.passed is True
     assert len(alignment.checks) == 1
     check = alignment.checks[0]
     assert check.category is expected_category
-    assert check.passed is False
-    reported_markers = set(
-        check.detail.removeprefix("Missing or incompatible material marker(s): ").split(", ")
-    )
-    assert missing_markers.issubset(reported_markers)
+    assert check.passed is True
+    assert check.detail == "No high-confidence contradiction detected."
 
 
 def test_structured_and_list_clauses_align_with_visible_material_and_numeric_constant() -> None:
@@ -56,25 +51,16 @@ def test_structured_and_list_clauses_align_with_visible_material_and_numeric_con
 
 
 @pytest.mark.parametrize(
-    ("statement", "missing_marker"),
+    "statement",
     [
-        (
-            "For every connected graph, including the empty graph and one-vertex graphs, "
-            "P holds with factor 3.",
-            "planar",
-        ),
-        (
-            "For every connected planar graph and every one-vertex graph, P holds with factor 3.",
-            "empty",
-        ),
-        (
-            "For every connected planar graph, including the empty graph and one-vertex graphs, "
-            "P holds with factor 2.",
-            "3",
-        ),
+        "For every connected graph, including the empty graph and one-vertex graphs, "
+        "P holds with factor 3.",
+        "For every connected planar graph and every one-vertex graph, P holds with factor 3.",
     ],
 )
-def test_structured_clause_omissions_fail_closed(statement: str, missing_marker: str) -> None:
+def test_structured_prose_omissions_do_not_block_without_an_explicit_conflict(
+    statement: str,
+) -> None:
     contract = {
         "domain": json.dumps(["connected planar graphs"]),
         "edge_cases": json.dumps({"included": ["empty graphs", "one vertex graphs"]}),
@@ -83,8 +69,20 @@ def test_structured_clause_omissions_fail_closed(statement: str, missing_marker:
 
     alignment = validate_target_contract(statement, contract)
 
+    assert alignment.passed is True
+
+
+def test_structured_numeric_value_still_blocks_an_explicit_change() -> None:
+    alignment = validate_target_contract(
+        (
+            "For every connected planar graph, including the empty graph and one-vertex graphs, "
+            "P holds with factor 2."
+        ),
+        {"constants": json.dumps({"factor": 3})},
+    )
+
     assert alignment.passed is False
-    assert missing_marker in " ".join(alignment.blocking_issues)
+    assert "numeric value 3" in " ".join(alignment.blocking_issues)
 
 
 def test_existing_quantitative_domain_contract_remains_aligned() -> None:
@@ -112,7 +110,7 @@ def test_comparison_clause_rejects_an_extra_material_rhs_term() -> None:
     )
 
     assert alignment.passed is False
-    assert "ordered comparison sides" in " ".join(alignment.blocking_issues)
+    assert "compact formal comparison" in " ".join(alignment.blocking_issues)
 
 
 @pytest.mark.parametrize(
@@ -208,8 +206,8 @@ def test_matroid_secretary_paraphrase_does_not_fail_on_explanatory_prose() -> No
             "and every other instance parameter."
         ),
         "additive_terms": (
-            "No additive term, asymptotic error, exceptional loss, or failure-probability "
-            "allowance "
+            "No additive term, including no -β or +β, asymptotic error, exceptional loss, or "
+            "failure-probability allowance "
             "is permitted; the guarantee is purely multiplicative: E[w(I_ALG)]≥OPT(M,w)/C."
         ),
         "domain": (
@@ -260,4 +258,4 @@ def test_long_prose_conclusion_still_blocks_reversed_comparison() -> None:
     )
 
     assert alignment.passed is False
-    assert "ordered comparison direction" in " ".join(alignment.blocking_issues)
+    assert "reversed comparison direction" in " ".join(alignment.blocking_issues)

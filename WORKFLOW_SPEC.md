@@ -43,12 +43,13 @@ repair. An unresolved marker blocks the workflow only in the exact target or suc
 an optional sentence is removed with a recorded warning. Partial/full resolution claims require
 verified sources and an exact statement-and-hypothesis comparison.
 
-Before admission, deterministic target alignment interprets each clause from its explicit key.
-Short formal clauses and high-confidence quantifier, qualifier, number, additive-term, and
-comparison signals fail closed on drift. Long explanatory domain and edge-case clauses require
-substantial visible material coverage rather than literal inclusion of every prose token. This
-prevents semantic regressions without treating paraphrases such as “entire matroid” versus
-“complete matroid” or explanatory verbs such as “covered” as new theorem hypotheses.
+Before admission, deterministic target alignment interprets each clause from its explicit key and
+records a hash-bound check. It blocks only an explicit high-confidence contradiction: reversed
+symbolic quantifiers or polarity, opposing qualifiers, a changed structured numeric value, or
+drift in a compact formal comparison. Missing token overlap in generated prose is nonblocking;
+negative examples such as “no `+β` is permitted” are never converted into positive requirements.
+This guard is deliberately narrow because the same frontier compiler authors the statement and
+contract. Later research, manuscript, and Lean gates still audit the actual mathematical claim.
 
 Every source states whether it identifies the target or supports a literature claim. Failure to
 verify target-identification evidence pauses for clarification. Failure to resolve literature-only

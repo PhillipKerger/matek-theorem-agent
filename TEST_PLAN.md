@@ -24,9 +24,9 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 - Frontier selection, graph-scoped task creation, bounded context slices, manuscript mappings,
   and exact-version Lean records.
 - Source-hash target registry create/reuse, byte-stable same-source target/contract/prompt reuse,
-  cosmetic same-contract paraphrase recording, clause-level quantifier/domain/additive-term/
-  polarity alignment failures, explicit versioned migration and invalidation, registry integrity
-  rejection, and `--migrate-target` confirmation.
+  cosmetic same-contract paraphrase recording, explicit quantifier/qualifier/polarity/formal-
+  comparison contradictions, nonblocking prose omissions, versioned migration and invalidation,
+  registry integrity rejection, and `--migrate-target` confirmation.
 - Archive-to-ledger projection, exact-statement claim aliases, AND-premise/OR-derivation trust,
   typed obligation logical versions covering exact statement, conclusion, quantifiers, hypotheses,
   dependency/target claim IDs, scope, notation version, and falsification evidence; assumption-
@@ -107,10 +107,11 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   result provenance.
 - An unavailable literature-support arXiv source is quarantined and its claims are downgraded while
   research still starts; target-identification evidence remains fail closed.
-- Target-contract alignment accepts the persisted matroid-secretary paraphrase with long
-  explanatory clauses and malformed transport Unicode escapes, while still rejecting reversed
-  quantifiers/inequalities, randomized-versus-deterministic and finite-versus-arbitrary drift,
-  changed numeric constants, missing additive terms, and short domain/edge omissions.
+- Target-contract alignment accepts the persisted matroid-secretary paraphrase, including literal
+  forbidden examples such as “no `+β`,” long explanatory clauses, and malformed transport Unicode
+  escapes. It still rejects explicit reversed symbolic quantifiers/inequalities, opposing
+  randomized/deterministic qualifiers, structured numeric changes, and compact formal-expression
+  drift; missing domain or edge-case prose alone is nonblocking.
 - Event-driven research configuration defaults and migration of legacy
   `maximum_assignments_per_round`/`maximum_rounds` and `--max-rounds` inputs to
   `max_pending_assignments`/`max_coordinator_decisions` without reintroducing barriers.

@@ -182,11 +182,10 @@ manuscript source, bibliography, and final verification outputs.
 
 `prompts/target_alignment.json` binds the compiled normalized statement and the canonical sorted
 claim contract to separate SHA-256 digests. It records every deterministic clause check and its
-blocking issues. A failed alignment is preserved for diagnosis and blocks research admission.
-Passing alignment certifies only this conservative contract comparison, not mathematical truth.
-The checker treats short formal clauses and high-confidence contradictions as exact while using
-substantial token coverage for long explanatory domain/edge prose; missing incidental prose words
-are not blocking mathematical discrepancies.
+blocking issues. An explicit contradiction is preserved for diagnosis and blocks research
+admission. Passing alignment means only that this narrow guard found no high-confidence conflict;
+it does not certify semantic equivalence or mathematical truth. Missing lexical overlap in
+generated prose is nonblocking, and negated examples are not treated as positive requirements.
 `target-registry.json` is keyed by the normalized source-problem SHA-256 and integrity-binds the
 canonical exact statement, contract JSON, compiled prompt, target node, version, compatibility
 observations, and explicit migrations. Same-source reruns re-materialize the canonical statement,

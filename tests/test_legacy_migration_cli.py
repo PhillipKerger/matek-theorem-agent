@@ -233,7 +233,11 @@ def test_migrate_legacy_apply_requires_confirmation_and_is_retry_idempotent(
 
 
 def test_migrate_legacy_help_describes_safe_plan_and_apply_modes() -> None:
-    result = CliRunner().invoke(app, ["graph", "migrate-legacy", "--help"])
+    result = CliRunner().invoke(
+        app,
+        ["graph", "migrate-legacy", "--help"],
+        terminal_width=160,
+    )
 
     assert result.exit_code == 0
     assert "explicitly apply one reviewed" in result.output

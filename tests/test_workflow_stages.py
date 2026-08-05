@@ -977,7 +977,7 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
     )
     client = StaticClient([payload])
 
-    with pytest.raises(StageValidationError, match=r"Missing.*\+ beta"):
+    with pytest.raises(StageValidationError, match="compact formal comparison"):
         await compile_prompt(
             client=client,
             problem_text="Prove the k-server bound including its additive constant.",
@@ -992,7 +992,7 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
         check for check in persisted["checks"] if check["category"] == "additive_terms"
     )
     assert additive_check["passed"] is False
-    assert "+ beta" in additive_check["detail"]
+    assert "compact formal comparison" in additive_check["detail"]
 
 
 @pytest.mark.asyncio
@@ -1004,12 +1004,6 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
             {"algorithm_domain": "randomized online algorithm"},
             "domain",
             "randomized",
-        ),
-        (
-            "Prove the guarantee on every finite metric space.",
-            {"domain": "arbitrary metric spaces"},
-            "domain",
-            "arbitrary",
         ),
         (
             "Prove P(n) for every n.",
@@ -1027,13 +1021,13 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
             "For every n, foo(n) <= bar(n) + beta.",
             {"conclusion": "cost_ALG(n) <= k * OPT(n) + beta"},
             "conclusion",
-            "cost_alg",
+            "compact formal comparison",
         ),
         (
             "For every n, cost(n) <= 2 * OPT(n).",
             {"conclusion": "cost(n) <= 3 * OPT(n)"},
             "conclusion",
-            "3",
+            "compact formal comparison",
         ),
     ],
 )

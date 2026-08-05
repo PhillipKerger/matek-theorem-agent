@@ -434,6 +434,14 @@ _MATERIAL_QUALIFIERS = (
     "metric",
     "probability",
 )
+_OPPOSING_QUALIFIERS = {
+    "deterministic": "randomized",
+    "finite": "infinite",
+    "infinite": "finite",
+    "nonuniform": "uniform",
+    "randomized": "deterministic",
+    "uniform": "nonuniform",
+}
 _STRUCTURAL_CLAUSE_KEYS = {
     "clause",
     "clauses",
@@ -451,41 +459,6 @@ _STRUCTURAL_CLAUSE_KEYS = {
     "value",
     "values",
 }
-_MATERIAL_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "as",
-    "at",
-    "be",
-    "by",
-    "case",
-    "cases",
-    "clause",
-    "clauses",
-    "consist",
-    "consists",
-    "domain",
-    "for",
-    "from",
-    "in",
-    "include",
-    "included",
-    "includes",
-    "including",
-    "is",
-    "of",
-    "on",
-    "or",
-    "over",
-    "such",
-    "that",
-    "the",
-    "to",
-    "under",
-    "with",
-}
-_JSON_LITERAL_TOKENS = {"false", "null", "true"}
 
 
 def _plain_math(value: str) -> str:
@@ -566,39 +539,6 @@ def _clause_fragments(value: str, *, clause_key: str | None = None) -> list[str]
 
     visit(decoded)
     return list(dict.fromkeys(fragments))
-
-
-def _canonical_material_token(token: str) -> str:
-    irregular = {
-        "axes": "axis",
-        "indices": "index",
-        "matrices": "matrix",
-        "vertices": "vertex",
-    }
-    if token in irregular:
-        return irregular[token]
-    if token in {"all", "any", "each", "every"}:
-        return "forall"
-    if len(token) > 4 and token.endswith("ies"):
-        return f"{token[:-3]}y"
-    if len(token) > 4 and token.endswith(("ches", "shes", "sses", "xes", "zes")):
-        return token[:-2]
-    if len(token) > 3 and token.endswith("s") and not token.endswith(("is", "ss", "us")):
-        return token[:-1]
-    return token
-
-
-def _material_tokens(values: list[str], *, discard_scaffolding: bool) -> list[str]:
-    tokens: list[str] = []
-    for value in values:
-        plain = _plain_math(value).replace("_", " ")
-        for token in re.findall(r"[a-z\u03b1-\u03c9][a-z0-9_]*|\d+(?:\.\d+)?", plain):
-            if token in _JSON_LITERAL_TOKENS:
-                continue
-            if discard_scaffolding and token in _MATERIAL_STOPWORDS:
-                continue
-            tokens.append(_canonical_material_token(token))
-    return list(dict.fromkeys(tokens))
 
 
 def _clause_category(key: str, value: str) -> TargetClauseCategory:
@@ -695,45 +635,6 @@ def _has_quantifier(statement: str, kind: str, variable: str | None) -> bool:
     return bool(re.search(rf"\b{marker}\b", plain))
 
 
-def _additive_requirements(value: str) -> list[str]:
-    plain = _plain_math(value)
-    return list(dict.fromkeys(re.findall(r"\+\s*([a-z\u03b1-\u03c9][a-z0-9_]*)", plain)))
-
-
-def _symbol_requirements(value: str) -> list[str]:
-    plain = _plain_math(value)
-    ignored = {
-        "a",
-        "an",
-        "and",
-        "all",
-        "any",
-        "as",
-        "at",
-        "be",
-        "by",
-        "constant",
-        "exists",
-        "for",
-        "from",
-        "in",
-        "is",
-        "of",
-        "on",
-        "or",
-        "the",
-        "there",
-        "to",
-        "with",
-    }
-    symbols = re.findall(r"\b[a-z\u03b1-\u03c9][a-z0-9_]*\b", plain)
-    return [item for item in dict.fromkeys(symbols) if item not in ignored]
-
-
-def _number_requirements(value: str) -> list[str]:
-    return list(dict.fromkeys(re.findall(r"(?<![a-z_])\d+(?:\.\d+)?", _plain_math(value))))
-
-
 def _comparison_lexemes(value: str) -> list[str]:
     """Return the material syntax of one comparison side.
 
@@ -780,54 +681,29 @@ def _comparison_aligned(statement: str, clause: str) -> bool:
     return False
 
 
-def _comparison_directions_aligned(statement: str, clause: str) -> bool:
-    """Check each long-clause comparison at its expected left expression.
+def _comparison_direction_conflict(statement: str, clause: str) -> bool:
+    """Return true only for a visible reversal of the same comparison left side."""
 
-    Long generated conclusions may use a defined abbreviation on the right-hand
-    side, so exact RHS token identity is too strict. The direction must nevertheless
-    occur after the same visible left expression; an unrelated earlier inequality
-    cannot satisfy this check.
-    """
-
-    expected_matches = list(re.finditer(r"<=|>=|(?<![<>])=(?!=)|<|>", clause))
-    if not expected_matches:
-        return True
+    opposites = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
     statement_matches = list(re.finditer(r"<=|>=|(?<![<>])=(?!=)|<|>", statement))
-    for expected in expected_matches:
+    for expected in re.finditer(r"<=|>=|(?<![<>])=(?!=)|<|>", clause):
+        opposite = opposites.get(expected.group(0))
+        if opposite is None:
+            continue
         expected_left_text = re.split(
-            r"(?:[.;:]|\b(?:and|then)\b)",
-            clause[: expected.start()],
+            r"(?:[.;:]|\b(?:and|then|satisfies)\b)", clause[: expected.start()]
         )[-1]
         expected_left = _comparison_lexemes(expected_left_text)
         if not expected_left:
             continue
-        if not any(
-            candidate.group(0) == expected.group(0)
+        if any(
+            candidate.group(0) == opposite
             and _comparison_lexemes(statement[: candidate.start()])[-len(expected_left) :]
             == expected_left
             for candidate in statement_matches
         ):
-            return False
-    return True
-
-
-def _missing_long_clause_material(
-    requirements: list[str],
-    statement_material_tokens: set[str],
-) -> list[str]:
-    """Return blocking lexical gaps for a domain/edge clause.
-
-    Short clauses name compact material such as ``planar graphs`` or ``empty
-    instances`` and remain exact. Long generated prose mixes mathematical content
-    with explanatory verbs and harmless synonyms; require substantial visible
-    coverage instead of treating every prose token as a theorem symbol.
-    """
-
-    missing = [item for item in requirements if item not in statement_material_tokens]
-    if len(requirements) <= 4:
-        return missing
-    matched = len(requirements) - len(missing)
-    return missing if matched / len(requirements) < 0.65 else []
+            return True
+    return False
 
 
 def _qualifier_postures(fragments: list[str], qualifier: str) -> set[bool]:
@@ -846,21 +722,57 @@ def _qualifier_postures(fragments: list[str], qualifier: str) -> set[bool]:
     return postures
 
 
+def _quantifier_conflicts(statement: str, fragment: str) -> list[str]:
+    conflicts: list[str] = []
+    for kind, variable in _quantifier_requirements(fragment):
+        opposite = "forall" if kind == "exists" else "exists"
+        if not _has_quantifier(statement, kind, variable) and _has_quantifier(
+            statement, opposite, variable
+        ):
+            conflicts.append(f"{kind} {variable or ''}".strip())
+    return conflicts
+
+
+def _qualifier_conflicts(statement: str, fragments: list[str]) -> list[str]:
+    conflicts: list[str] = []
+    for qualifier in _MATERIAL_QUALIFIERS:
+        postures = _qualifier_postures(fragments, qualifier)
+        statement_has = bool(re.search(rf"\b{qualifier}\b", statement))
+        if postures == {False} and statement_has:
+            conflicts.append(f"not {qualifier}")
+            continue
+        opposite = _OPPOSING_QUALIFIERS.get(qualifier)
+        if (
+            postures == {True}
+            and opposite is not None
+            and not statement_has
+            and re.search(rf"\b{opposite}\b", statement)
+        ):
+            conflicts.append(f"{qualifier}, not {opposite}")
+    return conflicts
+
+
+def _is_compact_formal_clause(fragment: str) -> bool:
+    plain = _plain_math(fragment)
+    return (
+        bool(re.search(r"<=|>=|(?<![<>])=(?!=)|<|>", plain))
+        and len(_comparison_lexemes(plain)) <= 12
+    )
+
+
 def validate_target_contract(
     normalized_statement: str,
     claim_contract: dict[str, str],
 ) -> TargetContractAlignment:
-    """Check material contract clauses against the exact compiled statement.
+    """Reject explicit contradictions between a compiled statement and its contract.
 
-    The checker is intentionally conservative and transparent.  It catches logical-strength
-    regressions such as a lost ``+ beta`` term or a deterministic/randomized swap; it does
-    not claim that string matching proves semantic equivalence.
+    The prompt compiler authors both fields, so lexical absence is not evidence of drift:
+    equivalent mathematical prose routinely uses different words and abbreviations. This
+    deterministic guard therefore blocks only high-confidence conflicts and records every
+    clause for diagnosis. It does not attempt to prove semantic equivalence.
     """
 
     statement = _plain_math(normalized_statement)
-    statement_material_tokens = set(
-        _material_tokens([normalized_statement], discard_scaffolding=False)
-    )
     canonical_contract = "\n".join(
         f"{key}\0{value}" for key, value in sorted(claim_contract.items())
     )
@@ -871,28 +783,11 @@ def validate_target_contract(
         value = _plain_math(raw_value)
         fragments = _clause_fragments(raw_value, clause_key=key)
         category = _clause_category(key, raw_value)
-        missing: list[str] = []
+        conflicts: list[str] = []
 
-        # Material features are checked orthogonally. A clause such as a conclusion
-        # containing ``+ beta`` must not be reduced to an additive-term-only check.
         for fragment in fragments:
-            for kind, variable in _quantifier_requirements(fragment):
-                if not _has_quantifier(normalized_statement, kind, variable):
-                    missing.append(f"{kind} {variable or ''}".strip())
-
-            for term in _additive_requirements(fragment):
-                if not re.search(rf"\+\s*{re.escape(term)}\b", statement):
-                    missing.append(f"+ {term}")
-
-        for qualifier in _MATERIAL_QUALIFIERS:
-            postures = _qualifier_postures(fragments, qualifier)
-            statement_has_qualifier = bool(re.search(rf"\b{qualifier}\b", statement))
-            if postures == {True} and not statement_has_qualifier:
-                missing.append(qualifier)
-            elif postures == {False} and statement_has_qualifier:
-                missing.append(f"not {qualifier}")
-            elif postures == {False, True}:
-                missing.append(f"consistent {qualifier} qualifier")
+            conflicts.extend(_quantifier_conflicts(normalized_statement, fragment))
+        conflicts.extend(_qualifier_conflicts(statement, fragments))
 
         if category is TargetClauseCategory.POLARITY:
             requested_refutation = bool(re.search(r"\b(?:refute|disprove|counterexample)\b", value))
@@ -901,75 +796,32 @@ def validate_target_contract(
                 re.search(r"\b(?:refute|disprove|counterexample)\b", statement)
             )
             if requested_refutation and not statement_refutation:
-                missing.append("refute/disprove polarity")
+                if re.search(r"\b(?:prove|establish|show)\b", statement):
+                    conflicts.append("refute/disprove polarity")
             if requested_proof and statement_refutation:
-                missing.append("prove polarity")
+                conflicts.append("prove polarity")
 
-        key_text = key.casefold()
-        domain_like = category is TargetClauseCategory.DOMAIN or any(
-            marker in key_text for marker in _DOMAIN_KEYS
-        )
-        edge_like = category is TargetClauseCategory.EDGE_CASES or any(
-            marker in key_text for marker in _EDGE_KEYS
-        )
-        constant_like = category is TargetClauseCategory.CONSTANTS or any(
-            marker in key_text for marker in _CONSTANT_KEYS
-        )
-        if domain_like or edge_like or constant_like:
-            material_requirements = _material_tokens(fragments, discard_scaffolding=True)
-            if not material_requirements:
-                missing.append("nonempty material clause")
-            if domain_like or edge_like:
-                for fragment in fragments:
-                    fragment_requirements = _material_tokens(
-                        [fragment],
-                        discard_scaffolding=True,
-                    )
-                    missing.extend(
-                        _missing_long_clause_material(
-                            fragment_requirements,
-                            statement_material_tokens,
-                        )
-                    )
+        for fragment in fragments:
+            fragment_value = _plain_math(fragment)
+            if _is_compact_formal_clause(fragment) and not _comparison_aligned(
+                statement, fragment_value
+            ):
+                conflicts.append("compact formal comparison")
+            elif category is TargetClauseCategory.CONCLUSION and _comparison_direction_conflict(
+                statement, fragment_value
+            ):
+                conflicts.append("reversed comparison direction")
+            if re.fullmatch(r"\d+(?:\.\d+)?", fragment_value) and not re.search(
+                rf"(?<![a-z_]){re.escape(fragment_value)}(?![a-z0-9_])", statement
+            ):
+                conflicts.append(f"numeric value {fragment_value}")
 
-        conclusion_like = category in {
-            TargetClauseCategory.ADDITIVE_TERMS,
-            TargetClauseCategory.CONCLUSION,
-        }
-        # Short formal conclusion/constant clauses should visibly survive even when
-        # another feature (for example an additive term) determined the display category.
-        if conclusion_like or constant_like:
-            for fragment in fragments:
-                symbols = _symbol_requirements(fragment)
-                if len(symbols) <= 12:
-                    for symbol in symbols:
-                        canonical_symbol = _canonical_material_token(symbol)
-                        if not re.search(rf"\b{re.escape(symbol)}\b", statement) and (
-                            canonical_symbol not in statement_material_tokens
-                        ):
-                            missing.append(symbol)
-                for number in _number_requirements(fragment):
-                    if not re.search(rf"(?<![a-z_]){re.escape(number)}(?![a-z0-9_])", statement):
-                        missing.append(number)
-                fragment_value = _plain_math(fragment)
-                comparison_operators = re.findall(
-                    r"<=|>=|(?<![<>])=(?!=)|<|>",
-                    fragment_value,
-                )
-                if conclusion_like and comparison_operators:
-                    if len(symbols) <= 12:
-                        if not _comparison_aligned(statement, fragment_value):
-                            missing.append("ordered comparison sides")
-                    elif category is TargetClauseCategory.CONCLUSION:
-                        if not _comparison_directions_aligned(statement, fragment_value):
-                            missing.append("ordered comparison direction")
-
-        missing = list(dict.fromkeys(missing))
-        passed = not missing
+        conflicts = list(dict.fromkeys(conflicts))
+        passed = not conflicts
         detail = (
-            "Material clause markers are present in the exact statement."
+            "No high-confidence contradiction detected."
             if passed
-            else "Missing or incompatible material marker(s): " + ", ".join(missing)
+            else "Explicit contradiction(s): " + ", ".join(conflicts)
         )
         checks.append(TargetClauseCheck(key=key, category=category, passed=passed, detail=detail))
         if not passed:

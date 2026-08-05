@@ -2,13 +2,13 @@
 
 ## 0.5.0 — Unreleased
 
-- Reduced false-positive prompt-alignment pauses without weakening high-confidence theorem-drift
-  checks. Clause keys now outrank incidental prose, symbolic quantifiers no longer bind ordinary
-  words such as “accept,” long explanatory domain/edge clauses use substantial material coverage,
-  comparisons tolerate earlier unrelated inequalities and trailing definitions, and malformed
-  transport Unicode escapes are decoded for lexical comparison. The real matroid-secretary
-  compiler artifact is covered by a regression test; reversed inequalities, changed constants,
-  missing additive terms, and material qualifier/quantifier drift still block research.
+- Replaced brittle prompt-alignment token coverage with a smaller contradiction-only guard. It
+  still blocks explicit reversed symbolic quantifiers or polarity, opposing qualifiers, changed
+  structured numeric values, and compact formal-comparison drift, while prose omissions,
+  paraphrases, abbreviations, and negated examples such as “no `+β`” no longer pause research.
+  Clause keys outrank incidental prose, malformed transport Unicode escapes remain normalized for
+  comparison, and both reported matroid-secretary compiler artifacts are covered by regression
+  tests.
 - Clarified every public research-topology control. New configurations use
   `num_first_level_agents`, `subagents_per_agent`, and the across-tier
   `max_concurrent_agents`, with defaults `8`, `4`, and `24`. Hierarchical workers reserve one

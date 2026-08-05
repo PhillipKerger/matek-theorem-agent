@@ -65,10 +65,12 @@ formalization, and generates a reproducible final report.
   support acceptance or the final bibliography. Unavailable target-identification evidence must
   not be guessed around.
 - Resolve arXiv identifiers through both `export.arxiv.org` and `arxiv.org/abs/<id>`.
-- Before research, deterministically compare the compiled statement with every applicable claim-
-  contract clause, including quantifiers, constants, additive terms, domains, edge cases,
-  polarity, and conclusion. Persist `prompts/target_alignment.json`; any material mismatch blocks
-  research instead of being repaired by assumption.
+- Before research, deterministically inspect the compiled statement against every applicable
+  claim-contract clause and persist `prompts/target_alignment.json`. Block only explicit,
+  high-confidence contradictions such as reversed symbolic quantifiers or polarity, opposing
+  qualifiers, changed structured numeric values, and drift in compact formal comparisons.
+  Lexical absence from generated domain, edge-case, or explanatory prose is not evidence of a
+  mismatch and must not prevent research from starting.
 - Bind the first aligned statement, canonical contract, and compiled prompt for a normalized
   source hash in `.matek/knowledge/<graph-name>/target-registry.json`. Later runs with the same
   source hash reuse those canonical bytes while refreshing literature separately. A new aligned

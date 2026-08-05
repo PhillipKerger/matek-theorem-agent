@@ -512,21 +512,21 @@ counterexamples, and reopen condition, while partial results from different bran
 available for later synthesis.
 
 The normalized source file hash freezes the theorem before research. The prompt compiler first
-writes `prompts/target_alignment.json`, which checks quantifiers, constants, additive terms,
-domains, edge cases, polarity, and conclusion against the claim contract. The graph then stores
-the aligned statement, canonical contract, and compiled prompt in `target-registry.json`. A later
+writes `prompts/target_alignment.json`, which hash-binds the statement and contract and checks each
+clause for explicit contradictions. The graph then stores the aligned statement, canonical
+contract, and compiled prompt in `target-registry.json`. A later
 run with the same source bytes reuses them byte-for-byte while refreshing literature separately.
 An aligned same-contract rewording is recorded as a cosmetic paraphrase without replacing those
 bytes. Contract drift fails closed; use
 `matek run problem.md --migrate-target "reason"` only for an intentional versioned migration.
 MATEK asks for confirmation unless `--yes` is supplied and marks affected proof evidence stale.
 The reason and authorization persist through resume and feed the durable target-migration event;
-resume never silently invents or broadens that authorization. Alignment is a conservative contract
-check, not a proof of the theorem. Compact formal clauses remain exact: reversed quantifiers or
-inequalities, changed numeric constants, missing additive terms, and contradictory material
-qualifiers block research. For longer generated prose, the checker requires substantial visible
-coverage and high-confidence markers instead of treating every explanatory verb as a mathematical
-symbol.
+resume never silently invents or broadens that authorization. Alignment is a narrow contradiction
+guard, not a proof of semantic equivalence or of the theorem. Reversed symbolic quantifiers or
+polarity, opposing qualifiers, changed structured numeric values, and compact formal-expression
+drift block research. Missing words in generated prose do not. In particular, contract examples
+inside prohibitions—such as “no `+β` is permitted”—are not required to appear positively in the
+statement. Research, manuscript, bibliography, and Lean verification retain their own gates.
 
 The Markdown vault is the complete research archive, not a bag of trusted theorems. Its rebuildable
 `ledgers/<problem-id>/canonical-ledger.json` projection contains exact canonical claims, joint
@@ -967,12 +967,12 @@ re-runs frozen deterministic checks natively.
   access is available and run `matek resume RUN_ID`; MATEK will not switch to API billing.
 - **Run time limit reached:** completed calls and artifacts remain checkpointed. Increase the
   frozen allowance explicitly with `matek resume RUN_ID --time-limit-minutes N` if desired.
-- **Prompt alignment paused after a valid compilation:** inspect
-  `prompts/target_alignment.json` beside `compiled_problem.json`. After upgrading MATEK to a
-  checker version that addresses the diagnostic, run `matek resume RUN_ID`; the completed compiler
-  response is replayed from the run-local model journal and deterministically rechecked rather than
-  purchased again. Use `--force-stage prompt_compilation` only when you intentionally want a fresh
-  bounded prompt-repair generation.
+- **Prompt alignment paused after a valid compilation:** upgrade to a release with the
+  contradiction-only alignment guard, inspect `prompts/target_alignment.json` beside
+  `compiled_problem.json`, and run `matek resume RUN_ID`. The completed compiler response is
+  replayed from the run-local model journal and deterministically rechecked rather than purchased
+  again. Use `--force-stage prompt_compilation` only when you intentionally want a fresh bounded
+  prompt-repair generation.
 - **Live search unavailable:** literature-support claims are quarantined or qualified so research
   can continue, but target identification may pause and final citation/bibliography gates remain
   strict. Restore Codex search or network access, then resume any missing source audits. To
