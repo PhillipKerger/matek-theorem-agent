@@ -1083,6 +1083,7 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     invocation = CliRunner().invoke(app, ["run", str(problem)])
 
     assert invocation.exit_code == 0, invocation.output
+    normalized_output = " ".join(invocation.output.replace("│", " ").split())
     assert "Resolved MATEK run configuration" in invocation.output
     assert "research coordinator" in invocation.output
     assert "max effort" in invocation.output
@@ -1090,7 +1091,7 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     assert "xhigh effort" in invocation.output
     assert "web access" in invocation.output
     assert "up to 4 effective" in invocation.output
-    assert "no automatic API fallback" in invocation.output
+    assert "no automatic API fallback" in normalized_output
     assert "MATEK run summary" in invocation.output
     assert "Problem solved?" in invocation.output
     assert "UNDETERMINED" in invocation.output

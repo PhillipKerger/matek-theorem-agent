@@ -489,6 +489,16 @@ _JSON_LITERAL_TOKENS = {"false", "null", "true"}
 
 
 def _plain_math(value: str) -> str:
+    # Some structured-output transports have emitted a malformed Unicode escape as
+    # U+001C followed by four hexadecimal digits (for example ``\x1c03c0`` for π,
+    # or ``\x1c22650`` for ≥ followed by 0). Decode that unambiguous artifact only
+    # for lexical comparison; the persisted model output remains byte-for-byte
+    # available for diagnosis.
+    value = re.sub(
+        r"\x1c([0-9a-fA-F]{4})",
+        lambda match: chr(int(match.group(1), 16)),
+        value,
+    )
     normalized = normalize_exact_statement(value).casefold()
     replacements = {
         "\\forall": " forall ",
@@ -592,45 +602,93 @@ def _material_tokens(values: list[str], *, discard_scaffolding: bool) -> list[st
 
 
 def _clause_category(key: str, value: str) -> TargetClauseCategory:
-    material = f"{key} {value}".casefold()
-    if any(marker in material for marker in _ADDITIVE_KEYS) or re.search(
-        r"\+\s*[a-z\u03b1-\u03c9]", material
-    ):
-        return TargetClauseCategory.ADDITIVE_TERMS
-    if any(marker in material for marker in _QUANTIFIER_KEYS) or re.search(
-        r"\b(?:for all|for every|forall|exists|there exists)\b", material
-    ):
-        return TargetClauseCategory.QUANTIFIERS
-    if any(marker in material for marker in _POLARITY_KEYS):
-        return TargetClauseCategory.POLARITY
-    if any(marker in material for marker in _EDGE_KEYS):
-        return TargetClauseCategory.EDGE_CASES
-    if any(marker in material for marker in _DOMAIN_KEYS):
-        return TargetClauseCategory.DOMAIN
-    if any(marker in material for marker in _CONSTANT_KEYS):
-        return TargetClauseCategory.CONSTANTS
-    if any(marker in material for marker in _CONCLUSION_KEYS):
-        return TargetClauseCategory.CONCLUSION
-    return TargetClauseCategory.OTHER
+    def classify(material: str) -> TargetClauseCategory | None:
+        if any(marker in material for marker in _ADDITIVE_KEYS) or re.search(
+            r"\+\s*[a-z\u03b1-\u03c9]", material
+        ):
+            return TargetClauseCategory.ADDITIVE_TERMS
+        if any(marker in material for marker in _QUANTIFIER_KEYS) or re.search(
+            r"\b(?:for all|for every|forall|exists|there exists)\b", material
+        ):
+            return TargetClauseCategory.QUANTIFIERS
+        if any(marker in material for marker in _POLARITY_KEYS):
+            return TargetClauseCategory.POLARITY
+        if any(marker in material for marker in _EDGE_KEYS):
+            return TargetClauseCategory.EDGE_CASES
+        if any(marker in material for marker in _DOMAIN_KEYS):
+            return TargetClauseCategory.DOMAIN
+        if any(marker in material for marker in _CONSTANT_KEYS):
+            return TargetClauseCategory.CONSTANTS
+        if any(marker in material for marker in _CONCLUSION_KEYS):
+            return TargetClauseCategory.CONCLUSION
+        return None
+
+    # The provider is instructed to use semantic clause keys. Prefer that explicit
+    # structure over incidental prose: a ``constants`` clause mentioning an
+    # "instance parameter" is not a domain clause, and a ``conclusion`` beginning
+    # "for every" is still a conclusion.
+    key_category = classify(key.replace("_", " ").replace("-", " ").casefold())
+    if key_category is not None:
+        return key_category
+    material = value.casefold()
+    return classify(material) or TargetClauseCategory.OTHER
+
+
+_SYMBOLIC_QUANTIFIER_NAMES = {
+    "alpha",
+    "beta",
+    "delta",
+    "epsilon",
+    "eta",
+    "gamma",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "omega",
+    "phi",
+    "pi",
+    "psi",
+    "rho",
+    "sigma",
+    "tau",
+    "theta",
+    "xi",
+    "zeta",
+}
+
+
+def _likely_quantified_symbol(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if len(value) == 1 or value in _SYMBOLIC_QUANTIFIER_NAMES or re.search(r"[_0-9]", value):
+        return value
+    return None
 
 
 def _quantifier_requirements(value: str) -> list[tuple[str, str | None]]:
     plain = _plain_math(value)
     requirements: list[tuple[str, str | None]] = []
     pattern = re.compile(
-        r"\b(forall|for all|for every|each|exists|there exists)\b"
-        r"(?:\s+(?:an?\s+)?([a-z][a-z0-9_]*))?"
+        r"\b(forall|for all|for every|each|exists|there exists?|there must exists?|"
+        r"must exists?|there is|there are)\b"
+        r"(?:\s+(?:(?:an?|one)\s+)?([a-z][a-z0-9_]*))?"
     )
     for kind, variable in pattern.findall(plain):
-        normalized_kind = "exists" if "exist" in kind else "forall"
-        requirements.append((normalized_kind, variable or None))
+        normalized_kind = (
+            "exists" if "exist" in kind or kind in {"there is", "there are"} else "forall"
+        )
+        requirements.append((normalized_kind, _likely_quantified_symbol(variable or None)))
     return list(dict.fromkeys(requirements))
 
 
 def _has_quantifier(statement: str, kind: str, variable: str | None) -> bool:
     plain = _plain_math(statement)
     marker = (
-        r"(?:exists|there exists)" if kind == "exists" else r"(?:forall|for all|for every|each|any)"
+        r"(?:exists?|there\s+(?:must\s+)?exists?|must\s+exists?|there\s+(?:is|are))"
+        if kind == "exists"
+        else r"(?:forall|for all|for every|each|any)"
     )
     if variable:
         return bool(re.search(rf"\b{marker}\s+(?:an?\s+)?{re.escape(variable)}\b", plain))
@@ -695,25 +753,81 @@ def _comparison_aligned(statement: str, clause: str) -> bool:
     expected = re.search(r"(.+?)\s*(<=|>=|=|<|>)\s*(.+)", clause)
     if expected is None:
         return True
-    expected_left = _comparison_lexemes(expected.group(1))
-    expected_right = _comparison_lexemes(expected.group(3))
+    expected_left_text = re.split(r"(?:[.;:]|\b(?:and|then)\b)", expected.group(1))[-1]
+    expected_right_text = re.split(r"(?:[,;.]|\bwhere\b)", expected.group(3))[0]
+    expected_left = _comparison_lexemes(expected_left_text)
+    expected_right = _comparison_lexemes(expected_right_text)
+    if not expected_left or not expected_right:
+        return True
     operator = expected.group(2)
-    for candidate in re.finditer(r"(.+?)\s*(<=|>=|=|<|>)\s*(.+)", statement):
-        if candidate.group(2) != operator:
+    for candidate in re.finditer(r"<=|>=|(?<![<>])=(?!=)|<|>", statement):
+        if candidate.group(0) != operator:
             continue
-        candidate_left = _comparison_lexemes(candidate.group(1))
-        candidate_right = _comparison_lexemes(candidate.group(3))
-        # Introductory theorem prose and quantifiers may precede the left-hand expression, so
-        # align it at the end of the candidate side.  The right-hand side runs to the end of the
-        # asserted comparison and must match exactly; accepting a mere subsequence here would
-        # silently admit material drift such as ``+ gamma + beta`` for a requested ``+ beta``.
+        candidate_left = _comparison_lexemes(statement[: candidate.start()])
+        candidate_right = _comparison_lexemes(statement[candidate.end() :])
+        remaining_right = candidate_right[len(expected_right) :]
+        # Introductory theorem prose and earlier comparisons may precede the left-hand
+        # expression. Match the expected expression at the end of that prefix and at the
+        # beginning of the right side. Ordinary prose may follow; an immediate arithmetic
+        # operator may not, since it materially extends the requested expression.
         if (
             len(candidate_left) >= len(expected_left)
             and candidate_left[-len(expected_left) :] == expected_left
-            and candidate_right == expected_right
+            and candidate_right[: len(expected_right)] == expected_right
+            and (not remaining_right or remaining_right[0] not in {"+", "-", "*", "/", "^"})
         ):
             return True
     return False
+
+
+def _comparison_directions_aligned(statement: str, clause: str) -> bool:
+    """Check each long-clause comparison at its expected left expression.
+
+    Long generated conclusions may use a defined abbreviation on the right-hand
+    side, so exact RHS token identity is too strict. The direction must nevertheless
+    occur after the same visible left expression; an unrelated earlier inequality
+    cannot satisfy this check.
+    """
+
+    expected_matches = list(re.finditer(r"<=|>=|(?<![<>])=(?!=)|<|>", clause))
+    if not expected_matches:
+        return True
+    statement_matches = list(re.finditer(r"<=|>=|(?<![<>])=(?!=)|<|>", statement))
+    for expected in expected_matches:
+        expected_left_text = re.split(
+            r"(?:[.;:]|\b(?:and|then)\b)",
+            clause[: expected.start()],
+        )[-1]
+        expected_left = _comparison_lexemes(expected_left_text)
+        if not expected_left:
+            continue
+        if not any(
+            candidate.group(0) == expected.group(0)
+            and _comparison_lexemes(statement[: candidate.start()])[-len(expected_left) :]
+            == expected_left
+            for candidate in statement_matches
+        ):
+            return False
+    return True
+
+
+def _missing_long_clause_material(
+    requirements: list[str],
+    statement_material_tokens: set[str],
+) -> list[str]:
+    """Return blocking lexical gaps for a domain/edge clause.
+
+    Short clauses name compact material such as ``planar graphs`` or ``empty
+    instances`` and remain exact. Long generated prose mixes mathematical content
+    with explanatory verbs and harmless synonyms; require substantial visible
+    coverage instead of treating every prose token as a theorem symbol.
+    """
+
+    missing = [item for item in requirements if item not in statement_material_tokens]
+    if len(requirements) <= 4:
+        return missing
+    matched = len(requirements) - len(missing)
+    return missing if matched / len(requirements) < 0.65 else []
 
 
 def _qualifier_postures(fragments: list[str], qualifier: str) -> set[bool]:
@@ -806,13 +920,22 @@ def validate_target_contract(
             if not material_requirements:
                 missing.append("nonempty material clause")
             if domain_like or edge_like:
-                for requirement in material_requirements:
-                    if requirement not in statement_material_tokens:
-                        missing.append(requirement)
+                for fragment in fragments:
+                    fragment_requirements = _material_tokens(
+                        [fragment],
+                        discard_scaffolding=True,
+                    )
+                    missing.extend(
+                        _missing_long_clause_material(
+                            fragment_requirements,
+                            statement_material_tokens,
+                        )
+                    )
 
-        conclusion_like = any(marker in key.casefold() for marker in _CONCLUSION_KEYS) or bool(
-            re.search(r"<=|>=|(?<![<>])=(?!=)|<|>", value)
-        )
+        conclusion_like = category in {
+            TargetClauseCategory.ADDITIVE_TERMS,
+            TargetClauseCategory.CONCLUSION,
+        }
         # Short formal conclusion/constant clauses should visibly survive even when
         # another feature (for example an additive term) determined the display category.
         if conclusion_like or constant_like:
@@ -829,8 +952,17 @@ def validate_target_contract(
                     if not re.search(rf"(?<![a-z_]){re.escape(number)}(?![a-z0-9_])", statement):
                         missing.append(number)
                 fragment_value = _plain_math(fragment)
-                if not _comparison_aligned(statement, fragment_value):
-                    missing.append("ordered comparison sides")
+                comparison_operators = re.findall(
+                    r"<=|>=|(?<![<>])=(?!=)|<|>",
+                    fragment_value,
+                )
+                if conclusion_like and comparison_operators:
+                    if len(symbols) <= 12:
+                        if not _comparison_aligned(statement, fragment_value):
+                            missing.append("ordered comparison sides")
+                    elif category is TargetClauseCategory.CONCLUSION:
+                        if not _comparison_directions_aligned(statement, fragment_value):
+                            missing.append("ordered comparison direction")
 
         missing = list(dict.fromkeys(missing))
         passed = not missing

@@ -310,6 +310,11 @@ minimality.
 
 Before research, `prompts/target_alignment.json` conservatively checks the compiler's theorem
 against the exact claim-contract clauses; this fail-closed comparison is not a mathematical proof.
+Clause keys control interpretation so incidental prose cannot recategorize a constants or
+conclusion clause. Short formal clauses and high-confidence logical signals remain exact; long
+generated domain and edge-case prose uses a visible-coverage threshold so harmless synonyms and
+explanatory verbs do not become invented theorem symbols. Explicit quantifier, qualifier, numeric,
+additive-term, and comparison drift still blocks.
 The first aligned result for a normalized source hash is frozen in `target-registry.json`;
 same-source reruns receive those exact statement, contract, and prompt bytes while literature
 refresh stays run-local. A new aligned statement with the same contract is recorded as a cosmetic

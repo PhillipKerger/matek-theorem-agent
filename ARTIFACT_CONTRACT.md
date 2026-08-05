@@ -184,6 +184,9 @@ manuscript source, bibliography, and final verification outputs.
 claim contract to separate SHA-256 digests. It records every deterministic clause check and its
 blocking issues. A failed alignment is preserved for diagnosis and blocks research admission.
 Passing alignment certifies only this conservative contract comparison, not mathematical truth.
+The checker treats short formal clauses and high-confidence contradictions as exact while using
+substantial token coverage for long explanatory domain/edge prose; missing incidental prose words
+are not blocking mathematical discrepancies.
 `target-registry.json` is keyed by the normalized source-problem SHA-256 and integrity-binds the
 canonical exact statement, contract JSON, compiled prompt, target node, version, compatibility
 observations, and explicit migrations. Same-source reruns re-materialize the canonical statement,

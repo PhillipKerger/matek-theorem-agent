@@ -522,7 +522,11 @@ bytes. Contract drift fails closed; use
 MATEK asks for confirmation unless `--yes` is supplied and marks affected proof evidence stale.
 The reason and authorization persist through resume and feed the durable target-migration event;
 resume never silently invents or broadens that authorization. Alignment is a conservative contract
-check, not a proof of the theorem.
+check, not a proof of the theorem. Compact formal clauses remain exact: reversed quantifiers or
+inequalities, changed numeric constants, missing additive terms, and contradictory material
+qualifiers block research. For longer generated prose, the checker requires substantial visible
+coverage and high-confidence markers instead of treating every explanatory verb as a mathematical
+symbol.
 
 The Markdown vault is the complete research archive, not a bag of trusted theorems. Its rebuildable
 `ledgers/<problem-id>/canonical-ledger.json` projection contains exact canonical claims, joint
@@ -963,6 +967,12 @@ re-runs frozen deterministic checks natively.
   access is available and run `matek resume RUN_ID`; MATEK will not switch to API billing.
 - **Run time limit reached:** completed calls and artifacts remain checkpointed. Increase the
   frozen allowance explicitly with `matek resume RUN_ID --time-limit-minutes N` if desired.
+- **Prompt alignment paused after a valid compilation:** inspect
+  `prompts/target_alignment.json` beside `compiled_problem.json`. After upgrading MATEK to a
+  checker version that addresses the diagnostic, run `matek resume RUN_ID`; the completed compiler
+  response is replayed from the run-local model journal and deterministically rechecked rather than
+  purchased again. Use `--force-stage prompt_compilation` only when you intentionally want a fresh
+  bounded prompt-repair generation.
 - **Live search unavailable:** literature-support claims are quarantined or qualified so research
   can continue, but target identification may pause and final citation/bibliography gates remain
   strict. Restore Codex search or network access, then resume any missing source audits. To

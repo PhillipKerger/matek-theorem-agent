@@ -107,6 +107,10 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   result provenance.
 - An unavailable literature-support arXiv source is quarantined and its claims are downgraded while
   research still starts; target-identification evidence remains fail closed.
+- Target-contract alignment accepts the persisted matroid-secretary paraphrase with long
+  explanatory clauses and malformed transport Unicode escapes, while still rejecting reversed
+  quantifiers/inequalities, randomized-versus-deterministic and finite-versus-arbitrary drift,
+  changed numeric constants, missing additive terms, and short domain/edge omissions.
 - Event-driven research configuration defaults and migration of legacy
   `maximum_assignments_per_round`/`maximum_rounds` and `--max-rounds` inputs to
   `max_pending_assignments`/`max_coordinator_decisions` without reintroducing barriers.

@@ -173,3 +173,91 @@ def test_structured_quantifier_polarity_cannot_be_reversed(
 
     assert alignment.passed is False
     assert "quantifier" in " ".join(alignment.blocking_issues).casefold()
+
+
+def test_matroid_secretary_paraphrase_does_not_fail_on_explanatory_prose() -> None:
+    statement = (
+        "Prove the following affirmative theorem. There exist one real universal constant C "
+        "with 1≤C<∞ and one randomized online algorithm ALG such that, for every finite labeled "
+        "matroid M=(E,I)—including E=∅, rank zero or one, loops, parallel elements, and nonunique "
+        "bases—and every arbitrary weight function w:E→R_{\x1c22650} with zeros and ties allowed, "
+        "the following holds. The entire matroid M, E, and |E| are known to ALG in advance, "
+        "equivalently through exact unrestricted independence access, but weights are not known "
+        "until arrival. An oblivious adversary may choose w after seeing M and ALG but must fix w "
+        "before the uniformly random arrival permutation \x1c03c0 and ALG's private random coins R "
+        "are realized. Each element arrives exactly once according to \x1c03c0; upon seeing its "
+        "identity and weight, ALG must immediately and irrevocably accept or reject it using only "
+        "M, the revealed history, and R. Every accepted prefix and the final accepted set I_ALG "
+        "must lie in I in every realization. For all M and w, "
+        "E_{\x1c03c0,R}[Σ_{e∈I_ALG}w(e)]≥(1/C)OPT(M,w), where "
+        "OPT(M,w)=max_{J∈I}Σ_{e∈J}w(e). The constant C and algorithmic guarantee have no "
+        "dependence on M, |E|, rank(M), w, weight spread, or any structural parameter, and contain "
+        "no additive term, exceptional set, or failure-probability relaxation. The expectation is "
+        "jointly over the uniform order and internal randomness, while feasibility is pointwise. "
+        "The OPT=0 case is included."
+    )
+    contract = {
+        "quantifiers": (
+            "There must exist one universal real constant C and one randomized online algorithm "
+            "ALG such that, for every finite matroid M=(E,I) and every weight function "
+            "w:E→R_{\x1c22650} fixed before any randomness is realized, the stated feasibility "
+            "and expected-value guarantees hold."
+        ),
+        "constants": (
+            "C must satisfy 1≤C<∞ and be independent of M, |E|, rank(M), w, the weight spread, "
+            "and every other instance parameter."
+        ),
+        "additive_terms": (
+            "No additive term, asymptotic error, exceptional loss, or failure-probability "
+            "allowance "
+            "is permitted; the guarantee is purely multiplicative: E[w(I_ALG)]≥OPT(M,w)/C."
+        ),
+        "domain": (
+            "All finite matroids are covered. The labeled ground set E and the complete matroid "
+            "are known in advance; equivalently, ALG has exact unrestricted independence-oracle "
+            "access to M. Elements arrive exactly once in a uniformly random permutation. Weights "
+            "are arbitrary nonnegative real numbers and are revealed only on arrival."
+        ),
+        "edge_cases": (
+            "The theorem includes the empty matroid, rank-zero and rank-one matroids, loops, "
+            "parallel elements, zero weights, tied weights, and OPT(M,w)=0. Any tie-breaking used "
+            "by ALG must be specified without access to unrevealed weights."
+        ),
+        "conclusion": (
+            "For every admissible M and w, every accepted prefix and the final set I_ALG must "
+            "belong to I in every realization, and "
+            "E_{\x1c03c0,R}[Σ_{e∈I_ALG}w(e)]≥(1/C)max_{J∈I}Σ_{e∈J}w(e), where "
+            "\x1c03c0 is the uniform arrival permutation and R is ALG's private randomness."
+        ),
+        "online_information": (
+            "ALG knows M, E, and |E| before arrivals, but not any weight until its element "
+            "arrives. "
+            "Each accept/reject decision is immediate and irrevocable and may depend only on M, "
+            "the revealed history, and private randomness."
+        ),
+    }
+
+    alignment = validate_target_contract(statement, contract)
+
+    assert alignment.passed is True
+    assert all(check.passed for check in alignment.checks)
+
+
+def test_long_prose_conclusion_still_blocks_reversed_comparison() -> None:
+    alignment = validate_target_contract(
+        (
+            "A separate normalization has C >= 1. For every finite matroid M and weight function "
+            "w, the randomized algorithm ALG returns a feasible set I_ALG and "
+            "E[w(I_ALG)] <= (1/C) OPT(M,w)."
+        ),
+        {
+            "conclusion": (
+                "For every admissible finite matroid M and nonnegative weight function w, every "
+                "accepted prefix is feasible and the final set I_ALG satisfies "
+                "E[w(I_ALG)] >= (1/C) OPT(M,w)."
+            )
+        },
+    )
+
+    assert alignment.passed is False
+    assert "ordered comparison direction" in " ".join(alignment.blocking_issues)

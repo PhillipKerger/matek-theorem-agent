@@ -1026,7 +1026,7 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
         (
             "For every n, foo(n) <= bar(n) + beta.",
             {"conclusion": "cost_ALG(n) <= k * OPT(n) + beta"},
-            "additive_terms",
+            "conclusion",
             "cost_alg",
         ),
         (
