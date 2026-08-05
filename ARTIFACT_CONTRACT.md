@@ -227,6 +227,14 @@ evidence claims, and verified state. Verified identity follows DOI/base-arXiv/MR
 precedence; unverified title/author records use provisional fingerprints and remain open. Only
 identical entity keys merge. Worker-result `CITES` relations require explicit result-source
 references; separately verified compiler sources may cite the frozen target.
+Equivalent case, `doi:` prefixes, and DOI resolver URLs normalize to one DOI. A ledger entry with
+multiple distinct DOI values materializes one source per DOI; an ambiguous alias or shared
+lower-precedence identifier maps conservatively to every retained candidate. The graph transaction
+writes `repairs/source-identity-decision-<sha256-prefix>.json` with the normalized DOI values,
+aliases, candidate node IDs, context, and `preserve_separate_source_nodes` decision. Its matching
+`source_identity_ambiguity` issue is provenance-only and does not turn worker admission or research
+scheduling into a failure. Historical mixed-DOI notes are retained, normalized, and marked by
+`matek graph doctor --repair` with a before/after audit log so existing evidence is never deleted.
 
 A legacy-migration plan is a user-selected external artifact, conventionally
 `.matek/migration-reports/<graph-name>.json`, and must not be placed beneath

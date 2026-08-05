@@ -20,7 +20,7 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   conflicts, unknown Markdown notes, crash recovery, snapshots, diffs, and SQLite rebuilds.
 - Problem-scoped graph-hygiene inspection and transactional source-identifier repair, including
   before/after audit artifacts, no-identifier warning/downgrade behavior, failed-repair atomicity,
-  bounded stage retry, and immutable-target non-regression.
+  historical mixed-DOI identification, bounded stage retry, and immutable-target non-regression.
 - Content-addressed snapshot deltas, blob deduplication, periodic checkpoints, integrity/content
   roots, deterministic reconstruction, corruption rejection, schema-v1 read compatibility, and
   byte-preserving legacy-to-v2 continuation.
@@ -242,7 +242,9 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
     staleness is local.
 24. Source/claim integration: exact source keys and exact-statement-plus-scope claims merge
     idempotently, distinct identifiers and semantic near-matches remain separate, and only explicit
-    worker-result source links create result `CITES` edges.
+    worker-result source links create result `CITES` edges. Equivalent DOI renderings deduplicate;
+    the SODA `10.1137/1.9781611973730.79` and MOR `10.1287/moor.2017.0876` versions remain separate,
+    retain citations/evidence, and produce a non-blocking structured decision artifact.
 25. Legacy backfill: planning leaves the vault byte-identical; applying the externally reviewed
     plan creates one new graph revision and application record, a retry is idempotent, ambiguous
     items remain unapplied, and queued verifier/falsifier tasks grant no trust without later audits.

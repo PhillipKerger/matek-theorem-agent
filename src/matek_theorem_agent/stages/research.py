@@ -77,6 +77,7 @@ from ..scientific import (
     transitive_result_dependency_keys,
     validate_result_dependency_dag,
 )
+from ..source_canonicalization import SOURCE_IDENTITY_AMBIGUITY_PREFIX
 from ..source_identifiers import tool_metadata_source_identifiers
 from ..source_provenance import IdentifierVerifier, SourceEvidenceClaim, SourceVerificationReport
 from .common import (
@@ -7842,8 +7843,17 @@ async def run_adaptive_research(
                         "the scientific worker."
                     ]
                     graph_merge = None
-                if graph_merge is not None and graph_merge.issues and graph_issue is None:
-                    graph_issue = StageValidationError("; ".join(graph_merge.issues))
+                blocking_graph_issues = (
+                    [
+                        issue
+                        for issue in graph_merge.issues
+                        if not issue.startswith(SOURCE_IDENTITY_AMBIGUITY_PREFIX)
+                    ]
+                    if graph_merge is not None
+                    else []
+                )
+                if blocking_graph_issues and graph_issue is None:
+                    graph_issue = StageValidationError("; ".join(blocking_graph_issues))
                     graph_issue_obligations = [
                         "Retry deterministic graph admission from the frozen typed report; the "
                         "scientific report remains accepted."

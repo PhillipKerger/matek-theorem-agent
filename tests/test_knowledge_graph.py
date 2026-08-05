@@ -1701,7 +1701,9 @@ def test_shared_url_cannot_merge_worker_sources_with_conflicting_dois(
                     "doi:10.5555/first",
                     "https://publisher.example.edu/shared",
                 ],
-                "evidence_claims": [],
+                "evidence_claims": [
+                    {"claim": "source-conflict-result", "source_ids": ["first-doi"]}
+                ],
                 "purpose": "literature_support",
                 "required_for_claim": False,
                 "verified": True,
@@ -1714,7 +1716,9 @@ def test_shared_url_cannot_merge_worker_sources_with_conflicting_dois(
                     "doi:10.5555/second",
                     "https://publisher.example.edu/shared",
                 ],
-                "evidence_claims": [],
+                "evidence_claims": [
+                    {"claim": "source-conflict-result", "source_ids": ["second-doi"]}
+                ],
                 "purpose": "literature_support",
                 "required_for_claim": False,
                 "verified": True,
@@ -1726,24 +1730,43 @@ def test_shared_url_cannot_merge_worker_sources_with_conflicting_dois(
         "mechanism": "Audit source identity before transfer.",
     }
 
-    with pytest.raises(GraphValidationError, match="conflicting doi identities"):
-        graph.integrate_worker_report(
-            problem_id=problem_id,
-            run_id="run-one",
-            assignment={
-                "id": "worker-one",
-                "approach_family": "literature",
-                "task": "Review potentially conflicting source records.",
-                "matek_assignment_id": "worker-one",
-            },
-            task_id=task_id,
-            report=report,
-            proposed_patch=None,
-            source_artifact=".matek/runs/run-one/research/workers/worker-one.json",
-            operation_id="source-conflict:run-one:worker-one",
-        )
+    merged = graph.integrate_worker_report(
+        problem_id=problem_id,
+        run_id="run-one",
+        assignment={
+            "id": "worker-one",
+            "approach_family": "literature",
+            "task": "Review potentially conflicting source records.",
+            "matek_assignment_id": "worker-one",
+        },
+        task_id=task_id,
+        report=report,
+        proposed_patch=None,
+        source_artifact=".matek/runs/run-one/research/workers/worker-one.json",
+        operation_id="source-conflict:run-one:worker-one",
+    )
 
-    assert graph.load_state().revision == revision
+    assert merged.committed
+    assert merged.new_revision != revision
+    assert any(issue.startswith("source_identity_ambiguity: ") for issue in merged.issues)
+    sources = [node for node in graph.load_nodes() if node.node_type is NodeType.SOURCE]
+    assert {node.metadata["matek_primary_identifier"] for node in sources} == {
+        "doi:10.5555/first",
+        "doi:10.5555/second",
+    }
+    result_node = next(
+        node
+        for node in graph.load_nodes()
+        if node.metadata.get("matek_result_local_key") == "source-conflict-result"
+    )
+    assert {
+        edge.target_id for edge in result_node.relations if edge.relation is RelationType.CITES
+    } == {source.matek_id for source in sources}
+    decision_logs = list((graph.graph_root / "repairs").glob("source-identity-decision-*.json"))
+    assert len(decision_logs) == 1
+    decision = json.loads(decision_logs[0].read_text(encoding="utf-8"))
+    assert decision["failure_class"] == "source_identity_ambiguity"
+    assert decision["decisions"][0]["decision"] == "preserve_separate_source_nodes"
 
 
 @pytest.mark.asyncio
@@ -2259,6 +2282,107 @@ def test_compiled_sources_use_verified_entity_identity_and_arxiv_revision_aliase
     ]
 
 
+def test_compiled_multi_doi_versions_remain_distinct_and_record_decision(
+    tmp_path: Path,
+) -> None:
+    graph, problem, problem_id, _ = initialized_graph(tmp_path)
+    compiled_base = {
+        "title": "Matroid secretary theorem",
+        "normalized_statement": "For every test object, the desired property holds.",
+        "claim_contract": {"target": "the desired property"},
+        "literature_status": "resolved",
+    }
+    separate_versions = [
+        {
+            "source_id": "conference-version",
+            "title": "Online contention resolution schemes",
+            "authors": ["Moran Feldman", "Ola Svensson", "Rico Zenklusen"],
+            "identifiers": ["doi:10.1137/1.9781611973730.79"],
+            "verified": True,
+            "verification_detail": "The SODA publication resolved.",
+        },
+        {
+            "source_id": "journal-version",
+            "title": "Online contention resolution schemes",
+            "authors": ["Moran Feldman", "Ola Svensson", "Rico Zenklusen"],
+            "identifiers": ["doi:10.1287/moor.2017.0876"],
+            "verified": True,
+            "verification_detail": "The journal publication resolved.",
+        },
+    ]
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-two",
+    )
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-two",
+        compiled_problem={**compiled_base, "source_ledger": separate_versions},
+    )
+
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-three",
+    )
+    merged = graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-three",
+        compiled_problem={
+            **compiled_base,
+            "source_ledger": [
+                {
+                    "source_id": "feldman-svensson-zenklusen",
+                    "title": "Online contention resolution schemes",
+                    "authors": ["Moran Feldman", "Ola Svensson", "Rico Zenklusen"],
+                    "identifiers": [
+                        "DOI:10.1137/1.9781611973730.79",
+                        "https://doi.org/10.1287/MOOR.2017.0876",
+                    ],
+                    "verified": True,
+                    "verification_detail": "Both publication records resolved.",
+                }
+            ],
+        },
+    )
+
+    assert merged.committed
+    assert any(issue.startswith("source_identity_ambiguity: ") for issue in merged.issues)
+    sources = [node for node in graph.load_nodes() if node.node_type is NodeType.SOURCE]
+    assert len(sources) == 2
+    assert {node.metadata["matek_primary_identifier"] for node in sources} == {
+        "doi:10.1137/1.9781611973730.79",
+        "doi:10.1287/moor.2017.0876",
+    }
+    assert all(
+        len(
+            [
+                identifier
+                for identifier in node.metadata["matek_identifiers"]
+                if identifier.startswith("doi:")
+            ]
+        )
+        == 1
+        for node in sources
+    )
+    target = graph.show(graph.main_claim_id(problem_id))
+    cited_source_ids = {
+        edge.target_id for edge in target.relations if edge.relation is RelationType.CITES
+    }
+    assert cited_source_ids == {source.matek_id for source in sources}
+    decision_logs = list((graph.graph_root / "repairs").glob("source-identity-decision-*.json"))
+    assert len(decision_logs) == 1
+    decision = json.loads(decision_logs[0].read_text(encoding="utf-8"))
+    assert decision["decisions"][0]["doi_identifiers"] == [
+        "doi:10.1137/1.9781611973730.79",
+        "doi:10.1287/moor.2017.0876",
+    ]
+    assert set(decision["decisions"][0]["candidate_node_ids"]) == {
+        source.matek_id for source in sources
+    }
+
+
 def test_graph_doctor_repairs_source_identity_metadata_and_logs_the_transaction(
     tmp_path: Path,
 ) -> None:
@@ -2375,6 +2499,70 @@ def test_graph_doctor_repairs_source_identity_metadata_and_logs_the_transaction(
     with pytest.raises(GraphValidationError, match="lacks a canonical source identity"):
         graph.doctor(repair=True, problem_id=problem_id, run_id="run-five")
     assert graph.load_state().revision == revision_before_failed_repair
+
+
+def test_graph_doctor_marks_historical_mixed_doi_identity_without_losing_evidence(
+    tmp_path: Path,
+) -> None:
+    graph, problem, problem_id, _ = initialized_graph(tmp_path)
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-two",
+    )
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-two",
+        compiled_problem={
+            "title": "Test theorem",
+            "normalized_statement": "For every test object, the desired property holds.",
+            "claim_contract": {"target": "the desired property"},
+            "literature_status": "resolved",
+            "source_ledger": [
+                {
+                    "source_id": "historical-source",
+                    "title": "A conference paper",
+                    "identifiers": ["doi:10.1137/1.9781611973730.79"],
+                    "verified": True,
+                    "verification_detail": "The publication resolved.",
+                }
+            ],
+        },
+    )
+    with graph._locked():
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        source = next(node for node in nodes if node.node_type is NodeType.SOURCE)
+        source.metadata["matek_identifiers"] = [
+            "doi:10.1137/1.9781611973730.79",
+            "https://doi.org/10.1287/MOOR.2017.0876",
+        ]
+        source.evidence = ["The historical citation supports the recorded theorem."]
+        graph._commit_nodes_unlocked(
+            state=state,
+            all_nodes=nodes,
+            changed_node_ids=[source.matek_id],
+            run_id="legacy-run",
+            author="legacy-fixture",
+            reason="Simulate a historical mixed-publication source record.",
+            operation_id="legacy-mixed-doi-source",
+        )
+
+    planned = graph.doctor(problem_id=problem_id)
+    assert [action.rule for action in planned.actions] == ["multiple_doi_versions"]
+    assert planned.warnings[0].startswith("source_identity_ambiguity: ")
+
+    repaired = graph.doctor(repair=True, problem_id=problem_id, run_id="run-three")
+    assert repaired.actions[0].applied is True
+    assert repaired.repair_log is not None
+    repaired_source = graph.show(source.matek_id)
+    assert repaired_source.evidence == ["The historical citation supports the recorded theorem."]
+    decision = json.loads(str(repaired_source.metadata["matek_source_identity_decision"]))
+    assert decision["doi_identifiers"] == [
+        "doi:10.1137/1.9781611973730.79",
+        "doi:10.1287/moor.2017.0876",
+    ]
+    assert graph.doctor(problem_id=problem_id).actions == []
 
 
 def test_persistent_markdown_vault_survives_two_runs_and_rebuilds_index(

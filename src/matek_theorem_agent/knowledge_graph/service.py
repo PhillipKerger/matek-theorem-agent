@@ -40,12 +40,14 @@ from ..scientific import (
     transitive_result_dependency_keys,
 )
 from ..source_canonicalization import (
+    SOURCE_IDENTITY_AMBIGUITY_PREFIX,
     CanonicalSourceEntity,
     SourceCanonicalizationError,
     canonical_source_identifiers,
     conflicting_stable_source_identifiers,
     make_source_entity,
     merge_source_entities,
+    split_source_entity_by_doi,
 )
 from ..workspace import (
     atomic_write_json,
@@ -219,6 +221,64 @@ class _VerifiedWorkerSourceRecord:
     evidence_claims: tuple[tuple[str, tuple[str, ...]], ...]
 
 
+def _doi_identifiers(entity: CanonicalSourceEntity) -> tuple[str, ...]:
+    return tuple(identifier for identifier in entity.identifiers if identifier.startswith("doi:"))
+
+
+def _source_candidates_conflict(
+    candidates: Sequence[tuple[GraphNode, CanonicalSourceEntity]],
+) -> bool:
+    return any(
+        conflicting_stable_source_identifiers(left.identifiers, right.identifiers)
+        for index, (_, left) in enumerate(candidates)
+        for _, right in candidates[index + 1 :]
+    )
+
+
+def _source_identity_decision(
+    *,
+    context: str,
+    identifiers: Iterable[str],
+    aliases: Iterable[str] = (),
+    candidate_node_ids: Iterable[str] = (),
+) -> dict[str, object]:
+    normalized, _ = canonical_source_identifiers(identifiers)
+    return {
+        "type": "multiple_doi_versions",
+        "context": context,
+        "decision": "preserve_separate_source_nodes",
+        "doi_identifiers": [item for item in normalized if item.startswith("doi:")],
+        "aliases": sorted(set(aliases), key=str.casefold),
+        "candidate_node_ids": sorted(set(candidate_node_ids)),
+    }
+
+
+def _source_identity_issue(decision: Mapping[str, object]) -> str:
+    return SOURCE_IDENTITY_AMBIGUITY_PREFIX + _canonical_json(decision)
+
+
+def _source_identity_decision_artifact(
+    *,
+    graph_name: str,
+    problem_id: str,
+    run_id: str,
+    timestamp: datetime,
+    decisions: Sequence[Mapping[str, object]],
+) -> tuple[str, str]:
+    payload = {
+        "schema_version": 1,
+        "failure_class": "source_identity_ambiguity",
+        "graph_name": graph_name,
+        "problem_id": problem_id,
+        "run_id": run_id,
+        "timestamp": timestamp.isoformat(),
+        "decisions": list(decisions),
+    }
+    digest = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()[:20]
+    relative = f"repairs/source-identity-decision-{digest}.json"
+    return relative, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
 def _metadata_text_list(node: GraphNode, key: str) -> list[str]:
     raw = node.metadata.get(key)
     if not isinstance(raw, list):
@@ -265,14 +325,124 @@ def _source_entity_from_node(node: GraphNode) -> CanonicalSourceEntity:
         ) from exc
 
 
+def _source_candidate_node_ids(
+    existing_nodes: Iterable[GraphNode],
+    *,
+    problem_id: str,
+    identifiers: Iterable[str],
+) -> list[str]:
+    normalized, _ = canonical_source_identifiers(identifiers)
+    identifier_set = set(normalized)
+    return sorted(
+        node.matek_id
+        for node in existing_nodes
+        if node.node_type is NodeType.SOURCE
+        and node.problem_id == problem_id
+        and identifier_set.intersection(_source_entity_from_node(node).identifiers)
+    )
+
+
+def _compatible_existing_sources(
+    *,
+    existing_nodes: Iterable[GraphNode],
+    problem_id: str,
+    incoming: CanonicalSourceEntity,
+    deterministic_source_id: str,
+    context: str,
+    require_verified_overlap: bool,
+) -> tuple[
+    list[tuple[GraphNode, CanonicalSourceEntity]],
+    bool,
+    list[dict[str, object]],
+]:
+    """Resolve safe upgrades and isolate ambiguous DOI candidates."""
+
+    compatible: list[tuple[GraphNode, CanonicalSourceEntity]] = []
+    decisions: list[dict[str, object]] = []
+    blocked_direct = False
+    for candidate in existing_nodes:
+        if candidate.node_type is not NodeType.SOURCE or candidate.problem_id != problem_id:
+            continue
+        candidate_entity = _source_entity_from_node(candidate)
+        overlaps = bool(set(candidate_entity.identifiers).intersection(incoming.identifiers))
+        if len(_doi_identifiers(candidate_entity)) > 1:
+            if overlaps or candidate.matek_id == deterministic_source_id:
+                decisions.append(
+                    _source_identity_decision(
+                        context=context,
+                        identifiers=[*candidate_entity.identifiers, *incoming.identifiers],
+                        aliases=[*candidate_entity.aliases, *incoming.aliases],
+                        candidate_node_ids=[candidate.matek_id],
+                    )
+                )
+                blocked_direct = blocked_direct or candidate.matek_id == deterministic_source_id
+            continue
+        if (
+            candidate.matek_id == deterministic_source_id
+            and candidate_entity.source_key == incoming.source_key
+        ):
+            compatible.append((candidate, candidate_entity))
+            continue
+        if require_verified_overlap and (not incoming.verified or not candidate_entity.verified):
+            continue
+        if candidate.matek_id == deterministic_source_id and not overlaps:
+            raise GraphValidationError(
+                f"canonical source ID collision at {deterministic_source_id}"
+            )
+        if not overlaps:
+            continue
+        if conflicting_stable_source_identifiers(
+            candidate_entity.identifiers,
+            incoming.identifiers,
+        ):
+            decisions.append(
+                _source_identity_decision(
+                    context=context,
+                    identifiers=[*candidate_entity.identifiers, *incoming.identifiers],
+                    aliases=[*candidate_entity.aliases, *incoming.aliases],
+                    candidate_node_ids=[candidate.matek_id],
+                )
+            )
+            blocked_direct = blocked_direct or candidate.matek_id == deterministic_source_id
+            continue
+        compatible.append((candidate, candidate_entity))
+
+    if _source_candidates_conflict(compatible):
+        decisions.append(
+            _source_identity_decision(
+                context=f"{context}_ambiguous_matches",
+                identifiers=[
+                    identifier
+                    for _, candidate_entity in compatible
+                    for identifier in candidate_entity.identifiers
+                ],
+                aliases=[
+                    *incoming.aliases,
+                    *(
+                        alias
+                        for _, candidate_entity in compatible
+                        for alias in candidate_entity.aliases
+                    ),
+                ],
+                candidate_node_ids=[candidate.matek_id for candidate, _ in compatible],
+            )
+        )
+        blocked_direct = blocked_direct or any(
+            candidate.matek_id == deterministic_source_id for candidate, _ in compatible
+        )
+        compatible = []
+    return compatible, blocked_direct, decisions
+
+
 def _verified_worker_source_records(
     raw_ledger: object,
     *,
     source_artifact: str,
-) -> list[_VerifiedWorkerSourceRecord]:
+) -> tuple[list[_VerifiedWorkerSourceRecord], list[dict[str, object]]]:
     if not isinstance(raw_ledger, list):
         raise GraphValidationError("typed source_ledger must be a list")
     records: list[_VerifiedWorkerSourceRecord] = []
+    decisions: list[dict[str, object]] = []
     for index, raw_entry in enumerate(raw_ledger):
         if not isinstance(raw_entry, Mapping):
             raise GraphValidationError(
@@ -344,22 +514,38 @@ def _verified_worker_source_records(
             raise GraphValidationError(
                 f"verified source ledger entry {alias!r} has no valid stable identity: {exc}"
             ) from exc
-        records.append(
+        versions = split_source_entity_by_doi(entity)
+        if len(versions) > 1:
+            decisions.append(
+                _source_identity_decision(
+                    context="worker_source_ledger",
+                    identifiers=entity.identifiers,
+                    aliases=[alias],
+                )
+            )
+        records.extend(
             _VerifiedWorkerSourceRecord(
                 alias=alias,
-                entity=entity,
+                entity=version,
                 evidence_claims=tuple(evidence_claims),
             )
+            for version in versions
         )
-    return sorted(records, key=lambda item: (item.entity.source_key, item.alias))
+    return sorted(records, key=lambda item: (item.entity.source_key, item.alias)), decisions
 
 
 def _group_verified_worker_sources(
     records: Sequence[_VerifiedWorkerSourceRecord],
-) -> tuple[list[CanonicalSourceEntity], dict[str, str]]:
+) -> tuple[
+    list[CanonicalSourceEntity],
+    dict[str, set[str]],
+    list[dict[str, object]],
+]:
     """Merge records only through exact aliases or canonical stable identifiers."""
 
     parents = list(range(len(records)))
+    group_members = [{index} for index in range(len(records))]
+    decisions: list[dict[str, object]] = []
 
     def find(index: int) -> int:
         while parents[index] != index:
@@ -367,11 +553,39 @@ def _group_verified_worker_sources(
             index = parents[index]
         return index
 
-    def union(left: int, right: int) -> None:
+    def union(left: int, right: int) -> bool:
         left_root = find(left)
         right_root = find(right)
-        if left_root != right_root:
-            parents[max(left_root, right_root)] = min(left_root, right_root)
+        if left_root == right_root:
+            return True
+        left_identifiers = {
+            identifier
+            for index in group_members[left_root]
+            for identifier in records[index].entity.identifiers
+        }
+        right_identifiers = {
+            identifier
+            for index in group_members[right_root]
+            for identifier in records[index].entity.identifiers
+        }
+        if conflicting_stable_source_identifiers(left_identifiers, right_identifiers):
+            decisions.append(
+                _source_identity_decision(
+                    context="worker_source_grouping",
+                    identifiers=[*left_identifiers, *right_identifiers],
+                    aliases=[
+                        records[index].alias
+                        for index in group_members[left_root] | group_members[right_root]
+                    ],
+                )
+            )
+            return False
+        root = min(left_root, right_root)
+        child = max(left_root, right_root)
+        parents[child] = root
+        group_members[root].update(group_members[child])
+        group_members[child].clear()
+        return True
 
     for left, left_record in enumerate(records):
         left_identifiers = set(left_record.entity.identifiers)
@@ -382,25 +596,14 @@ def _group_verified_worker_sources(
             )
             if not overlaps:
                 continue
-            conflicts = conflicting_stable_source_identifiers(
-                left_record.entity.identifiers,
-                right_record.entity.identifiers,
-            )
-            if conflicts:
-                schemes = ", ".join(sorted(conflicts))
-                raise GraphValidationError(
-                    "verified source records overlap through an alias or low-precedence "
-                    f"identifier but assert conflicting {schemes} identities"
-                )
-            if overlaps:
-                union(left, right)
+            union(left, right)
 
     grouped: dict[int, list[_VerifiedWorkerSourceRecord]] = defaultdict(list)
     for index, record in enumerate(records):
         grouped[find(index)].append(record)
 
     entities: list[CanonicalSourceEntity] = []
-    reference_to_key: dict[str, str] = {}
+    reference_to_keys: dict[str, set[str]] = defaultdict(set)
     for members in grouped.values():
         identifiers = sorted(
             {identifier for member in members for identifier in member.entity.identifiers}
@@ -446,20 +649,20 @@ def _group_verified_worker_sources(
         )
         entities.append(entity)
         for reference in [entity.source_key, *entity.identifiers, *aliases]:
-            prior = reference_to_key.get(reference)
-            if prior is not None and prior != entity.source_key:
-                raise GraphValidationError(
-                    f"verified source reference {reference!r} resolves to multiple entities"
-                )
-            reference_to_key[reference] = entity.source_key
-    return sorted(entities, key=lambda item: item.source_key), reference_to_key
+            reference_to_keys[reference].add(entity.source_key)
+    unique_decisions = {_canonical_json(decision): decision for decision in decisions}
+    return (
+        sorted(entities, key=lambda item: item.source_key),
+        dict(reference_to_keys),
+        list(unique_decisions.values()),
+    )
 
 
 def _explicit_result_source_keys(
     records: Sequence[_VerifiedWorkerSourceRecord],
     *,
     typed_results: Sequence[ScientificResult],
-    reference_to_key: Mapping[str, str],
+    reference_to_keys: Mapping[str, set[str]],
 ) -> tuple[dict[str, set[str]], dict[str, list[str]], list[str]]:
     by_local_key = {result.local_key: result.local_key for result in typed_results}
     by_statement: dict[str, list[str]] = defaultdict(list)
@@ -472,15 +675,16 @@ def _explicit_result_source_keys(
         for claim, source_references in record.evidence_claims:
             resolved_keys: set[str] = set()
             for reference in source_references:
-                source_key = reference_to_key.get(reference)
-                if source_key is None:
+                source_keys = reference_to_keys.get(reference)
+                if not source_keys:
                     issues.append(
                         f"verified evidence claim references unknown or unverified source "
                         f"{reference!r}"
                     )
                     continue
-                resolved_keys.add(source_key)
-                evidence_by_source[source_key].append(claim)
+                resolved_keys.update(source_keys)
+                for source_key in source_keys:
+                    evidence_by_source[source_key].append(claim)
             if not resolved_keys:
                 continue
             result_keys: list[str] = []
@@ -580,17 +784,37 @@ def _verified_worker_source_nodes(
     run_id: str,
     source_artifact: str,
     now: datetime,
-) -> tuple[list[GraphNode], dict[str, set[str]], list[str]]:
-    records = _verified_worker_source_records(
+) -> tuple[
+    list[GraphNode],
+    dict[str, set[str]],
+    list[str],
+    list[dict[str, object]],
+]:
+    records, decisions = _verified_worker_source_records(
         raw_ledger,
         source_artifact=source_artifact,
     )
-    entities, reference_to_key = _group_verified_worker_sources(records)
+    decisions = [
+        {
+            **decision,
+            "candidate_node_ids": _source_candidate_node_ids(
+                existing_nodes.values(),
+                problem_id=problem_id,
+                identifiers=cast(list[str], decision["doi_identifiers"]),
+            ),
+        }
+        if not decision["candidate_node_ids"]
+        else decision
+        for decision in decisions
+    ]
+    entities, reference_to_keys, grouping_decisions = _group_verified_worker_sources(records)
+    decisions.extend(grouping_decisions)
     result_source_keys, evidence_by_source, issues = _explicit_result_source_keys(
         records,
         typed_results=typed_results,
-        reference_to_key=reference_to_key,
+        reference_to_keys=reference_to_keys,
     )
+    issues.extend(_source_identity_issue(decision) for decision in decisions)
     source_nodes: list[GraphNode] = []
     source_ids_by_key: dict[str, str] = {}
     run_node_id = _deterministic_id(NodeType.RUN, problem_id, run_id)
@@ -601,39 +825,16 @@ def _verified_worker_source_nodes(
             problem_id,
             incoming_key,
         )
-        direct = existing_nodes.get(deterministic_source_id)
-        compatible_existing: list[tuple[GraphNode, CanonicalSourceEntity]] = []
-        for candidate in existing_nodes.values():
-            if candidate.node_type is not NodeType.SOURCE or candidate.problem_id != problem_id:
-                continue
-            candidate_entity = _source_entity_from_node(candidate)
-            overlaps = bool(set(candidate_entity.identifiers).intersection(incoming.identifiers))
-            if candidate.matek_id == deterministic_source_id and not overlaps:
-                raise GraphValidationError(
-                    f"canonical source ID collision at {deterministic_source_id}"
-                )
-            if not overlaps:
-                continue
-            conflicts = conflicting_stable_source_identifiers(
-                candidate_entity.identifiers,
-                incoming.identifiers,
-            )
-            if conflicts:
-                schemes = ", ".join(sorted(conflicts))
-                raise GraphValidationError(
-                    "verified source overlaps an existing low-precedence identifier "
-                    f"but asserts conflicting {schemes} identity"
-                )
-            compatible_existing.append((candidate, candidate_entity))
-        if direct is not None and not any(
-            candidate.matek_id == direct.matek_id for candidate, _ in compatible_existing
-        ):
-            direct_entity = _source_entity_from_node(direct)
-            if direct_entity.source_key != incoming_key:
-                raise GraphValidationError(
-                    f"canonical source ID collision at {deterministic_source_id}"
-                )
-            compatible_existing.append((direct, direct_entity))
+        compatible_existing, blocked_direct, candidate_decisions = _compatible_existing_sources(
+            existing_nodes=existing_nodes.values(),
+            problem_id=problem_id,
+            incoming=incoming,
+            deterministic_source_id=deterministic_source_id,
+            context="worker_existing_source_upgrade",
+            require_verified_overlap=False,
+        )
+        decisions.extend(candidate_decisions)
+        issues.extend(_source_identity_issue(decision) for decision in candidate_decisions)
         compatible_existing.sort(
             key=lambda item: (
                 item[0].matek_id != deterministic_source_id,
@@ -642,7 +843,15 @@ def _verified_worker_source_nodes(
             )
         )
         existing = compatible_existing[0][0] if compatible_existing else None
-        source_id = existing.matek_id if existing is not None else deterministic_source_id
+        source_id = (
+            existing.matek_id
+            if existing is not None
+            else (
+                _deterministic_id(NodeType.SOURCE, problem_id, incoming_key, "doi-version")
+                if blocked_direct
+                else deterministic_source_id
+            )
+        )
         source_ids_by_key[incoming_key] = source_id
         if compatible_existing:
             incoming = _merge_compatible_source_identities(
@@ -768,7 +977,13 @@ def _verified_worker_source_nodes(
         }
         for result_key, source_keys in result_source_keys.items()
     }
-    return source_nodes, result_source_ids, issues
+    unique_decisions = {_canonical_json(decision): decision for decision in decisions}
+    return (
+        source_nodes,
+        result_source_ids,
+        list(dict.fromkeys(issues)),
+        list(unique_decisions.values()),
+    )
 
 
 def _utc_now() -> datetime:
@@ -794,6 +1009,97 @@ def _replace_generated_heading_value(body: str, title: str, heading: str, value:
     if count == 0:
         updated = generated.rstrip() + f"\n\n## {heading}\n\n{value.strip()}"
     return replace_generated_section(body, title, updated)
+
+
+def _mixed_doi_source_repair(
+    node: GraphNode,
+    run_id: str,
+    timestamp: datetime,
+) -> tuple[GraphNode, GraphHygieneAction] | None:
+    """Normalize and mark a historical source that contains distinct DOI versions."""
+
+    raw_identifiers = _metadata_text_list(node, "matek_identifiers")
+    raw_revisions = _metadata_text_list(node, "matek_identifier_revisions")
+    identifiers, revisions = canonical_source_identifiers([*raw_identifiers, *raw_revisions])
+    dois = [identifier for identifier in identifiers if identifier.startswith("doi:")]
+    if len(dois) <= 1:
+        return None
+    primary_value = node.metadata.get("matek_primary_identifier")
+    primary_candidates, _ = canonical_source_identifiers(
+        [primary_value] if isinstance(primary_value, str) else []
+    )
+    primary = next(
+        (identifier for identifier in primary_candidates if identifier in identifiers),
+        dois[0],
+    )
+    decision = _source_identity_decision(
+        context="graph_doctor_historical_source",
+        identifiers=identifiers,
+        aliases=_metadata_text_list(node, "matek_source_aliases"),
+        candidate_node_ids=[node.matek_id],
+    )
+    raw_identity_decision = node.metadata.get("matek_source_identity_decision")
+    normalized_identity_decision: object = raw_identity_decision
+    if isinstance(raw_identity_decision, str):
+        try:
+            normalized_identity_decision = json.loads(raw_identity_decision)
+        except json.JSONDecodeError:
+            pass
+    before: dict[str, object] = {
+        "primary_identifier": primary_value,
+        "identifiers": raw_identifiers,
+        "identifier_revisions": raw_revisions,
+        "identity_decision": normalized_identity_decision,
+    }
+    after: dict[str, object] = {
+        "primary_identifier": primary,
+        "identifiers": identifiers,
+        "identifier_revisions": revisions,
+        "identity_decision": decision,
+    }
+    if before == after:
+        return None
+
+    repaired = node.model_copy(deep=True)
+    repaired.metadata["matek_primary_identifier"] = primary
+    repaired.metadata["matek_identifiers"] = identifiers
+    repaired.metadata["matek_identifier_revisions"] = revisions
+    repaired.metadata["matek_source_identity_decision"] = _canonical_json(decision)
+    repaired.body = _replace_generated_heading_value(
+        repaired.body,
+        repaired.title,
+        "Stable identifiers",
+        "\n".join(f"- `{identifier}`" for identifier in identifiers),
+    )
+    repaired.body = _replace_generated_heading_value(
+        repaired.body,
+        repaired.title,
+        "Identifier revisions",
+        "\n".join(f"- `{revision}`" for revision in revisions) or "_None._",
+    )
+    repaired.body = _replace_generated_heading_value(
+        repaired.body,
+        repaired.title,
+        "Identity review",
+        (
+            "This historical record contains multiple DOI publication versions. "
+            "It is retained without merging or deleting evidence; new ingestion preserves "
+            "one canonical source node per DOI."
+        ),
+    )
+    repaired.last_modified_run = run_id
+    repaired.author_role = "matek-graph-hygiene"
+    repaired.updated_at = timestamp
+    _source_entity_from_node(repaired)
+    warning = _source_identity_issue(decision)
+    return repaired, GraphHygieneAction(
+        rule="multiple_doi_versions",
+        node_id=node.matek_id,
+        before=before,
+        after=after,
+        warning=warning,
+        timestamp=timestamp,
+    )
 
 
 def _source_primary_identifier_repair(
@@ -885,7 +1191,10 @@ def _source_primary_identifier_repair(
 _SOURCE_HYGIENE_RULES: dict[
     str,
     Callable[[GraphNode, str, datetime], tuple[GraphNode, GraphHygieneAction] | None],
-] = {"primary_identifier_in_identifiers": _source_primary_identifier_repair}
+] = {
+    "multiple_doi_versions": _mixed_doi_source_repair,
+    "primary_identifier_in_identifiers": _source_primary_identifier_repair,
+}
 
 
 def _deterministic_id(node_type: NodeType, *parts: str) -> str:
@@ -1982,6 +2291,7 @@ class KnowledgeGraph:
         path_overrides: Mapping[str, str] | None = None,
         removed_paths: Sequence[str] = (),
         additional_writes: Mapping[str, str] | None = None,
+        issues: Sequence[str] = (),
     ) -> GraphMergeResult:
         if operation_id in state.processed_operations:
             previous = state.processed_operations[operation_id]
@@ -2101,6 +2411,7 @@ class KnowledgeGraph:
                 node_id for node_id in changed if previous_hashes[node_id] is not None
             ],
             stale_node_ids=list(dict.fromkeys(stale_node_ids)),
+            issues=list(dict.fromkeys(issues)),
         )
         next_state = state.model_copy(deep=True)
         next_state.revision_number = next_number
@@ -4011,6 +4322,7 @@ class KnowledgeGraph:
         source_artifacts: Sequence[str] = (),
         stale_node_ids: Sequence[str] = (),
         additional_writes: Mapping[str, str] | None = None,
+        issues: Sequence[str] = (),
     ) -> GraphMergeResult:
         if operation_id in state.processed_operations:
             prior = state.processed_operations[operation_id]
@@ -4145,6 +4457,7 @@ class KnowledgeGraph:
             source_artifacts=source_artifacts,
             stale_node_ids=stale_node_ids,
             additional_writes=additional_writes,
+            issues=issues,
         )
 
     @staticmethod
@@ -4836,6 +5149,7 @@ class KnowledgeGraph:
             proposed: list[GraphNode] = [problem, target]
             source_nodes: list[GraphNode] = []
             source_entities: dict[str, Any] = {}
+            source_identity_decisions: list[dict[str, object]] = []
             raw_sources = compiled_problem.get("source_ledger", [])
             if isinstance(raw_sources, list):
                 for raw_source in raw_sources:
@@ -4869,12 +5183,27 @@ class KnowledgeGraph:
                         raise GraphValidationError(
                             f"compiled source ledger entry has invalid identity: {exc}"
                         ) from exc
-                    previous_entity = source_entities.get(entity.source_key)
-                    source_entities[entity.source_key] = (
-                        merge_source_entities(previous_entity, entity)
-                        if previous_entity is not None
-                        else entity
-                    )
+                    versions = split_source_entity_by_doi(entity)
+                    if len(versions) > 1:
+                        source_identity_decisions.append(
+                            _source_identity_decision(
+                                context="compiled_source_ledger",
+                                identifiers=entity.identifiers,
+                                aliases=entity.aliases,
+                                candidate_node_ids=_source_candidate_node_ids(
+                                    by_id.values(),
+                                    problem_id=problem_id,
+                                    identifiers=entity.identifiers,
+                                ),
+                            )
+                        )
+                    for version in versions:
+                        previous_entity = source_entities.get(version.source_key)
+                        source_entities[version.source_key] = (
+                            merge_source_entities(previous_entity, version)
+                            if previous_entity is not None
+                            else version
+                        )
 
                 for source_key, entity in sorted(source_entities.items()):
                     deterministic_source_id = _deterministic_id(
@@ -4882,42 +5211,19 @@ class KnowledgeGraph:
                         problem_id,
                         source_key,
                     )
-                    compatible_existing: list[tuple[GraphNode, CanonicalSourceEntity]] = []
-                    for candidate in by_id.values():
-                        if (
-                            candidate.node_type is not NodeType.SOURCE
-                            or candidate.problem_id != problem_id
-                        ):
-                            continue
-                        candidate_entity = _source_entity_from_node(candidate)
-                        if (
-                            candidate.matek_id == deterministic_source_id
-                            and candidate_entity.source_key == source_key
-                        ):
-                            compatible_existing.append((candidate, candidate_entity))
-                            continue
-                        if not entity.verified or not candidate_entity.verified:
-                            continue
-                        overlaps = bool(
-                            set(candidate_entity.identifiers).intersection(entity.identifiers)
-                        )
-                        if candidate.matek_id == deterministic_source_id and not overlaps:
-                            raise GraphValidationError(
-                                f"canonical source ID collision at {deterministic_source_id}"
-                            )
-                        if not overlaps:
-                            continue
-                        conflicts = conflicting_stable_source_identifiers(
-                            candidate_entity.identifiers,
-                            entity.identifiers,
-                        )
-                        if conflicts:
-                            schemes = ", ".join(sorted(conflicts))
-                            raise GraphValidationError(
-                                "compiled source overlaps an existing low-precedence "
-                                f"identifier but asserts conflicting {schemes} identity"
-                            )
-                        compatible_existing.append((candidate, candidate_entity))
+                    (
+                        compatible_existing,
+                        blocked_direct,
+                        candidate_decisions,
+                    ) = _compatible_existing_sources(
+                        existing_nodes=by_id.values(),
+                        problem_id=problem_id,
+                        incoming=entity,
+                        deterministic_source_id=deterministic_source_id,
+                        context="compiled_existing_source_upgrade",
+                        require_verified_overlap=True,
+                    )
+                    source_identity_decisions.extend(candidate_decisions)
                     compatible_existing.sort(
                         key=lambda item: (
                             item[0].matek_id != deterministic_source_id,
@@ -4944,7 +5250,16 @@ class KnowledgeGraph:
                     source_id = (
                         existing_source.matek_id
                         if existing_source is not None
-                        else deterministic_source_id
+                        else (
+                            _deterministic_id(
+                                NodeType.SOURCE,
+                                problem_id,
+                                source_key,
+                                "doi-version",
+                            )
+                            if blocked_direct
+                            else deterministic_source_id
+                        )
                     )
                     superseded_source_ids = [
                         candidate.matek_id
@@ -5057,6 +5372,22 @@ class KnowledgeGraph:
                         )
                     )
             proposed.extend(source_nodes)
+            unique_identity_decisions = {
+                _canonical_json(decision): decision for decision in source_identity_decisions
+            }
+            source_identity_decisions = list(unique_identity_decisions.values())
+            source_identity_writes: dict[str, str] = {}
+            source_identity_artifacts: list[str] = []
+            if source_identity_decisions:
+                decision_path, decision_contents = _source_identity_decision_artifact(
+                    graph_name=self.graph_name,
+                    problem_id=problem_id,
+                    run_id=run_id,
+                    timestamp=now,
+                    decisions=source_identity_decisions,
+                )
+                source_identity_writes[decision_path] = decision_contents
+                source_identity_artifacts.append(decision_path)
             return self._upsert_generated_nodes_unlocked(
                 state=state,
                 nodes=by_id,
@@ -5065,13 +5396,18 @@ class KnowledgeGraph:
                 author="prompt-compiler",
                 reason="Compile the exact target and source ledger into the persistent graph.",
                 operation_id=f"prompt-compiled:{run_id}",
-                source_artifacts=[f".matek/runs/{run_id}/prompts/compiled_problem.json"],
+                source_artifacts=[
+                    f".matek/runs/{run_id}/prompts/compiled_problem.json",
+                    *source_identity_artifacts,
+                ],
                 stale_node_ids=[target_id, *stale_nodes] if stale_nodes else (),
                 additional_writes={
                     self.target_registry_path.relative_to(self.vault_root).as_posix(): (
                         render_target_registry(target_registry)
-                    )
+                    ),
+                    **source_identity_writes,
                 },
+                issues=[_source_identity_issue(decision) for decision in source_identity_decisions],
             )
 
     def record_assignment_tasks(
@@ -5948,7 +6284,12 @@ class KnowledgeGraph:
                             )
                         )
                         admitted_node.metadata["matek_originating_approach_refuted"] = approach_id
-                source_nodes, result_source_ids, source_issues = _verified_worker_source_nodes(
+                (
+                    source_nodes,
+                    result_source_ids,
+                    source_issues,
+                    source_identity_decisions,
+                ) = _verified_worker_source_nodes(
                     report.get("source_ledger", []),
                     typed_results=typed_results,
                     existing_nodes=by_id,
@@ -6033,6 +6374,18 @@ class KnowledgeGraph:
                     )
                 if relation_issues:
                     raise GraphValidationError("; ".join(relation_issues))
+                source_identity_writes: dict[str, str] = {}
+                source_identity_artifacts: list[str] = []
+                if source_identity_decisions:
+                    decision_path, decision_contents = _source_identity_decision_artifact(
+                        graph_name=self.graph_name,
+                        problem_id=problem_id,
+                        run_id=run_id,
+                        timestamp=now,
+                        decisions=source_identity_decisions,
+                    )
+                    source_identity_writes[decision_path] = decision_contents
+                    source_identity_artifacts.append(decision_path)
                 merged = self._upsert_generated_nodes_unlocked(
                     state=state,
                     nodes=by_id,
@@ -6041,7 +6394,9 @@ class KnowledgeGraph:
                     author="matek-scientific-admission",
                     reason=(f"Admit typed scientific report {assignment_id} deterministically."),
                     operation_id=operation_id,
-                    source_artifacts=[source_artifact],
+                    source_artifacts=[source_artifact, *source_identity_artifacts],
+                    additional_writes=source_identity_writes,
+                    issues=source_issues,
                 )
                 return merged.model_copy(
                     update={

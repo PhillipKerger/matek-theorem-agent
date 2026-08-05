@@ -299,7 +299,10 @@ formalization, and generates a reproducible final report.
   identical entity key. Same-title works with distinct identifiers remain separate and unverified
   records remain open under a provisional title/author fingerprint. Worker-result `CITES` edges
   are created only from explicit result-source references; separately verified compiler-literature
-  citations remain attached to the frozen target.
+  citations remain attached to the frozen target. Equivalent DOI syntax shall deduplicate, while
+  distinct DOI publication versions shall remain separate. Ambiguous aliases or existing matches
+  preserve every usable source and citation, emit a structured provenance decision, and shall not
+  block research unless an active proof dependency has no usable source identity.
 - `matek graph migrate-legacy` shall default to an integrity-protected, read-only plan outside the
   vault. Applying requires that exact external plan through `--apply-plan`, interactive confirmation
   or `--yes`, and successful integrity, graph-name, source-revision, and archive-digest checks.

@@ -12,6 +12,7 @@ from matek_theorem_agent.source_canonicalization import (
     make_source_entity,
     merge_exact_claim_entities,
     merge_source_entities,
+    split_source_entity_by_doi,
 )
 
 
@@ -93,6 +94,44 @@ def test_shared_url_does_not_erase_conflicting_doi_identities() -> None:
     assert conflicts == {
         "doi": (("doi:10.1000/first",), ("doi:10.1000/second",)),
     }
+
+
+def test_same_doi_renderings_deduplicate_without_splitting() -> None:
+    entity = make_source_entity(
+        title="One publication",
+        identifiers=[
+            "DOI:10.5555/ABC",
+            "https://doi.org/10.5555/abc",
+        ],
+        verified=True,
+    )
+
+    assert split_source_entity_by_doi(entity) == [entity]
+    assert entity.identifiers == ["doi:10.5555/abc"]
+
+
+def test_distinct_dois_split_while_preserving_shared_provenance() -> None:
+    entity = make_source_entity(
+        title="Conference and journal versions",
+        identifiers=[
+            "doi:10.1137/1.9781611973730.79",
+            "doi:10.1287/moor.2017.0876",
+            "arxiv:1407.0001v2",
+        ],
+        source_alias="feldman-svensson-zenklusen",
+        verification_provenance=["Both publications were independently resolved."],
+        verified=True,
+    )
+
+    versions = split_source_entity_by_doi(entity)
+
+    assert [version.source_key for version in versions] == [
+        "doi:10.1137/1.9781611973730.79",
+        "doi:10.1287/moor.2017.0876",
+    ]
+    assert all(version.primary_identifier == version.source_key for version in versions)
+    assert all("arxiv:1407.0001" in version.identifiers for version in versions)
+    assert all(version.aliases == ["feldman-svensson-zenklusen"] for version in versions)
 
 
 def test_canonical_identifier_extraction_returns_base_and_revision() -> None:

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Preserved conference, journal, and other publication versions as separate canonical source
+  nodes when a ledger or historical upgrade contains distinct DOI values. Equivalent DOI syntax
+  still deduplicates. Ambiguous aliases and lower-precedence identifiers now retain every source
+  and citation, emit a non-blocking structured provenance warning, and transactionally write a
+  source-identity decision artifact; graph doctor marks historical mixed-DOI records with the same
+  auditable policy instead of blocking research.
 - Replaced the remaining broad randomized/deterministic qualifier heuristic with structured
   randomness alignment. Target artifacts now compare algorithm randomization, arrival order,
   weight-adversary timing, expectation sources, pathwise feasibility, and value-guarantee mode as

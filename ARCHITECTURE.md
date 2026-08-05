@@ -331,7 +331,10 @@ Versions, aliases, titles, evidence links, and verification provenance merge onl
 entity key; title similarity cannot merge distinct identifiers. Unverified title/author records
 remain open under provisional fingerprints. Worker scientific admission creates result `CITES`
 edges only for explicit result references; verified compiler literature remains separately linked
-to the frozen target.
+to the frozen target. Multi-DOI ledger records split at ingestion into one publication source per
+normalized DOI. Ambiguous aliases and lower-precedence identifiers fan evidence out to the retained
+candidates and commit a structured source-identity decision artifact; this provenance warning is
+non-blocking for research scheduling.
 
 Eligible non-main, gap-free results on the current uncapped smallest open cut enter a separate
 lemma-audit transaction under `research/lemma-audits/<nomination-id>/`. Its frozen blind packet

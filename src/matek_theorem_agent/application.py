@@ -23,6 +23,7 @@ from .execution.base import ExecutionBackend
 from .failures import classify_failure, recovery_obligations
 from .intake import ingest_problem
 from .knowledge_graph import (
+    GraphMergeResult,
     GraphNotInitializedError,
     GraphValidationError,
     KnowledgeGraph,
@@ -592,8 +593,8 @@ class WorkflowRunner:
         compiled_problem: Mapping[str, Any],
         options: WorkflowOptions,
     ) -> None:
-        def record() -> None:
-            graph.record_compiled_problem(
+        def record() -> GraphMergeResult:
+            return graph.record_compiled_problem(
                 problem_id=self._graph_problem_id(state),
                 run_id=state.run_id,
                 compiled_problem=compiled_problem,
@@ -605,8 +606,7 @@ class WorkflowRunner:
             )
 
         try:
-            record()
-            return
+            result = record()
         except GraphValidationError:
             retry_counts = state.metadata.get("graph_hygiene_retry_counts", {})
             counts = dict(retry_counts) if isinstance(retry_counts, dict) else {}
@@ -624,8 +624,20 @@ class WorkflowRunner:
             counts[StageName.PROMPT_COMPILATION.value] = retry_count + 1
             state.metadata["graph_hygiene_retry_counts"] = counts
             store.save(state)
-        # Exactly one retry is permitted after an applicable deterministic repair.
-        record()
+            # Exactly one retry is permitted after an applicable deterministic repair.
+            result = record()
+        if result.issues:
+            raw_warnings = state.metadata.get("source_provenance_warnings", [])
+            warnings = list(raw_warnings) if isinstance(raw_warnings, list) else []
+            state.metadata["source_provenance_warnings"] = list(
+                dict.fromkeys([*warnings, *result.issues])
+            )
+            logger.event(
+                "graph.source_identity.preserved",
+                stage=StageName.PROMPT_COMPILATION,
+                data={"warnings": result.issues},
+            )
+            store.save(state)
 
     def _budget_tracker(
         self,

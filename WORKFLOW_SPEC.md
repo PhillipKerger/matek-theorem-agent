@@ -96,6 +96,12 @@ Each hard stop must name its clause-local structured conflict; uncertainty is wa
 current fail-closed alignment reasons are the concrete conflicts enumerated in the inventory
 above, never the isolated presence or absence of a word.
 
+Source identity uses normalized DOI values as publication-version keys. If one source label carries
+multiple distinct DOIs, prompt and worker ingestion deterministically retain one source node per
+DOI, map an ambiguous evidence reference to all preserved candidates, and write a structured graph
+decision artifact. Shared titles, authors, aliases, URLs, or preprint identifiers cannot overwrite
+one DOI with another. This ambiguity is warning-only unless an active proof dependency genuinely
+requires one publication identity and no usable source can be retained.
 
 Every source states whether it identifies the target or supports a literature claim. Failure to
 verify target-identification evidence pauses for clarification. Failure to resolve literature-only

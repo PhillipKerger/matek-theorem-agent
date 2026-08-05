@@ -14,6 +14,7 @@ from .source_identifiers import source_identifiers
 
 _ARXIV_REVISION = re.compile(r"\A(arxiv:.+?)(v\d+)\Z", re.IGNORECASE)
 _STRONG_IDENTIFIER_PREFIXES = ("doi:", "arxiv:", "mr:", "isbn:")
+SOURCE_IDENTITY_AMBIGUITY_PREFIX = "source_identity_ambiguity: "
 
 
 class SourceCanonicalizationError(ValueError):
@@ -187,6 +188,35 @@ def make_source_entity(
         verification_provenance=list(verification_provenance),
         verified=verified,
     )
+
+
+def split_source_entity_by_doi(
+    entity: CanonicalSourceEntity,
+) -> list[CanonicalSourceEntity]:
+    """Keep distinct DOI publications as separate canonical source entities.
+
+    A compiler or worker may use one local source label for conference and
+    journal versions of a work.  Shared titles, aliases, and non-DOI
+    identifiers are useful provenance, but they do not make distinct DOI
+    values interchangeable.
+    """
+
+    dois = [identifier for identifier in entity.identifiers if identifier.startswith("doi:")]
+    if len(dois) <= 1:
+        return [entity]
+    shared_identifiers = [
+        identifier for identifier in entity.identifiers if not identifier.startswith("doi:")
+    ]
+    return [
+        entity.model_copy(
+            update={
+                "source_key": doi,
+                "primary_identifier": doi if entity.verified else None,
+                "identifiers": sorted([*shared_identifiers, doi]),
+            }
+        )
+        for doi in dois
+    ]
 
 
 def merge_source_entities(

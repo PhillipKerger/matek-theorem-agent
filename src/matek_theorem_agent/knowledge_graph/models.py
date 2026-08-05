@@ -371,7 +371,7 @@ class GraphValidationReport(_GraphModel):
 
 
 class GraphHygieneAction(_GraphModel):
-    rule: Literal["primary_identifier_in_identifiers"]
+    rule: Literal["primary_identifier_in_identifiers", "multiple_doi_versions"]
     failure_class: Literal["metadata_invariant"] = "metadata_invariant"
     node_id: str
     before: dict[str, object]
