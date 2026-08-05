@@ -80,10 +80,11 @@ include = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not comprehensive'"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
+  "comprehensive: slower exhaustive workflow scenarios run explicitly before releases",
   "live: explicitly enabled tests that may use network, paid APIs, or local tools",
   "codex_live: opt-in authenticated Codex CLI tests that consume Codex allowance",
 ]

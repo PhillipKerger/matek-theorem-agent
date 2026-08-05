@@ -37,7 +37,7 @@ Prefer focused changes with tests for every affected state transition, failure m
 boundary. Dependency injection is used for model providers, subprocesses, clocks, and
 filesystem-sensitive behavior so unit tests remain deterministic.
 
-Run the complete offline quality suite before opening a pull request:
+Run the focused offline quality suite while developing:
 
 ```bash
 .venv/bin/ruff check .
@@ -46,6 +46,13 @@ Run the complete offline quality suite before opening a pull request:
 .venv/bin/pytest -q
 .venv/bin/python scripts/verify_project.py
 .venv/bin/python -m build
+```
+
+Before opening a pull request or preparing a release, also run the comprehensive offline workflow
+scenarios. This overrides the default marker filter and runs every offline test:
+
+```bash
+.venv/bin/pytest -q -o addopts=-ra
 ```
 
 If a Pydantic type represented in `resources/schemas/` changes, regenerate and commit its schema:

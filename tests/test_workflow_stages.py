@@ -143,6 +143,8 @@ from matek_theorem_agent.stages.scientific_phase import (
     load_scientific_phase_state,
 )
 
+pytestmark = pytest.mark.comprehensive
+
 PROJECT = Path(__file__).resolve().parents[1]
 FRAMEWORK = PROJECT / "resources" / "prompts" / "research_prompt_framework.txt"
 PROMPT_COMPILER_INSTRUCTIONS = PROJECT / "resources" / "prompts" / "prompt_compiler.md"

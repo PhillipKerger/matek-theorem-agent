@@ -36,7 +36,12 @@ from matek_theorem_agent.config import (
 )
 from matek_theorem_agent.execution.base import CommandRequest, CommandResult
 from matek_theorem_agent.intake import ingest_problem
-from matek_theorem_agent.knowledge_graph import GraphNotInitializedError, KnowledgeGraph, NodeType
+from matek_theorem_agent.knowledge_graph import (
+    GraphNotInitializedError,
+    GraphValidationError,
+    KnowledgeGraph,
+    NodeType,
+)
 from matek_theorem_agent.models import ScientificStatus, StageName, StageStatus
 from matek_theorem_agent.openai_client import ModelRequest, ModelResult
 from matek_theorem_agent.progress import Ascension
@@ -97,6 +102,8 @@ from matek_theorem_agent.stages.research import (
     adapt_research_worker_report_v1,
 )
 from matek_theorem_agent.state import StateStore
+
+pytestmark = pytest.mark.comprehensive
 
 E2E_CLAIM_CONTRACT = {
     "quantifiers": "for every natural number n",
@@ -1961,6 +1968,13 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
 
     assert first_graph["problem_id"] == second_graph["problem_id"]
     assert first_graph["revision"] != second_graph["revision"]
+    assert first_graph["canonical_target"]["status"] == "created"
+    assert second_graph["canonical_target"]["status"] == "reused"
+    assert (
+        first_graph["canonical_target"]["contract_sha256"]
+        == second_graph["canonical_target"]["contract_sha256"]
+    )
+    assert "Canonical target: `reused`" in second.report.report_markdown.read_text(encoding="utf-8")
     graph = KnowledgeGraph(project, "problem")
     nodes = graph.load_nodes()
     assert len([node for node in nodes if node.node_type is NodeType.PROBLEM]) == 1
@@ -1996,6 +2010,30 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
         coordinator_payloads[1]["knowledge_graph_memory"]["graph_revision"]
         in second_decision["rationale"]
     )
+
+
+@pytest.mark.asyncio
+async def test_target_bind_failure_finalizes_the_prompt_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runner, _, _, _ = workflow_runner(project, accepted=True)
+
+    def reject_target_bind(*args: object, **kwargs: object) -> None:
+        raise GraphValidationError("possible target change requires explicit migration")
+
+    monkeypatch.setattr(KnowledgeGraph, "record_compiled_problem", reject_target_bind)
+    result = await runner.run_new(
+        make_problem(project),
+        project,
+        options=WorkflowOptions(research_only=True),
+        environment_snapshot={"fixture": "offline"},
+    )
+
+    assert result.state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.FAILED
+    assert result.report.report.workflow_status == "PAUSED_RETRIABLE"
 
 
 @pytest.mark.asyncio

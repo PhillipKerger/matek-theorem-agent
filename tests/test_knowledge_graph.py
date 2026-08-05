@@ -2065,7 +2065,7 @@ async def test_replayed_computation_creates_immutable_artifacts_and_proposed_der
         )
 
 
-def test_recompiling_unchanged_source_reuses_frozen_target_and_requires_explicit_migration(
+def test_recompiling_unchanged_source_reuses_frozen_target_across_contract_layouts(
     tmp_path: Path,
 ) -> None:
     graph, problem, problem_id, _ = initialized_graph(tmp_path)
@@ -2080,7 +2080,10 @@ def test_recompiling_unchanged_source_reuses_frozen_target_and_requires_explicit
         compiled_problem={
             "title": "Paraphrased test theorem",
             "normalized_statement": "All test objects enjoy the desired property.",
-            "claim_contract": {"target": "the desired property"},
+            "claim_contract": {
+                "model": "all finite test objects, including degenerate cases",
+                "success": "the desired property with no additive error",
+            },
             "literature_status": "open_problem",
             "source_ledger": [],
         },
@@ -2095,9 +2098,15 @@ def test_recompiling_unchanged_source_reuses_frozen_target_and_requires_explicit
     assert frozen.exact_statement == "For every test object, the desired property holds."
     assert json.loads(frozen.canonical_contract_json) == {"target": "the desired property"}
 
+
+def test_edited_user_problem_requires_an_explicit_target_migration(tmp_path: Path) -> None:
+    graph, problem, problem_id, _ = initialized_graph(tmp_path)
+    changed_problem = "Prove the property only for nonempty test objects.\n"
+    problem.write_text(changed_problem, encoding="utf-8")
+
     graph.initialize_problem(
         source_path=problem,
-        problem_text=problem.read_text(encoding="utf-8"),
+        problem_text=changed_problem,
         run_id="run-three",
     )
     changed = {

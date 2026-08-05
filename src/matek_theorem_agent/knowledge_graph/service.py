@@ -4453,42 +4453,86 @@ class KnowledgeGraph:
             try:
                 target_registry = load_target_registry(self.target_registry_path)
                 if existing_target is not None and source_hash not in target_registry.targets:
-                    prior_contract_text = _generated_heading_value(
-                        existing_target.body, "Scope and conventions"
-                    )
-                    prior_contract: object = incoming_contract
-                    if prior_contract_text:
-                        try:
-                            prior_contract = json.loads(prior_contract_text)
-                        except json.JSONDecodeError:
-                            incoming_contract_hash = sha256_text(
-                                canonical_contract_json(incoming_contract)
+                    prior_targets = [
+                        item
+                        for item in target_registry.targets.values()
+                        if item.target_node_id == target_id
+                    ]
+                    if prior_targets:
+                        if not allow_target_migration:
+                            raise TargetRegistryError(
+                                "the user-authored problem changed; an explicit target migration "
+                                "and reason are required"
                             )
-                            recorded_contract_hash = existing_target.metadata.get(
-                                "matek_claim_contract_sha256"
-                            )
-                            if recorded_contract_hash != incoming_contract_hash:
-                                raise TargetRegistryError(
-                                    "legacy target contract cannot be reconstructed safely"
-                                ) from None
+                        prior = max(
+                            prior_targets,
+                            key=lambda item: (item.statement_version, item.established_run_id),
+                        )
+                        prior_title = prior.title
+                        prior_statement = prior.exact_statement
+                        prior_contract = json.loads(prior.canonical_contract_json)
+                        prior_prompt = prior.compiled_prompt
+                        prior_run_id = prior.established_run_id
+                    else:
+                        # One-time compatibility path for graphs created before the target
+                        # registry existed.  The graph note, not fresh compiler prose, is the
+                        # best available canonical target.
+                        prior_contract_text = _generated_heading_value(
+                            existing_target.body, "Scope and conventions"
+                        )
+                        prior_contract = incoming_contract
+                        if prior_contract_text:
+                            try:
+                                prior_contract = json.loads(prior_contract_text)
+                            except json.JSONDecodeError:
+                                incoming_contract_hash = sha256_text(
+                                    canonical_contract_json(incoming_contract)
+                                )
+                                recorded_contract_hash = existing_target.metadata.get(
+                                    "matek_claim_contract_sha256"
+                                )
+                                if recorded_contract_hash != incoming_contract_hash:
+                                    raise TargetRegistryError(
+                                        "legacy target contract cannot be reconstructed safely"
+                                    ) from None
+                        prior_title = existing_target.title.removeprefix("Main target — ")
+                        prior_statement = exact_statement(existing_target.body)
+                        prior_prompt = incoming_prompt
+                        prior_run_id = existing_target.created_in_run
                     target_registry, _ = bind_frozen_target(
                         target_registry,
                         normalized_source_sha256=source_hash,
                         target_node_id=target_id,
-                        title=existing_target.title.removeprefix("Main target — "),
-                        exact_statement=exact_statement(existing_target.body),
+                        title=prior_title,
+                        exact_statement=prior_statement,
                         claim_contract=prior_contract,
-                        compiled_prompt=incoming_prompt,
-                        run_id=existing_target.created_in_run,
+                        compiled_prompt=prior_prompt,
+                        run_id=prior_run_id,
                     )
+
+                # An unchanged normalized source hash is the deliberately cheap sanity
+                # check for a normal repeat run.  Its frozen target is authoritative:
+                # stochastic compiler wording and JSON layout must not enter the strict
+                # migration comparison at all.
+                existing_frozen = target_registry.targets.get(source_hash)
+                if existing_frozen is not None and not allow_target_migration:
+                    bind_title = existing_frozen.title
+                    bind_statement = existing_frozen.exact_statement
+                    bind_contract = json.loads(existing_frozen.canonical_contract_json)
+                    bind_prompt = existing_frozen.compiled_prompt
+                else:
+                    bind_title = title
+                    bind_statement = incoming_statement
+                    bind_contract = incoming_contract
+                    bind_prompt = incoming_prompt
                 target_registry, binding = bind_frozen_target(
                     target_registry,
                     normalized_source_sha256=source_hash,
                     target_node_id=target_id,
-                    title=title,
-                    exact_statement=incoming_statement,
-                    claim_contract=incoming_contract,
-                    compiled_prompt=incoming_prompt,
+                    title=bind_title,
+                    exact_statement=bind_statement,
+                    claim_contract=bind_contract,
+                    compiled_prompt=bind_prompt,
                     run_id=run_id,
                     allow_material_migration=allow_target_migration,
                     migration_reason=target_migration_reason,

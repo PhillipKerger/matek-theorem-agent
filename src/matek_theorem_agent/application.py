@@ -449,7 +449,21 @@ class WorkflowRunner:
             "statement_sha256": frozen.statement_sha256,
             "contract_sha256": frozen.contract_sha256,
             "statement_version": frozen.statement_version,
+            "disposition": (
+                "migrated"
+                if frozen.last_migration_run_id == state.run_id
+                else "created"
+                if frozen.established_run_id == state.run_id
+                else "reused"
+            ),
         }
+        graph_metadata = state.metadata.get("knowledge_graph")
+        if isinstance(graph_metadata, dict):
+            graph_metadata["canonical_target"] = {
+                "status": state.metadata["frozen_target"]["disposition"],
+                "target_id": frozen.target_node_id,
+                "contract_sha256": frozen.contract_sha256,
+            }
         return rebound
 
     def _record_lean_graph_result(
@@ -1897,21 +1911,27 @@ class WorkflowRunner:
             state.metadata["research_status"] = ScientificStatus.PROMPT_COMPILED.value
         graph = self._knowledge_graph_for_state(state)
         if not result.needs_clarification:
-            graph.record_compiled_problem(
-                problem_id=self._graph_problem_id(state),
-                run_id=state.run_id,
-                compiled_problem=result.compiled_problem.model_dump(mode="json"),
-                normalized_source_sha256=str(state.metadata.get("problem_normalized_sha256") or "")
-                or None,
-                allow_target_migration=bool(options.target_migration_reason),
-                target_migration_reason=options.target_migration_reason,
-            )
-            result.compiled_problem = self._bind_frozen_compiled_target(
-                state=state,
-                graph=graph,
-                compiled=result.compiled_problem,
-                persist_prompt_artifacts=True,
-            )
+            try:
+                graph.record_compiled_problem(
+                    problem_id=self._graph_problem_id(state),
+                    run_id=state.run_id,
+                    compiled_problem=result.compiled_problem.model_dump(mode="json"),
+                    normalized_source_sha256=str(
+                        state.metadata.get("problem_normalized_sha256") or ""
+                    )
+                    or None,
+                    allow_target_migration=bool(options.target_migration_reason),
+                    target_migration_reason=options.target_migration_reason,
+                )
+                result.compiled_problem = self._bind_frozen_compiled_target(
+                    state=state,
+                    graph=graph,
+                    compiled=result.compiled_problem,
+                    persist_prompt_artifacts=True,
+                )
+            except Exception as exc:
+                self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)
+                raise
         self._refresh_graph_metadata(state, graph)
         self._checkpoint(
             state,

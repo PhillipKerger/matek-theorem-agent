@@ -280,5 +280,12 @@ ruff check .
 ruff format --check .
 mypy src
 pytest -q
+pytest -q -o addopts=-ra
 python scripts/verify_project.py
 ```
+
+The default test command runs the focused offline suite. The two large banks of exhaustive
+workflow scenarios are marked `comprehensive` because they repeatedly construct complete graph
+and workflow fixtures and dominate local feedback time. The explicit `addopts` override runs the
+entire offline suite before a release; it does not enable live model, network, Lean, or LaTeX
+smoke tests.

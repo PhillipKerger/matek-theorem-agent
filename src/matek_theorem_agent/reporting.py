@@ -484,9 +484,18 @@ def render_report_markdown(report: FinalReport) -> str:
                 f"- Obsidian vault: [open Home](../../../knowledge/{graph_name}/Home.md) "
                 f"(project path: `{graph_vault}`)",
                 f"- Rebuildable index: project path `{graph_index}`",
-                "",
             ]
         )
+        canonical_target = report.knowledge_graph.get("canonical_target")
+        if isinstance(canonical_target, dict):
+            lines.extend(
+                [
+                    f"- Canonical target: `{canonical_target.get('status', 'unknown')}`",
+                    f"- Target ID: `{canonical_target.get('target_id', 'unknown')}`",
+                    f"- Contract SHA-256: `{canonical_target.get('contract_sha256', 'unknown')}`",
+                ]
+            )
+        lines.append("")
 
     lines.extend(
         [
