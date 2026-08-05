@@ -197,6 +197,11 @@
       "title": "Retriable Actions",
       "type": "array"
     },
+    "root_failure": {
+      "additionalProperties": true,
+      "title": "Root Failure",
+      "type": "object"
+    },
     "run_id": {
       "title": "Run Id",
       "type": "string"

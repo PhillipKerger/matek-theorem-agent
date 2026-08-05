@@ -38,7 +38,7 @@ from matek_theorem_agent.execution.base import CommandRequest, CommandResult
 from matek_theorem_agent.intake import ingest_problem
 from matek_theorem_agent.knowledge_graph import (
     GraphNotInitializedError,
-    GraphValidationError,
+    GraphTargetValidationError,
     KnowledgeGraph,
     NodeType,
 )
@@ -1958,6 +1958,45 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
         environment_snapshot={"fixture": "offline"},
     )
     first_graph = dict(first.state.metadata["knowledge_graph"])
+    graph = KnowledgeGraph(project, "problem")
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="historical-source-run",
+    )
+    graph.record_compiled_problem(
+        problem_id=str(first_graph["problem_id"]),
+        run_id="historical-source-run",
+        compiled_problem={
+            "title": "Offline fixture theorem",
+            "normalized_statement": "Prove P(n) for every natural number n.",
+            "claim_contract": E2E_CLAIM_CONTRACT,
+            "compiled_prompt": covered_compiled_prompt(),
+            "source_ledger": [
+                {
+                    "source_id": "historical-paper",
+                    "title": "Historical source metadata fixture",
+                    "identifiers": ["arxiv:2103.04205", "doi:10.1137/24m1630207"],
+                    "verified": True,
+                    "verification_detail": "Both fixture identifiers resolved.",
+                }
+            ],
+        },
+    )
+    with graph._locked():
+        graph_state = graph._load_state_unlocked()
+        graph_nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        historical_source = next(node for node in graph_nodes if node.node_type is NodeType.SOURCE)
+        historical_source.metadata["matek_primary_identifier"] = "arxiv:9999.99999"
+        graph._commit_nodes_unlocked(
+            state=graph_state,
+            all_nodes=graph_nodes,
+            changed_node_ids=[historical_source.matek_id],
+            run_id="historical-source-run",
+            author="legacy-fixture",
+            reason="Simulate repairable historical source metadata drift.",
+            operation_id="historical-source-metadata-drift",
+        )
     second = await runner.run_new(
         problem,
         project,
@@ -1975,8 +2014,13 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
         == second_graph["canonical_target"]["contract_sha256"]
     )
     assert "Canonical target: `reused`" in second.report.report_markdown.read_text(encoding="utf-8")
-    graph = KnowledgeGraph(project, "problem")
+    recovery = second.state.metadata["graph_hygiene_recovery"]
+    assert recovery[0]["status"] == "succeeded"
+    assert recovery[0]["affected_ids"] == [historical_source.matek_id]
+    assert second.state.stages[StageName.RESEARCH].status is StageStatus.SUCCEEDED
     nodes = graph.load_nodes()
+    repaired_source = next(node for node in nodes if node.matek_id == historical_source.matek_id)
+    assert repaired_source.metadata["matek_primary_identifier"] == "doi:10.1137/24m1630207"
     assert len([node for node in nodes if node.node_type is NodeType.PROBLEM]) == 1
     assert any(node.node_type is NodeType.TASK for node in nodes)
     assert any(node.node_type is NodeType.APPROACH for node in nodes)
@@ -2022,7 +2066,7 @@ async def test_target_bind_failure_finalizes_the_prompt_stage(
     runner, _, _, _ = workflow_runner(project, accepted=True)
 
     def reject_target_bind(*args: object, **kwargs: object) -> None:
-        raise GraphValidationError("possible target change requires explicit migration")
+        raise GraphTargetValidationError("possible target change requires explicit migration")
 
     monkeypatch.setattr(KnowledgeGraph, "record_compiled_problem", reject_target_bind)
     result = await runner.run_new(
@@ -2033,7 +2077,13 @@ async def test_target_bind_failure_finalizes_the_prompt_stage(
     )
 
     assert result.state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.FAILED
+    assert result.state.scientific_status is ScientificStatus.RECEIVED
     assert result.report.report.workflow_status == "PAUSED_RETRIABLE"
+    assert result.report.report.root_failure["blocking_stage"] == "prompt_compilation"
+    assert result.report.report.root_failure["failure_class"] == "scientific_target"
+    assert "Blocking stage: `prompt_compilation`" in result.report.report_markdown.read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.asyncio

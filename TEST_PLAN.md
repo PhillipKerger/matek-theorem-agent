@@ -18,6 +18,9 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   model-authored `graph_patch` payloads.
 - Human prose/statement edits, statement version increments, proof re-audit, managed-field
   conflicts, unknown Markdown notes, crash recovery, snapshots, diffs, and SQLite rebuilds.
+- Problem-scoped graph-hygiene inspection and transactional source-identifier repair, including
+  before/after audit artifacts, no-identifier warning/downgrade behavior, failed-repair atomicity,
+  bounded stage retry, and immutable-target non-regression.
 - Content-addressed snapshot deltas, blob deduplication, periodic checkpoints, integrity/content
   roots, deterministic reconstruction, corruption rejection, schema-v1 read compatibility, and
   byte-preserving legacy-to-v2 continuation.

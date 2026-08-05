@@ -337,6 +337,10 @@ Graph commands are local and model-free:
 - `matek graph status` renders a typed machine-readable summary. `frontier [--problem-id ID]`
   includes `main_target`, `live_derivations`, `strongest_audited_results`, `open_obligations`,
   `smallest_known_open_cut`, and `open_cut_search_capped`.
+- `matek graph doctor [--repair] [--problem-id ID]` inspects generated source metadata without
+  model calls. `--repair` applies only whitelisted local invariants in one recoverable graph
+  transaction, records an append-only before/after artifact, and rebuilds derived projections.
+  It never changes the canonical target or mathematical proof dependencies.
 - `matek graph rebuild-index` recreates SQLite from authoritative Markdown.
 - `matek graph open` attempts Obsidian and otherwise succeeds gracefully while printing the
   vault path for manual opening.

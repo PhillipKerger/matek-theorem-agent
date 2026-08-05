@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .models import RunState
+from .models import STAGE_ORDER, RunState, StageStatus
 from .state import ArtifactIntegrityError
 from .workspace import atomic_write_json, atomic_write_text, sha256_file
 
@@ -64,6 +64,7 @@ class FinalReport(BaseModel):
     prompt_validation_warnings: list[str] = Field(default_factory=list)
     source_provenance_warnings: list[str] = Field(default_factory=list)
     execution_issues: list[dict[str, Any]] = Field(default_factory=list)
+    root_failure: dict[str, Any] = Field(default_factory=dict)
     manuscript_findings: list[dict[str, Any]] = Field(default_factory=list)
     stage_statuses: dict[str, str] = Field(default_factory=dict)
     skipped_stages: list[dict[str, str]] = Field(default_factory=list)
@@ -204,6 +205,57 @@ def _research_checkpoint_summary(run_root: Path) -> dict[str, Any]:
     }
 
 
+def blocking_failure_summary(state: RunState) -> dict[str, Any]:
+    """Return the single persisted stage failure that currently blocks progress."""
+
+    for stage in STAGE_ORDER:
+        record = state.stages[stage]
+        if record.status not in {StageStatus.FAILED, StageStatus.INTERRUPTED}:
+            continue
+        failure = record.failure
+        details = failure.details if failure is not None else {}
+        failure_class = str(
+            details.get("failure_class")
+            or (failure.category.value if failure is not None else "unknown")
+        )
+        raw_recoveries = state.metadata.get("graph_hygiene_recovery", [])
+        recoveries = raw_recoveries if isinstance(raw_recoveries, list) else []
+        recovery = next(
+            (
+                item
+                for item in reversed(recoveries)
+                if isinstance(item, dict)
+                and item.get("stage") == stage.value
+                and item.get("trigger") == "stage_failure"
+            ),
+            None,
+        )
+        obligations = details.get("recovery_obligations", [])
+        next_action = state.metadata.get("resume_action")
+        if next_action is None and isinstance(obligations, list) and obligations:
+            next_action = obligations[0]
+        if recovery is None:
+            automatic_recovery = "unavailable"
+        else:
+            automatic_recovery = "attempted; the bounded stage retry still failed"
+        return {
+            "blocking_stage": stage.value,
+            "category": failure.category.value if failure is not None else "execution",
+            "failure_class": failure_class,
+            "kind": failure.kind if failure is not None else "Interrupted",
+            "root_cause": (
+                failure.message
+                if failure is not None
+                else record.error or "The stage was interrupted before completion."
+            ),
+            "automatic_recovery": automatic_recovery,
+            "next_action": str(next_action)
+            if next_action
+            else "Inspect the recorded stage failure.",
+        }
+    return {}
+
+
 def build_final_report(
     state: RunState,
     *,
@@ -213,8 +265,18 @@ def build_final_report(
 
     run_root = state.run_root.resolve()
     metadata = state.metadata
+    root_failure = blocking_failure_summary(state)
     scientific = str(metadata.get("research_status", state.scientific_status.value))
     workflow = str(metadata.get("workflow_status", "COMPLETE"))
+    if root_failure and workflow in {"RUNNING", "COMPLETE"}:
+        workflow = (
+            "HARD_STOPPED" if root_failure.get("category") == "integrity" else "PAUSED_RETRIABLE"
+        )
+    if (
+        root_failure.get("blocking_stage") == "prompt_compilation"
+        and scientific == "PROMPT_COMPILED"
+    ):
+        scientific = "RECEIVED"
     manuscript = str(metadata.get("manuscript_status", "NOT_STARTED"))
     publication = str(metadata.get("publication_status", "NOT_ASSESSED"))
     lean = str(metadata.get("lean_status", "NOT_STARTED"))
@@ -318,6 +380,7 @@ def build_final_report(
             if isinstance(metadata.get("execution_issues", []), list)
             else []
         ),
+        root_failure=root_failure,
         manuscript_findings=manuscript_findings,
         stage_statuses=stage_statuses,
         skipped_stages=skipped_stages,
@@ -358,6 +421,20 @@ def render_report_markdown(report: FinalReport) -> str:
         f"| Lean | `{report.lean_status}` |",
         "",
     ]
+    if report.root_failure:
+        lines.extend(
+            [
+                "## Blocking failure",
+                "",
+                f"- Blocking stage: `{report.root_failure.get('blocking_stage', 'unknown')}`",
+                f"- Failure class: `{report.root_failure.get('failure_class', 'unknown')}`",
+                f"- Root cause: {report.root_failure.get('root_cause', 'Unavailable')}",
+                "- Automatic recovery: "
+                f"{report.root_failure.get('automatic_recovery', 'unavailable')}",
+                f"- Next action: {report.root_failure.get('next_action', 'Inspect the failure.')}",
+                "",
+            ]
+        )
     if report.skipped_stages:
         lines.extend(["## Skipped stages", ""])
         lines.extend(f"- `{item['stage']}` — {item['reason']}" for item in report.skipped_stages)

@@ -366,6 +366,15 @@ operation IDs, and change records; `target-registry.json` freezes source-hash ta
 serialized. This placement preserves the default no-write-outside-`.matek/` boundary and prevents
 unrelated problems from sharing memory by default.
 
+Before prompt compilation spends a model call, graph hygiene scans only source nodes for the
+active problem. The initial rule normalizes identifiers and repairs a redundant primary identifier
+that is absent from the identifier list. It commits through the ordinary graph transaction, so the
+Markdown note, snapshot, navigation, and SQLite index advance together, and writes an append-only
+`repairs/` artifact containing the rule and before/after values. Missing stable identifiers
+downgrade the source to an unverified warning. Immutable targets, theorem statements, proof claims,
+and dependency semantics are not eligible for this resolver; target changes still require explicit
+migration.
+
 Snapshot schema v2 publishes a small manifest only after its immutable content-addressed node and
 edge blobs and optional checkpoint are durable. Each manifest binds its parent integrity root and
 a content root for the complete reconstructed blob set, plus the SHA-256 digest of the exact

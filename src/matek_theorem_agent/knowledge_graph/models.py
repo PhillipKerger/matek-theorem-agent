@@ -370,6 +370,34 @@ class GraphValidationReport(_GraphModel):
     issues: list[GraphValidationIssue] = Field(default_factory=list)
 
 
+class GraphHygieneAction(_GraphModel):
+    rule: Literal["primary_identifier_in_identifiers"]
+    failure_class: Literal["metadata_invariant"] = "metadata_invariant"
+    node_id: str
+    before: dict[str, object]
+    after: dict[str, object]
+    applied: bool = False
+    warning: str | None = None
+    timestamp: datetime
+
+    @field_validator("node_id")
+    @classmethod
+    def node_id_is_valid(cls, value: str) -> str:
+        return validate_node_id(value)
+
+
+class GraphHygieneReport(_GraphModel):
+    graph_name: str
+    problem_id: str | None = None
+    inspected_source_count: int = Field(ge=0)
+    repair_requested: bool
+    previous_revision: str
+    new_revision: str
+    actions: list[GraphHygieneAction] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    repair_log: str | None = None
+
+
 class GraphNodeSummary(_GraphModel):
     matek_id: str
     node_type: NodeType
@@ -512,6 +540,8 @@ __all__ = [
     "GraphDiff",
     "GraphEdge",
     "GraphFrontier",
+    "GraphHygieneAction",
+    "GraphHygieneReport",
     "GraphMergeResult",
     "GraphNode",
     "GraphNodeCreate",

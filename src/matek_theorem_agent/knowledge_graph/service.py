@@ -42,6 +42,7 @@ from ..scientific import (
 from ..source_canonicalization import (
     CanonicalSourceEntity,
     SourceCanonicalizationError,
+    canonical_source_identifiers,
     conflicting_stable_source_identifiers,
     make_source_entity,
     merge_source_entities,
@@ -112,6 +113,8 @@ from .models import (
     GraphDiff,
     GraphEdge,
     GraphFrontier,
+    GraphHygieneAction,
+    GraphHygieneReport,
     GraphMergeResult,
     GraphNode,
     GraphNodeSummary,
@@ -201,6 +204,14 @@ class GraphValidationError(KnowledgeGraphError):
     pass
 
 
+class GraphMetadataInvariantError(GraphValidationError):
+    failure_class = "metadata_invariant"
+
+
+class GraphTargetValidationError(GraphValidationError):
+    failure_class = "scientific_target"
+
+
 @dataclass(frozen=True)
 class _VerifiedWorkerSourceRecord:
     alias: str
@@ -249,7 +260,7 @@ def _source_entity_from_node(node: GraphNode) -> CanonicalSourceEntity:
             verified=verified,
         )
     except ValueError as exc:
-        raise GraphValidationError(
+        raise GraphMetadataInvariantError(
             f"existing canonical source node {node.matek_id} is malformed: {exc}"
         ) from exc
 
@@ -773,6 +784,108 @@ def _generated_heading_value(body: str, heading: str) -> str | None:
     pattern = re.compile(rf"(?ms)^##\s+{re.escape(heading)}\s*$\n+(.*?)(?=^##\s+|\Z)")
     match = pattern.search(generated)
     return match.group(1).strip() if match is not None else None
+
+
+def _replace_generated_heading_value(body: str, title: str, heading: str, value: str) -> str:
+    generated = generated_section(body)
+    pattern = re.compile(rf"(?ms)(^##\s+{re.escape(heading)}\s*$\n+).*?(?=^##\s+|\Z)")
+    replacement = rf"\g<1>{value.strip()}\n\n"
+    updated, count = pattern.subn(replacement, generated, count=1)
+    if count == 0:
+        updated = generated.rstrip() + f"\n\n## {heading}\n\n{value.strip()}"
+    return replace_generated_section(body, title, updated)
+
+
+def _source_primary_identifier_repair(
+    node: GraphNode,
+    run_id: str,
+    timestamp: datetime,
+) -> tuple[GraphNode, GraphHygieneAction] | None:
+    """Return the one whitelisted source-metadata repair, if needed."""
+
+    raw_identifiers = _metadata_text_list(node, "matek_identifiers")
+    raw_revisions = _metadata_text_list(node, "matek_identifier_revisions")
+    identifiers, revisions = canonical_source_identifiers([*raw_identifiers, *raw_revisions])
+    primary_value = node.metadata.get("matek_primary_identifier")
+    raw_primary = str(primary_value).strip() if isinstance(primary_value, str) else None
+    primary_candidates, _ = canonical_source_identifiers([raw_primary] if raw_primary else [])
+    normalized_primary = primary_candidates[0] if len(primary_candidates) == 1 else None
+    if normalized_primary not in identifiers:
+        normalized_primary = next(
+            (identifier for identifier in identifiers if identifier.startswith("doi:")),
+            identifiers[0] if identifiers else None,
+        )
+    verified = bool(node.metadata.get("matek_verified", False))
+    repaired_verified = verified and bool(identifiers)
+    before: dict[str, object] = {
+        "primary_identifier": primary_value,
+        "identifiers": raw_identifiers,
+        "identifier_revisions": raw_revisions,
+        "verified": verified,
+    }
+    after: dict[str, object] = {
+        "primary_identifier": normalized_primary,
+        "identifiers": identifiers,
+        "identifier_revisions": revisions,
+        "verified": repaired_verified,
+    }
+    if before == after:
+        return None
+
+    repaired = node.model_copy(deep=True)
+    repaired.metadata["matek_primary_identifier"] = normalized_primary
+    repaired.metadata["matek_identifiers"] = identifiers
+    repaired.metadata["matek_identifier_revisions"] = revisions
+    repaired.metadata["matek_verified"] = repaired_verified
+    repaired.body = _replace_generated_heading_value(
+        repaired.body,
+        repaired.title,
+        "Stable identifiers",
+        "\n".join(f"- `{identifier}`" for identifier in identifiers) or "_None._",
+    )
+    repaired.body = _replace_generated_heading_value(
+        repaired.body,
+        repaired.title,
+        "Identifier revisions",
+        "\n".join(f"- `{revision}`" for revision in revisions) or "_None._",
+    )
+    warning: str | None = None
+    if not identifiers:
+        warning = (
+            f"Source {node.matek_id} has no stable identifier; retained as unverified metadata."
+        )
+        repaired.epistemic_status = EpistemicStatus.OPEN
+        repaired.workflow_status = WorkflowStatus.ACTIVE
+        repaired.tags = [tag for tag in repaired.tags if tag != "matek/source-verified"]
+        repaired.tags = list(dict.fromkeys([*repaired.tags, "matek/source-open"]))
+        verification = _generated_heading_value(repaired.body, "Verification") or ""
+        downgrade = "Not independently verified: no stable identifier is currently recorded."
+        if downgrade not in verification:
+            repaired.body = _replace_generated_heading_value(
+                repaired.body,
+                repaired.title,
+                "Verification",
+                "\n\n".join(item for item in (verification, downgrade) if item),
+            )
+    repaired.last_modified_run = run_id
+    repaired.author_role = "matek-graph-hygiene"
+    repaired.updated_at = timestamp
+    # Validate only the affected source. Mathematical claims and targets are not touched.
+    _source_entity_from_node(repaired)
+    return repaired, GraphHygieneAction(
+        rule="primary_identifier_in_identifiers",
+        node_id=node.matek_id,
+        before=before,
+        after=after,
+        warning=warning,
+        timestamp=timestamp,
+    )
+
+
+_SOURCE_HYGIENE_RULES: dict[
+    str,
+    Callable[[GraphNode, str, datetime], tuple[GraphNode, GraphHygieneAction] | None],
+] = {"primary_identifier_in_identifiers": _source_primary_identifier_repair}
 
 
 def _deterministic_id(node_type: NodeType, *parts: str) -> str:
@@ -2239,6 +2352,104 @@ class KnowledgeGraph:
             self._canonical_ledgers_unlocked(state, nodes, persist=True)
             self._write_navigation_unlocked(state, nodes)
             return self._rebuild_index_unlocked(state, nodes)
+
+    def doctor(
+        self,
+        *,
+        repair: bool = False,
+        problem_id: str | None = None,
+        run_id: str = "SYSTEM",
+    ) -> GraphHygieneReport:
+        """Inspect or transactionally repair whitelisted generated source metadata."""
+
+        with self._locked():
+            self._recover_pending_unlocked()
+            state = self._load_state_unlocked()
+            nodes = self._load_nodes_unlocked(include_human_notes=True)
+            if problem_id is not None and not any(
+                node.matek_id == problem_id and node.node_type is NodeType.PROBLEM for node in nodes
+            ):
+                raise GraphValidationError(f"problem node does not exist: {problem_id}")
+            selected = [
+                node
+                for node in nodes
+                if node.node_type is NodeType.SOURCE
+                and not node.tombstone
+                and (problem_id is None or node.problem_id == problem_id)
+            ]
+            timestamp = self._now()
+            repaired_nodes: dict[str, GraphNode] = {}
+            actions: list[GraphHygieneAction] = []
+            for node in sorted(selected, key=lambda item: item.matek_id):
+                for rule in _SOURCE_HYGIENE_RULES.values():
+                    planned = rule(node, run_id, timestamp)
+                    if planned is None:
+                        continue
+                    repaired_node, action = planned
+                    repaired_nodes[node.matek_id] = repaired_node
+                    actions.append(action)
+                    break
+            warnings = [action.warning for action in actions if action.warning is not None]
+            if not repair or not actions:
+                return GraphHygieneReport(
+                    graph_name=self.graph_name,
+                    problem_id=problem_id,
+                    inspected_source_count=len(selected),
+                    repair_requested=repair,
+                    previous_revision=state.revision,
+                    new_revision=state.revision,
+                    actions=actions,
+                    warnings=warnings,
+                )
+
+            by_id = {node.matek_id: node for node in nodes}
+            by_id.update(repaired_nodes)
+            applied_actions = [action.model_copy(update={"applied": True}) for action in actions]
+            action_payloads = [action.model_dump(mode="json") for action in applied_actions]
+            repair_sha256 = hashlib.sha256(
+                _canonical_json(action_payloads).encode("utf-8")
+            ).hexdigest()
+            operation_id = f"graph-hygiene:{repair_sha256[:20]}"
+            repair_log = f"repairs/{operation_id.replace(':', '-')}.json"
+            log_payload = {
+                "schema_version": 1,
+                "failure_class": "metadata_invariant",
+                "graph_name": self.graph_name,
+                "problem_id": problem_id,
+                "run_id": run_id,
+                "timestamp": timestamp.isoformat(),
+                "actions": action_payloads,
+            }
+            result = self._commit_nodes_unlocked(
+                state=state,
+                all_nodes=list(by_id.values()),
+                changed_node_ids=sorted(repaired_nodes),
+                run_id=run_id,
+                author="matek-graph-hygiene",
+                reason="Repair whitelisted generated source identity metadata.",
+                operation_id=operation_id,
+                source_artifacts=[repair_log],
+                additional_writes={
+                    repair_log: json.dumps(
+                        log_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                },
+            )
+            return GraphHygieneReport(
+                graph_name=self.graph_name,
+                problem_id=problem_id,
+                inspected_source_count=len(selected),
+                repair_requested=True,
+                previous_revision=result.previous_revision,
+                new_revision=result.new_revision,
+                actions=applied_actions,
+                warnings=warnings,
+                repair_log=repair_log,
+            )
 
     @staticmethod
     def _relation_issue(edge: GraphEdge, by_id: Mapping[str, GraphNode]) -> str | None:
@@ -4538,7 +4749,9 @@ class KnowledgeGraph:
                     migration_reason=target_migration_reason,
                 )
             except (TargetRegistryError, ValueError) as exc:
-                raise GraphValidationError(f"cannot bind the immutable main target: {exc}") from exc
+                raise GraphTargetValidationError(
+                    f"cannot bind the immutable main target: {exc}"
+                ) from exc
 
             frozen = binding.target
             normalized_statement = frozen.exact_statement

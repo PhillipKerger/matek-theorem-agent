@@ -566,7 +566,11 @@ URL. ArXiv revisions and report-local aliases are retained on one source note; s
 with different identifiers remain separate. Unverified title/author fingerprints remain open, and
 fuzzy title similarity alone never merges sources. A worker result gets a `CITES` edge only when it
 explicitly references that source; separately verified compiler literature remains linked to the
-frozen target.
+frozen target. Before prompt-model work, a deterministic graph-hygiene pass checks source records
+for the active problem. It transactionally normalizes an inconsistent primary identifier, rebuilds
+derived graph views, and records the exact before/after values under `repairs/`. A source with no
+stable identifier remains available as unverified metadata with a warning; this does not rewrite
+the theorem, a proof claim, or evidence semantics.
 
 After deterministic admission, the highest-leverage eligible non-main lemma on the current exact
 open cut may enter a live blind audit. A fresh verifier checks statement alignment and every proof
@@ -628,6 +632,8 @@ Useful offline commands include:
 ```bash
 matek graph list
 matek graph status --knowledge-graph problem
+matek graph doctor -g problem
+matek graph doctor --repair -g problem
 matek graph frontier -g problem
 matek graph validate -g problem
 matek graph show CLM-... -g problem
@@ -987,6 +993,11 @@ re-runs frozen deterministic checks natively.
   compiler wording. Upgrade MATEK and run `matek resume RUN_ID`; the saved compiler work can be
   replayed without replacing the graph contract. Use `--migrate-target` only when the user-authored
   problem was intentionally edited.
+- **A historical source has inconsistent generated identifier metadata:** ordinary runs repair the
+  whitelisted primary-identifier invariant automatically before model work. To inspect or apply
+  the same offline maintenance explicitly, run `matek graph doctor -g NAME` or
+  `matek graph doctor --repair -g NAME`. Sources without stable identifiers remain as unverified
+  warnings instead of blocking unrelated research.
 - **Live search unavailable:** literature-support claims are quarantined or qualified so research
   can continue, but target identification may pause and final citation/bibliography gates remain
   strict. Restore Codex search or network access, then resume any missing source audits. To

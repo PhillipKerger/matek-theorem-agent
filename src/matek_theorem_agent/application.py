@@ -524,6 +524,103 @@ class WorkflowRunner:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         return BoundedHttpSourceVerifier(cache_path=cache_path)
 
+    def _repair_prompt_graph_hygiene(
+        self,
+        state: RunState,
+        store: StateStore,
+        logger: RunLogger,
+        graph: KnowledgeGraph,
+        *,
+        trigger: str,
+    ) -> bool:
+        """Apply the deterministic source-metadata resolver and persist its outcome."""
+
+        report = graph.doctor(
+            repair=True,
+            problem_id=self._graph_problem_id(state),
+            run_id=state.run_id,
+        )
+        if not report.actions:
+            return False
+        raw_history = state.metadata.get("graph_hygiene_recovery", [])
+        history = list(raw_history) if isinstance(raw_history, list) else []
+        history.append(
+            {
+                "stage": StageName.PROMPT_COMPILATION.value,
+                "failure_class": "metadata_invariant",
+                "trigger": trigger,
+                "status": "succeeded",
+                "affected_ids": [action.node_id for action in report.actions],
+                "rules": list(dict.fromkeys(action.rule for action in report.actions)),
+                "repair_log": report.repair_log,
+                "previous_revision": report.previous_revision,
+                "new_revision": report.new_revision,
+            }
+        )
+        state.metadata["graph_hygiene_recovery"] = history
+        if report.warnings:
+            raw_warnings = state.metadata.get("source_provenance_warnings", [])
+            warnings = list(raw_warnings) if isinstance(raw_warnings, list) else []
+            state.metadata["source_provenance_warnings"] = list(
+                dict.fromkeys([*warnings, *report.warnings])
+            )
+        logger.event(
+            "graph.hygiene.repaired",
+            stage=StageName.PROMPT_COMPILATION,
+            data={
+                "trigger": trigger,
+                "affected_ids": [action.node_id for action in report.actions],
+                "repair_log": report.repair_log,
+            },
+        )
+        self._refresh_graph_metadata(state, graph)
+        store.save(state)
+        return True
+
+    def _record_compiled_problem_with_recovery(
+        self,
+        state: RunState,
+        store: StateStore,
+        logger: RunLogger,
+        graph: KnowledgeGraph,
+        compiled_problem: Mapping[str, Any],
+        options: WorkflowOptions,
+    ) -> None:
+        def record() -> None:
+            graph.record_compiled_problem(
+                problem_id=self._graph_problem_id(state),
+                run_id=state.run_id,
+                compiled_problem=compiled_problem,
+                normalized_source_sha256=(
+                    str(state.metadata.get("problem_normalized_sha256") or "") or None
+                ),
+                allow_target_migration=bool(options.target_migration_reason),
+                target_migration_reason=options.target_migration_reason,
+            )
+
+        try:
+            record()
+            return
+        except GraphValidationError:
+            retry_counts = state.metadata.get("graph_hygiene_retry_counts", {})
+            counts = dict(retry_counts) if isinstance(retry_counts, dict) else {}
+            retry_count = counts.get(StageName.PROMPT_COMPILATION.value, 0)
+            if not isinstance(retry_count, int) or retry_count >= 1:
+                raise
+            if not self._repair_prompt_graph_hygiene(
+                state,
+                store,
+                logger,
+                graph,
+                trigger="stage_failure",
+            ):
+                raise
+            counts[StageName.PROMPT_COMPILATION.value] = retry_count + 1
+            state.metadata["graph_hygiene_retry_counts"] = counts
+            store.save(state)
+        # Exactly one retry is permitted after an applicable deterministic repair.
+        record()
+
     def _budget_tracker(
         self,
         usage_records: list[UsageRecord],
@@ -1515,6 +1612,7 @@ class WorkflowRunner:
     ) -> None:
         safe_message = redact_text(str(exc))
         category = classify_failure(exc)
+        failure_class = str(getattr(exc, "failure_class", category.value))
         fail_stage(
             state,
             stage,
@@ -1522,7 +1620,10 @@ class WorkflowRunner:
             kind=type(exc).__name__,
             category=category,
             retriable=category is not FailureCategory.INTEGRITY,
-            details={"recovery_obligations": recovery_obligations(exc, category)},
+            details={
+                "failure_class": failure_class,
+                "recovery_obligations": recovery_obligations(exc, category),
+            },
         )
         raw_issues = state.metadata.get("execution_issues", [])
         issues = list(raw_issues) if isinstance(raw_issues, list) else []
@@ -1532,6 +1633,7 @@ class WorkflowRunner:
         issues.append(
             {
                 "category": category.value,
+                "failure_class": failure_class,
                 "stage": stage.value,
                 "kind": type(exc).__name__,
                 "message": safe_message,
@@ -1547,6 +1649,7 @@ class WorkflowRunner:
             data={
                 "error_type": type(exc).__name__,
                 "category": category.value,
+                "failure_class": failure_class,
                 "message": safe_message,
             },
         )
@@ -1790,20 +1893,30 @@ class WorkflowRunner:
         options: WorkflowOptions,
     ) -> CompiledProblem:
         result_path = state.run_root / "prompts" / "compiled_problem.json"
-        if not self._begin(state, store, logger, StageName.PROMPT_COMPILATION):
+        graph = self._knowledge_graph_for_state(state)
+        stage_started = self._begin(state, store, logger, StageName.PROMPT_COMPILATION)
+        if stage_started:
+            try:
+                self._repair_prompt_graph_hygiene(
+                    state,
+                    store,
+                    logger,
+                    graph,
+                    trigger="preflight",
+                )
+            except Exception as exc:
+                self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)
+                raise
+        if not stage_started:
             compiled = CompiledProblem.model_validate_json(result_path.read_text(encoding="utf-8"))
-            graph = self._knowledge_graph_for_state(state)
             if not compiled.needs_clarification:
-                graph.record_compiled_problem(
-                    problem_id=self._graph_problem_id(state),
-                    run_id=state.run_id,
-                    compiled_problem=compiled.model_dump(mode="json"),
-                    normalized_source_sha256=str(
-                        state.metadata.get("problem_normalized_sha256") or ""
-                    )
-                    or None,
-                    allow_target_migration=bool(options.target_migration_reason),
-                    target_migration_reason=options.target_migration_reason,
+                self._record_compiled_problem_with_recovery(
+                    state,
+                    store,
+                    logger,
+                    graph,
+                    compiled.model_dump(mode="json"),
+                    options,
                 )
                 compiled = self._bind_frozen_compiled_target(
                     state=state,
@@ -1869,13 +1982,19 @@ class WorkflowRunner:
             self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)
             raise
         state.metadata.pop("prompt_compilation_recovery", None)
+        existing_source_warnings = state.metadata.get("source_provenance_warnings", [])
+        source_warnings = (
+            list(existing_source_warnings) if isinstance(existing_source_warnings, list) else []
+        )
         state.metadata.update(
             {
                 "literature_status": result.compiled_problem.literature_status.value,
                 "literature_resolution_summary": (
                     result.compiled_problem.literature_resolution_summary
                 ),
-                "source_provenance_warnings": result.source_verification.warnings,
+                "source_provenance_warnings": list(
+                    dict.fromkeys([*source_warnings, *result.source_verification.warnings])
+                ),
                 "prompt_validation_warnings": result.prompt_validation.warnings,
                 "prompt_validation_generation": result.prompt_validation.repair_generation,
             }
@@ -1906,22 +2025,15 @@ class WorkflowRunner:
                     "lean_status": "SKIPPED_PROBLEM_CLARIFICATION",
                 }
             )
-        else:
-            state.scientific_status = ScientificStatus.PROMPT_COMPILED
-            state.metadata["research_status"] = ScientificStatus.PROMPT_COMPILED.value
-        graph = self._knowledge_graph_for_state(state)
         if not result.needs_clarification:
             try:
-                graph.record_compiled_problem(
-                    problem_id=self._graph_problem_id(state),
-                    run_id=state.run_id,
-                    compiled_problem=result.compiled_problem.model_dump(mode="json"),
-                    normalized_source_sha256=str(
-                        state.metadata.get("problem_normalized_sha256") or ""
-                    )
-                    or None,
-                    allow_target_migration=bool(options.target_migration_reason),
-                    target_migration_reason=options.target_migration_reason,
+                self._record_compiled_problem_with_recovery(
+                    state,
+                    store,
+                    logger,
+                    graph,
+                    result.compiled_problem.model_dump(mode="json"),
+                    options,
                 )
                 result.compiled_problem = self._bind_frozen_compiled_target(
                     state=state,
@@ -1932,6 +2044,8 @@ class WorkflowRunner:
             except Exception as exc:
                 self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)
                 raise
+            state.scientific_status = ScientificStatus.PROMPT_COMPILED
+            state.metadata["research_status"] = ScientificStatus.PROMPT_COMPILED.value
         self._refresh_graph_metadata(state, graph)
         self._checkpoint(
             state,

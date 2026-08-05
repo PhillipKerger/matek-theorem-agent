@@ -65,6 +65,8 @@
 - [x] Ctrl-C leaves resumable state and completed call records.
 - [x] `run` and `resume` expose explicit `--backend codex|api` selection.
 - [x] Codex failures checkpoint with actionable resume guidance and never initiate API calls.
+- [x] Prompt startup repairs whitelisted generated source metadata without model calls, logs the
+  transaction, retries at most once, and never rewrites canonical targets or proof dependencies.
 
 ## Research integrity
 

@@ -2259,6 +2259,124 @@ def test_compiled_sources_use_verified_entity_identity_and_arxiv_revision_aliase
     ]
 
 
+def test_graph_doctor_repairs_source_identity_metadata_and_logs_the_transaction(
+    tmp_path: Path,
+) -> None:
+    graph, problem, problem_id, _ = initialized_graph(tmp_path)
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-two",
+    )
+    compiled = {
+        "title": "Test theorem",
+        "normalized_statement": "For every test object, the desired property holds.",
+        "claim_contract": {"target": "the desired property"},
+        "literature_status": "open_problem",
+        "source_ledger": [
+            {
+                "source_id": "published-source",
+                "title": "A useful source",
+                "identifiers": ["arxiv:2103.04205", "doi:10.1137/24m1630207"],
+                "verified": True,
+                "verification_detail": "Both stable identifiers resolved.",
+            }
+        ],
+    }
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-two",
+        compiled_problem=compiled,
+    )
+
+    with graph._locked():
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        source = next(node for node in nodes if node.node_type is NodeType.SOURCE)
+        source.metadata["matek_primary_identifier"] = "arxiv:9999.99999"
+        graph._commit_nodes_unlocked(
+            state=state,
+            all_nodes=nodes,
+            changed_node_ids=[source.matek_id],
+            run_id="legacy-run",
+            author="legacy-fixture",
+            reason="Simulate historical generated metadata drift.",
+            operation_id="legacy-source-metadata-drift",
+        )
+
+    planned = graph.doctor(problem_id=problem_id)
+    assert len(planned.actions) == 1
+    assert planned.actions[0].applied is False
+    assert graph.load_state().revision == planned.previous_revision
+
+    repaired = graph.doctor(repair=True, problem_id=problem_id, run_id="run-three")
+    assert repaired.actions[0].rule == "primary_identifier_in_identifiers"
+    assert repaired.actions[0].applied is True
+    assert repaired.actions[0].before["primary_identifier"] == "arxiv:9999.99999"
+    assert repaired.actions[0].after["primary_identifier"] == "doi:10.1137/24m1630207"
+    assert repaired.repair_log is not None
+    repair_log = json.loads((graph.graph_root / repaired.repair_log).read_text(encoding="utf-8"))
+    assert repair_log["failure_class"] == "metadata_invariant"
+    assert repair_log["actions"][0]["node_id"] == repaired.actions[0].node_id
+    source = graph.show(repaired.actions[0].node_id)
+    assert source.metadata["matek_primary_identifier"] == "doi:10.1137/24m1630207"
+    assert graph.validate().valid
+
+    # The repaired source no longer blocks the ordinary compiled-problem transaction.
+    graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-three",
+    )
+    assert graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-three",
+        compiled_problem=compiled,
+    ).committed
+
+    with graph._locked():
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        source = next(node for node in nodes if node.node_type is NodeType.SOURCE)
+        source.metadata["matek_identifiers"] = []
+        source.metadata["matek_identifier_revisions"] = []
+        graph._commit_nodes_unlocked(
+            state=state,
+            all_nodes=nodes,
+            changed_node_ids=[source.matek_id],
+            run_id="legacy-run",
+            author="legacy-fixture",
+            reason="Simulate a source whose stable identifiers disappeared.",
+            operation_id="legacy-source-identifiers-missing",
+        )
+    downgraded = graph.doctor(repair=True, problem_id=problem_id, run_id="run-four")
+    assert downgraded.warnings
+    source = graph.show(source.matek_id)
+    assert source.metadata["matek_primary_identifier"] is None
+    assert source.metadata["matek_verified"] is False
+    assert source.epistemic_status is EpistemicStatus.OPEN
+
+    with graph._locked():
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        source = next(node for node in nodes if node.node_type is NodeType.SOURCE)
+        source.metadata["matek_source_id"] = ""
+        source.metadata["matek_primary_identifier"] = "malformed-primary"
+        graph._commit_nodes_unlocked(
+            state=state,
+            all_nodes=nodes,
+            changed_node_ids=[source.matek_id],
+            run_id="legacy-run",
+            author="legacy-fixture",
+            reason="Simulate metadata outside the whitelisted repair boundary.",
+            operation_id="legacy-source-key-missing",
+        )
+    revision_before_failed_repair = graph.load_state().revision
+    with pytest.raises(GraphValidationError, match="lacks a canonical source identity"):
+        graph.doctor(repair=True, problem_id=problem_id, run_id="run-five")
+    assert graph.load_state().revision == revision_before_failed_repair
+
+
 def test_persistent_markdown_vault_survives_two_runs_and_rebuilds_index(
     tmp_path: Path,
 ) -> None:
@@ -2956,6 +3074,10 @@ def test_graph_cli_operates_without_obsidian(
     status = cli.invoke(app, ["graph", "status"])
     assert status.exit_code == 0
     assert '"node_count": 0' in status.output
+    doctor = cli.invoke(app, ["graph", "doctor", "--repair"])
+    assert doctor.exit_code == 0, doctor.output
+    assert '"repair_requested": true' in doctor.output
+    assert '"actions": []' in doctor.output
     exported = cli.invoke(app, ["graph", "export", "--format", "mermaid"])
     assert exported.exit_code == 0
     assert "flowchart TD" in exported.output

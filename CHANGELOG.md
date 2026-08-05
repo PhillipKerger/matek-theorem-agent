@@ -2,6 +2,11 @@
 
 ## 0.6.0 — 2026-08-05
 
+- Added a deterministic graph-hygiene preflight for generated source metadata. Inconsistent
+  primary identifiers are transactionally repaired before prompt-model work, with an append-only
+  before/after log and rebuilt graph projections. Sources with no stable identifier remain as
+  unverified warnings. `matek graph doctor --repair` exposes the same offline operation, while
+  canonical targets and proof dependencies remain outside the repair boundary.
 - Reused the graph's live canonical target whenever the normalized user problem is unchanged.
   Repeat runs now rematerialize the previously frozen statement, contract, and compiled prompt;
   stochastic compiler prose or JSON layout cannot trigger a contract-drift pause. A changed

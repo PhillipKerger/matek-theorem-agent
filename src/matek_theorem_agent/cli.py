@@ -77,7 +77,7 @@ from .openai_client import (
 )
 from .progress import Ascension
 from .redaction import redact_text
-from .reporting import FinalReport
+from .reporting import FinalReport, blocking_failure_summary
 from .resources import resource_path
 from .stages.compile_prompt import EXPECTED_FRAMEWORK_SHA256
 from .state import (
@@ -803,6 +803,28 @@ def graph_status_command(
     try:
         status_value = _project_graph(knowledge_graph).status()
         console.print(json.dumps(status_value.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("doctor")
+def graph_doctor(
+    repair: bool = typer.Option(
+        False,
+        "--repair",
+        help="Transactionally repair whitelisted generated metadata defects.",
+    ),
+    problem_id: str | None = typer.Option(None, "--problem-id"),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
+    """Inspect repairable generated graph metadata without model calls."""
+
+    try:
+        report = _project_graph(knowledge_graph).doctor(
+            repair=repair,
+            problem_id=problem_id,
+        )
+        console.print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
@@ -1554,9 +1576,27 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
             state.metadata.get("research_status", state.scientific_status.value)
         )
         workflow_status = str(state.metadata.get("workflow_status", "RUNNING"))
+        root_failure = blocking_failure_summary(state)
+        if root_failure and workflow_status in {"RUNNING", "COMPLETE"}:
+            workflow_status = (
+                "HARD_STOPPED"
+                if root_failure.get("category") == "integrity"
+                else "PAUSED_RETRIABLE"
+            )
+        if (
+            root_failure.get("blocking_stage") == "prompt_compilation"
+            and scientific_status == "PROMPT_COMPILED"
+        ):
+            scientific_status = "RECEIVED"
         console.print(f"Run [bold]{state.run_id}[/bold]")
         console.print(f"Scientific: {scientific_status}")
         console.print(f"Workflow: {workflow_status}")
+        if root_failure:
+            console.print(f"Blocking stage: {root_failure['blocking_stage']}")
+            console.print(f"Failure class: {root_failure['failure_class']}")
+            console.print(f"Root cause: {root_failure['root_cause']}")
+            console.print(f"Automatic recovery: {root_failure['automatic_recovery']}")
+            console.print(f"Next action: {root_failure['next_action']}")
         console.print(f"Manuscript: {state.metadata.get('manuscript_status', 'NOT_STARTED')}")
         console.print(f"Publication: {state.metadata.get('publication_status', 'NOT_ASSESSED')}")
         console.print(f"Lean: {state.metadata.get('lean_status', 'NOT_STARTED')}")
