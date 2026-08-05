@@ -67,10 +67,15 @@ formalization, and generates a reproducible final report.
 - Resolve arXiv identifiers through both `export.arxiv.org` and `arxiv.org/abs/<id>`.
 - Before research, deterministically inspect the compiled statement against every applicable
   claim-contract clause and persist `prompts/target_alignment.json`. Block only explicit,
-  high-confidence contradictions such as reversed symbolic quantifiers or polarity, opposing
-  qualifiers, changed structured numeric values, and drift in compact formal comparisons.
-  Lexical absence from generated domain, edge-case, or explanatory prose is not evidence of a
-  mismatch and must not prevent research from starting.
+  high-confidence contradictions found by clause-specific structured comparison: quantifier
+  order/scope, constant scope or value, domain qualifiers, information access, online decision
+  timing, feasibility mode, random sources and expectation mode, benchmark/conclusion form, or
+  requested-outcome polarity. Randomized algorithms may have pathwise deterministic feasibility,
+  deterministic preprocessing or tie-breaking, and proofs conditioned on a realized seed; none
+  of those facts makes the algorithm deterministic-only. Every blocking record includes the
+  compared structured values and concrete conflict. Lexical absence or ambiguous vocabulary is
+  not evidence of a mismatch: record a warning, retain the frozen canonical contract, and start
+  research.
 - Bind the first aligned statement, canonical contract, and compiled prompt for a normalized
   source hash in `.matek/knowledge/<graph-name>/target-registry.json`. Later runs with the same
   source hash reuse those canonical bytes while refreshing literature separately. A new aligned

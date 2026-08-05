@@ -959,6 +959,51 @@ async def test_prompt_compiler_persists_hash_bound_k_server_target_alignment(
 
 
 @pytest.mark.asyncio
+async def test_prompt_compiler_incident_randomized_policy_reaches_research_boundary(
+    tmp_path: Path,
+) -> None:
+    payload = CompiledProblem(
+        title="Random-order matroid secretary target",
+        normalized_statement=(
+            "There exist a universal constant C and one randomized causal online policy ALG. "
+            "Let pi be a uniformly random arrival permutation and R be ALG's internal "
+            "randomness. Every accepted set is feasible for every realization. "
+            "E_{pi,R}[w(I_ALG)] >= OPT/C."
+        ),
+        claim_contract={
+            "randomness": json.dumps(
+                {
+                    "algorithm_randomization": "allowed_or_required",
+                    "arrival_randomness": "uniform_random_permutation",
+                    "weight_adversary": "oblivious_before_randomness",
+                    "expectation_over": ["arrival_order", "algorithm_coins"],
+                    "feasibility_requirement": "pathwise",
+                    "value_guarantee": "in_expectation",
+                }
+            )
+        },
+        compiled_prompt=covered_compiled_prompt(),
+    )
+
+    result = await compile_prompt(
+        client=StaticClient([payload]),
+        problem_text="Prove the random-order matroid secretary guarantee.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
+
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
+    assert result.target_alignment.randomness is not None
+    assert result.target_alignment.randomness.material_contradiction is False
+    persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
+    assert persisted["randomness"]["statement"]["algorithm_randomization"] == (
+        "allowed_or_required"
+    )
+    assert persisted["randomness"]["statement"]["feasibility_requirement"] == "pathwise"
+
+
+@pytest.mark.asyncio
 async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
     tmp_path: Path,
 ) -> None:

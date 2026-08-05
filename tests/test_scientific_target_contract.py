@@ -5,8 +5,12 @@ import json
 import pytest
 
 from matek_theorem_agent.scientific import (
+    AlgorithmRandomization,
+    ArrivalRandomness,
+    FeasibilityRequirement,
     TargetClauseCategory,
     TargetPolarity,
+    ValueGuarantee,
     classify_requested_polarity,
     validate_target_contract,
 )
@@ -372,3 +376,274 @@ def test_non_material_polarity_uncertainty_warns_and_passes() -> None:
     assert alignment.polarity.material_contradiction is False
     assert alignment.polarity.contract_polarity is TargetPolarity.AFFIRMATIVE_PROOF
     assert alignment.polarity.statement_polarity is TargetPolarity.CONSTRUCTION
+
+
+# --- Structured randomness/feasibility alignment (P0 reliability fix) ------------------
+
+
+_RANDOMNESS_CONTRACT = {
+    "randomness": (
+        "ALG is a randomized online policy with private random coins. Arrivals form a uniformly "
+        "random permutation. The value guarantee is in expectation jointly over the arrival "
+        "order and ALG's internal randomness, while feasibility holds deterministically "
+        "conditional on every realization. Weights are fixed before randomness by an oblivious "
+        "adversary."
+    )
+}
+
+
+def test_randomness_incident_distinguishes_pathwise_feasibility_from_algorithm_type() -> None:
+    statement = (
+        "There exist one universal constant C and one randomized causal online policy ALG. "
+        "Let pi be a uniformly random arrival permutation and let R be ALG's internal "
+        "randomness. Weights are fixed before the permutation and coins are realized. Every "
+        "accepted set is feasible for every realization. "
+        "E_{pi,R}[w(I_ALG)] >= OPT/C."
+    )
+
+    alignment = validate_target_contract(statement, _RANDOMNESS_CONTRACT)
+
+    assert alignment.passed is True
+    assert alignment.randomness is not None
+    assert alignment.randomness.material_contradiction is False
+    assert alignment.randomness.contract.algorithm_randomization is (
+        AlgorithmRandomization.ALLOWED_OR_REQUIRED
+    )
+    assert alignment.randomness.statement.algorithm_randomization is (
+        AlgorithmRandomization.ALLOWED_OR_REQUIRED
+    )
+    assert alignment.randomness.contract.feasibility_requirement is FeasibilityRequirement.PATHWISE
+    assert alignment.randomness.statement.feasibility_requirement is FeasibilityRequirement.PATHWISE
+    assert alignment.randomness.statement.expectation_over == [
+        "arrival_order",
+        "algorithm_coins",
+    ]
+    check = alignment.checks[0]
+    assert check.category is TargetClauseCategory.RANDOMNESS
+    assert check.material_conflicts == []
+
+
+def test_persisted_structured_randomness_object_is_compared_directly() -> None:
+    contract = {
+        "randomness": json.dumps(
+            {
+                "algorithm_randomization": "allowed_or_required",
+                "arrival_randomness": "uniform_random_permutation",
+                "weight_adversary": "oblivious_before_randomness",
+                "expectation_over": ["arrival_order", "algorithm_coins"],
+                "feasibility_requirement": "pathwise",
+                "value_guarantee": "in_expectation",
+            }
+        )
+    }
+    statement = (
+        "A randomized online algorithm uses private coins under a uniformly random arrival "
+        "permutation. An oblivious adversary fixes weights before randomness. Feasibility is "
+        "pathwise, and expected value over arrival order and algorithm coins is at least OPT/C."
+    )
+
+    alignment = validate_target_contract(statement, contract)
+
+    assert alignment.passed is True
+    assert alignment.randomness is not None
+    assert alignment.randomness.contract.model_dump(mode="json") == json.loads(
+        contract["randomness"]
+    )
+
+
+@pytest.mark.parametrize(
+    "orthogonal_condition",
+    [
+        "Feasibility holds deterministically and pathwise for every realization.",
+        "ALG uses deterministic tie-breaking inside the randomized policy.",
+        "ALG performs deterministic preprocessing before using its private coins.",
+        "The proof conditions on the realized random seed.",
+        "The adversary fixes all weights before randomness is realized.",
+    ],
+)
+def test_deterministic_execution_conditions_do_not_negate_randomized_policy(
+    orthogonal_condition: str,
+) -> None:
+    statement = (
+        "There is a randomized online policy ALG with private random coins under a uniformly "
+        "random arrival permutation. The expected value over the arrival order and algorithm "
+        f"coins is at least OPT/C. {orthogonal_condition}"
+    )
+
+    alignment = validate_target_contract(statement, _RANDOMNESS_CONTRACT)
+
+    assert alignment.passed is True
+    assert alignment.randomness is not None
+    assert alignment.randomness.statement.algorithm_randomization is (
+        AlgorithmRandomization.ALLOWED_OR_REQUIRED
+    )
+
+
+def test_explicit_deterministic_only_algorithm_reports_structured_randomness_conflict() -> None:
+    alignment = validate_target_contract(
+        (
+            "ALG must be deterministic and may not use random coins. Arrivals are a uniformly "
+            "random permutation. Its expected value over arrival order is at least OPT/C."
+        ),
+        _RANDOMNESS_CONTRACT,
+    )
+
+    assert alignment.passed is False
+    assert alignment.randomness is not None
+    assert alignment.randomness.material_contradiction is True
+    assert alignment.randomness.contract.algorithm_randomization is (
+        AlgorithmRandomization.ALLOWED_OR_REQUIRED
+    )
+    assert alignment.randomness.statement.algorithm_randomization is (
+        AlgorithmRandomization.DETERMINISTIC_ONLY
+    )
+    check = alignment.checks[0]
+    assert check.contract_values["algorithm_randomization"] == "allowed_or_required"
+    assert check.statement_values["algorithm_randomization"] == "deterministic_only"
+    assert "algorithm_randomization" in check.detail
+    assert "Compared contract values" in check.detail
+
+
+def test_adversarial_arrival_replacement_reports_compared_structured_values() -> None:
+    alignment = validate_target_contract(
+        (
+            "There is a randomized online policy ALG with private coins for an adversarial "
+            "arrival order. Its expected value over algorithm coins is at least OPT/C."
+        ),
+        _RANDOMNESS_CONTRACT,
+    )
+
+    assert alignment.passed is False
+    assert alignment.randomness is not None
+    assert alignment.randomness.contract.arrival_randomness is (
+        ArrivalRandomness.UNIFORM_RANDOM_PERMUTATION
+    )
+    assert alignment.randomness.statement.arrival_randomness is (
+        ArrivalRandomness.ADVERSARIAL_OR_DETERMINISTIC_ORDER
+    )
+    assert "arrival_randomness" in " ".join(alignment.blocking_issues)
+
+
+def test_expected_value_replaced_by_pathwise_value_fails_without_blaming_feasibility() -> None:
+    alignment = validate_target_contract(
+        (
+            "There is a randomized online policy with private coins under a uniformly random "
+            "arrival permutation. Feasibility holds pathwise. The value guarantee holds "
+            "pathwise for every realization."
+        ),
+        _RANDOMNESS_CONTRACT,
+    )
+
+    assert alignment.passed is False
+    assert alignment.randomness is not None
+    assert alignment.randomness.contract.value_guarantee is ValueGuarantee.IN_EXPECTATION
+    assert alignment.randomness.statement.value_guarantee is ValueGuarantee.PATHWISE
+    assert "value_guarantee" in " ".join(alignment.blocking_issues)
+
+
+def test_uncertain_randomness_alignment_warns_and_uses_frozen_contract() -> None:
+    alignment = validate_target_contract(
+        "Prove that ALG attains the stated guarantee while always remaining feasible.",
+        _RANDOMNESS_CONTRACT,
+    )
+
+    assert alignment.passed is True
+    assert alignment.randomness is not None
+    assert alignment.randomness.material_contradiction is False
+    assert alignment.randomness.warnings
+    assert any("Structured randomness uncertainty" in warning for warning in alignment.warnings)
+
+
+@pytest.mark.parametrize(
+    ("key", "contract", "statement"),
+    [
+        ("quantifiers", "for every n", "For every n, P(n) holds."),
+        ("constants", "C is universal", "There is a universal constant C."),
+        ("domain", "all finite matroids", "The theorem covers all finite matroids."),
+        (
+            "information_model",
+            "Decisions have no access to unseen weights.",
+            "Each decision has no access to unseen weights.",
+        ),
+        (
+            "online_decisions",
+            "Each decision is immediate and irrevocable.",
+            "Each decision is immediate and irrevocable.",
+        ),
+        (
+            "feasibility",
+            "Feasibility holds pathwise for every realization.",
+            "Feasibility holds pathwise for every realization.",
+        ),
+        (
+            "randomness",
+            "Arrivals are a uniformly random permutation.",
+            "Arrivals are a uniformly random permutation.",
+        ),
+        ("conclusion", "value_ALG >= OPT/C", "value_ALG >= OPT/C"),
+        ("polarity", "affirmative_proof", "Prove the theorem."),
+    ],
+)
+def test_clause_specific_structured_alignment_corpus(
+    key: str,
+    contract: str,
+    statement: str,
+) -> None:
+    alignment = validate_target_contract(statement, {key: contract})
+
+    assert alignment.passed is True
+    check = alignment.checks[0]
+    assert check.passed is True
+    assert check.contract_values
+    assert check.statement_values
+
+
+@pytest.mark.parametrize(
+    ("key", "contract", "statement", "field"),
+    [
+        ("quantifiers", "for every n", "there exists n", "forall n"),
+        ("constants", "C is universal", "C may depend on the instance", "scope"),
+        ("domain", "all finite matroids", "all infinite matroids", "finiteness"),
+        (
+            "information_model",
+            "Decisions have no access to unseen weights.",
+            "Decisions may inspect future unseen weights.",
+            "unseen_information",
+        ),
+        (
+            "online_decisions",
+            "Each decision is immediate and irrevocable.",
+            "Each decision may be delayed and revocable.",
+            "timing",
+        ),
+        (
+            "feasibility",
+            "Feasibility holds pathwise for every realization.",
+            "The algorithm is feasible only in expectation.",
+            "feasibility_requirement",
+        ),
+        (
+            "randomness",
+            "Arrivals are a uniformly random permutation.",
+            "Arrivals use an adversarial order.",
+            "arrival_randomness",
+        ),
+        ("conclusion", "value_ALG >= OPT/C", "value_ALG <= OPT/C", "comparison"),
+        ("polarity", "affirmative_proof", "Disprove the conjecture.", "polarity"),
+    ],
+)
+def test_clause_specific_structured_conflict_corpus(
+    key: str,
+    contract: str,
+    statement: str,
+    field: str,
+) -> None:
+    alignment = validate_target_contract(statement, {key: contract})
+
+    assert alignment.passed is False
+    check = alignment.checks[0]
+    assert check.passed is False
+    assert check.contract_values
+    assert check.statement_values
+    assert field in check.detail
+    assert "Compared contract values" in check.detail

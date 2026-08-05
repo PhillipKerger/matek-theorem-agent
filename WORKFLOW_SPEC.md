@@ -44,9 +44,16 @@ an optional sentence is removed with a recorded warning. Partial/full resolution
 verified sources and an exact statement-and-hypothesis comparison.
 
 Before admission, deterministic target alignment interprets each clause from its explicit key and
-records a hash-bound check. It blocks only an explicit high-confidence contradiction: reversed
-symbolic quantifiers, a changed structured numeric value, opposing qualifiers, drift in a compact
-formal comparison, or a material polarity contradiction. Polarity is compared as a compact
+records a hash-bound check. Quantifiers, constants, domain, information access, online decisions,
+feasibility, randomness, benchmark/conclusion, and polarity each use a small clause-specific
+structured comparison. Randomness records algorithm randomization, arrival model, weight-adversary
+timing, expectation sources, feasibility mode, and value-guarantee mode as orthogonal fields. A
+randomized policy with deterministic/pathwise feasibility, deterministic preprocessing or
+tie-breaking, or a proof conditioned on the realized seed remains randomized. It blocks only an
+explicit high-confidence structured contradiction: reversed symbolic quantifiers, a changed
+structured numeric value, opposing clause-local modes, drift in a compact formal comparison, or a
+material polarity contradiction. Every failure records the compared values and exact material
+conflict. Polarity is compared as a compact
 structured value (`affirmative_proof`, `disproof`, `classification`, `construction`,
 `investigation`, or `ambiguous`) derived only from the leading requested-outcome directive of the
 `polarity` clause and the normalized statement. It never scans framework templates, literature
@@ -69,16 +76,25 @@ these is the prompt-compilation/target-binding stage in `application.py` and `st
 | Gate | Input | Hard stop only when | On uncertainty |
 | --- | --- | --- | --- |
 | Canonical target binding | normalized source hash, frozen registry target | user input changed and requires an explicit migration | reuse the stored frozen target |
-| Target alignment (quantifier/qualifier/numeric/comparison) | normalized statement, structured contract clauses | an explicit structured material contradiction | pass; record a warning |
+| Target alignment (quantifier/constant/domain/information/decision) | normalized statement, matching structured contract clause | explicit opposing values in the same semantic field | pass; record compared values and a warning |
+| Target alignment (feasibility/randomness/conclusion) | structured algorithm type, arrival/adversary model, expectation sources, feasibility and value modes | explicit deterministic-only replacement, opposing arrival model, removed required random source, pathwise/expected-mode replacement, or other concrete structured conflict | pass; preserve pathwise feasibility separately from algorithm randomization and record a warning |
 | Target alignment (polarity) | compact structured polarity of the `polarity` clause and statement | contract `affirmative_proof` versus statement `disproof` (or the reverse) | warn, reuse canonical target, continue |
 | Source validation | source ledger, active proof dependencies | an active proof dependency truly requires a source that cannot be resolved | auto-repair once, then warn and continue |
 | Graph schema/index validation | knowledge-graph store and index | corruption that local repair/rebuild cannot fix | repair/rebuild locally, retry once |
 | Provider response validation | structured model output | schema-invalid output after a bounded regenerate | bounded regenerate/retry |
 | Literature/provenance lookup | source verification report | never for research scheduling | warn; never imply a mathematical failure |
 
-The alignment polarity decision (gate name, compared structured fields, decision rule, material
-flag, and root-cause detail) is persisted in `prompts/target_alignment.json` and surfaced through
-`matek status` and the final report's prompt-validation warnings.
+Every alignment decision persists compared contract/statement values, the decision rule, concrete
+material conflicts, and warnings in `prompts/target_alignment.json`. The dedicated polarity and
+randomness decisions are surfaced through `matek status` and the final report's prompt-validation
+warnings.
+
+The mandatory pre-research gate audit searches for validators that scan whole prompts, treat
+`deterministic` as the unqualified negation of `randomized`, conflate execution-wise invariants
+with an algorithm distribution, or convert an LLM/keyword suspicion into a fail-closed result.
+Each hard stop must name its clause-local structured conflict; uncertainty is warning-only. The
+current fail-closed alignment reasons are the concrete conflicts enumerated in the inventory
+above, never the isolated presence or absence of a word.
 
 
 Every source states whether it identifies the target or supports a literature claim. Failure to

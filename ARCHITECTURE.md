@@ -311,9 +311,14 @@ minimality.
 Before research, `prompts/target_alignment.json` hash-binds the compiler's theorem and exact claim
 contract and checks for explicit contradictions; it is not a mathematical proof. Clause keys
 control interpretation so incidental prose cannot recategorize a constants or conclusion clause.
-Reversed symbolic quantifiers or polarity, opposing qualifiers, changed structured numeric values,
-and compact formal-comparison drift block. Missing prose tokens do not: generated paraphrases,
-abbreviations, and negative examples are too weak a basis for aborting an otherwise valid run.
+Each check persists its compared structured values and concrete conflicts. Randomness has a
+dedicated record for algorithm randomization, arrival randomness, weight-adversary timing,
+expectation sources, feasibility mode, and value-guarantee mode; pathwise feasibility is therefore
+not an algorithm-type signal. Reversed symbolic quantifiers or polarity, explicitly opposing
+clause-local modes, changed structured numeric values, and compact formal-comparison drift block.
+Missing or ambiguous prose tokens do not: generated paraphrases, abbreviations, deterministic
+tie-breaking, and negative examples are too weak a basis for aborting an otherwise valid run and
+produce warnings when a structured comparison remains uncertain.
 The first aligned result for a normalized source hash is frozen in `target-registry.json`;
 same-source reruns receive those exact statement, contract, and prompt bytes while literature
 refresh stays run-local. A new aligned statement with the same contract is recorded as a cosmetic

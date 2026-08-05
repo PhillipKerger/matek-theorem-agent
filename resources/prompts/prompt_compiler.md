@@ -38,14 +38,26 @@ Requirements:
   Every material contract clause must appear explicitly in `normalized_statement`; do not leave
   theorem-strength information only in the compiled prompt or contract metadata.
 - Give applicable contract clauses clear keys for `quantifiers`, `constants`, `additive_terms`,
-  `domain`, `edge_cases`, `polarity`, and `conclusion`. Preserve all quantified variables,
-  constants and additive terms (for example `+ beta`), deterministic versus randomized
-  qualifiers, finite versus arbitrary domains, and exceptional cases. Set the `polarity` clause to
-  a single compact structured value — `affirmative_proof`, `disproof`, `classification`,
-  `construction`, or `investigation` — that names the requested outcome. State excluded or
-  insufficient outcomes elsewhere (for example in `edge_cases`), never inside `polarity`. If the
-  input does not settle one of these material choices, request clarification instead of
-  strengthening or weakening the theorem.
+  `domain`, `information_model`, `online_decisions`, `feasibility`, `randomness`, `edge_cases`,
+  `polarity`, and `conclusion`. Preserve all quantified variables, constants and additive terms
+  (for example `+ beta`), finite versus arbitrary domains, information restrictions, decision
+  timing, exceptional cases, and deterministic versus randomized algorithm requirements. For a
+  stochastic target, serialize the `randomness` value as a compact JSON object with
+  `algorithm_randomization`, `arrival_randomness`, `weight_adversary`,
+  `expectation_over`, `feasibility_requirement`, and `value_guarantee`. Algorithm randomization,
+  pathwise feasibility, and an expected-value conclusion are orthogonal: deterministic
+  feasibility, preprocessing, or tie-breaking does not make a randomized policy deterministic.
+  Use the explicit values `allowed_or_required` or `deterministic_only`,
+  `uniform_random_permutation` or `adversarial_or_deterministic_order`,
+  `oblivious_before_randomness` or `adaptive_after_randomness`, `pathwise`, `in_expectation`, or
+  `high_probability`, and the expectation sources `arrival_order` and `algorithm_coins`; use
+  `unspecified` only when a field truly does not apply.
+  Set the `polarity` clause to a single compact structured value — `affirmative_proof`, `disproof`,
+  `classification`, `construction`, or `investigation` — that names the requested outcome. State
+  and preserve the exact prove-versus-refute posture. State excluded or insufficient outcomes
+  elsewhere (for example in `edge_cases`), never inside `polarity`. If the input does not settle
+  one of these material choices, request clarification instead of strengthening or weakening the
+  theorem.
 - Use public web search aggressively to verify definitions, known results, primary sources,
   exact bottlenecks, and bibliographic metadata.
 - Classify the exact target's relationship to existing literature as `unknown`,

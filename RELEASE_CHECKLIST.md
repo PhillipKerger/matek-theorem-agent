@@ -71,6 +71,10 @@
 ## Research integrity
 
 - [x] Framework preserved verbatim and hash checked.
+- [x] Pre-research target alignment uses clause-local structured comparisons; randomized policies,
+  pathwise feasibility, deterministic tie-breaking/preprocessing, expectation sources, and arrival
+  models are represented separately, with uncertainty warning-only and concrete compared values on
+  every hard failure.
 - [x] Adaptive research registry and independent audit suite implemented.
 - [x] Recoverable worker/provider/source failures are durable coordinator events; integrity
   failures alone hard-stop research.

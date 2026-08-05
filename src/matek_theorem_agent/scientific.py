@@ -393,6 +393,10 @@ class TargetClauseCategory(StrEnum):
     CONSTANTS = "constants"
     ADDITIVE_TERMS = "additive_terms"
     DOMAIN = "domain"
+    INFORMATION_MODEL = "information_model"
+    ONLINE_DECISIONS = "online_decisions"
+    FEASIBILITY = "feasibility"
+    RANDOMNESS = "randomness"
     EDGE_CASES = "edge_cases"
     POLARITY = "polarity"
     CONCLUSION = "conclusion"
@@ -422,11 +426,73 @@ class PolarityDecision(_ScientificModel):
     detail: str
 
 
+class AlgorithmRandomization(StrEnum):
+    ALLOWED_OR_REQUIRED = "allowed_or_required"
+    DETERMINISTIC_ONLY = "deterministic_only"
+    UNSPECIFIED = "unspecified"
+
+
+class ArrivalRandomness(StrEnum):
+    UNIFORM_RANDOM_PERMUTATION = "uniform_random_permutation"
+    ADVERSARIAL_OR_DETERMINISTIC_ORDER = "adversarial_or_deterministic_order"
+    UNSPECIFIED = "unspecified"
+
+
+class WeightAdversary(StrEnum):
+    OBLIVIOUS_BEFORE_RANDOMNESS = "oblivious_before_randomness"
+    ADAPTIVE_AFTER_RANDOMNESS = "adaptive_after_randomness"
+    UNSPECIFIED = "unspecified"
+
+
+class FeasibilityRequirement(StrEnum):
+    PATHWISE = "pathwise"
+    IN_EXPECTATION = "in_expectation"
+    HIGH_PROBABILITY = "high_probability"
+    UNSPECIFIED = "unspecified"
+
+
+class ValueGuarantee(StrEnum):
+    IN_EXPECTATION = "in_expectation"
+    PATHWISE = "pathwise"
+    HIGH_PROBABILITY = "high_probability"
+    UNSPECIFIED = "unspecified"
+
+
+class RandomnessFacts(_ScientificModel):
+    """Orthogonal randomness and execution-wise requirements for one target encoding."""
+
+    algorithm_randomization: AlgorithmRandomization = AlgorithmRandomization.UNSPECIFIED
+    arrival_randomness: ArrivalRandomness = ArrivalRandomness.UNSPECIFIED
+    weight_adversary: WeightAdversary = WeightAdversary.UNSPECIFIED
+    expectation_over: list[Literal["arrival_order", "algorithm_coins"]] = Field(
+        default_factory=list
+    )
+    feasibility_requirement: FeasibilityRequirement = FeasibilityRequirement.UNSPECIFIED
+    value_guarantee: ValueGuarantee = ValueGuarantee.UNSPECIFIED
+
+
+class RandomnessDecision(_ScientificModel):
+    """Auditable comparison that keeps random sources separate from pathwise invariants."""
+
+    gate: Literal["target_randomness_alignment"] = "target_randomness_alignment"
+    contract_clause_keys: list[str]
+    contract: RandomnessFacts
+    statement: RandomnessFacts
+    decision_rule: str
+    material_contradiction: bool
+    material_conflicts: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    detail: str
+
+
 class TargetClauseCheck(_ScientificModel):
     key: str
     category: TargetClauseCategory
     passed: bool
     detail: str
+    contract_values: dict[str, str | list[str]] = Field(default_factory=dict)
+    statement_values: dict[str, str | list[str]] = Field(default_factory=dict)
+    material_conflicts: list[str] = Field(default_factory=list)
 
 
 class TargetContractAlignment(_ScientificModel):
@@ -437,36 +503,29 @@ class TargetContractAlignment(_ScientificModel):
     blocking_issues: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     polarity: PolarityDecision | None = None
+    randomness: RandomnessDecision | None = None
 
 
 _QUANTIFIER_KEYS = ("quantifier", "uniformity")
 _CONSTANT_KEYS = ("constant", "parameter", "coefficient")
 _ADDITIVE_KEYS = ("additive", "offset", "slack")
 _DOMAIN_KEYS = ("domain", "space", "instance", "object", "metric", "finite", "arbitrary")
+_INFORMATION_KEYS = ("information", "known", "oracle", "revealed", "unseen")
+_ONLINE_DECISION_KEYS = ("online decision", "decision", "irrevocable", "immediate", "operation")
+_FEASIBILITY_KEYS = ("feasibility", "feasible", "independence", "invariant")
+_RANDOMNESS_KEYS = (
+    "randomness",
+    "randomization",
+    "randomisation",
+    "randomized",
+    "randomised",
+    "stochastic",
+    "arrival",
+    "coin",
+)
 _EDGE_KEYS = ("edge", "boundary", "exception", "degenerate", "zero", "empty")
 _POLARITY_KEYS = ("polarity", "posture", "prove", "refute", "disprove")
-_CONCLUSION_KEYS = ("conclusion", "target", "guarantee", "bound", "inequality")
-_MATERIAL_QUALIFIERS = (
-    "randomized",
-    "deterministic",
-    "finite",
-    "infinite",
-    "arbitrary",
-    "uniform",
-    "nonuniform",
-    "constructive",
-    "existential",
-    "metric",
-    "probability",
-)
-_OPPOSING_QUALIFIERS = {
-    "deterministic": "randomized",
-    "finite": "infinite",
-    "infinite": "finite",
-    "nonuniform": "uniform",
-    "randomized": "deterministic",
-    "uniform": "nonuniform",
-}
+_CONCLUSION_KEYS = ("conclusion", "target", "guarantee", "benchmark", "bound", "inequality")
 _STRUCTURAL_CLAUSE_KEYS = {
     "clause",
     "clauses",
@@ -578,6 +637,14 @@ def _clause_category(key: str, value: str) -> TargetClauseCategory:
             return TargetClauseCategory.QUANTIFIERS
         if any(marker in material for marker in _POLARITY_KEYS):
             return TargetClauseCategory.POLARITY
+        if any(marker in material for marker in _RANDOMNESS_KEYS):
+            return TargetClauseCategory.RANDOMNESS
+        if any(marker in material for marker in _FEASIBILITY_KEYS):
+            return TargetClauseCategory.FEASIBILITY
+        if any(marker in material for marker in _INFORMATION_KEYS):
+            return TargetClauseCategory.INFORMATION_MODEL
+        if any(marker in material for marker in _ONLINE_DECISION_KEYS):
+            return TargetClauseCategory.ONLINE_DECISIONS
         if any(marker in material for marker in _EDGE_KEYS):
             return TargetClauseCategory.EDGE_CASES
         if any(marker in material for marker in _DOMAIN_KEYS):
@@ -731,22 +798,6 @@ def _comparison_direction_conflict(statement: str, clause: str) -> bool:
     return False
 
 
-def _qualifier_postures(fragments: list[str], qualifier: str) -> set[bool]:
-    """Return positive/negative requirements for a material structured qualifier."""
-
-    postures: set[bool] = set()
-    negative = re.compile(rf"\b(?:not|non)\s*-?\s*{re.escape(qualifier)}\b")
-    positive = re.compile(rf"\b{re.escape(qualifier)}\b")
-    for fragment in fragments:
-        plain = _plain_math(fragment)
-        without_negative = negative.sub(" ", plain)
-        if negative.search(plain):
-            postures.add(False)
-        if positive.search(without_negative):
-            postures.add(True)
-    return postures
-
-
 def _quantifier_conflicts(statement: str, fragment: str) -> list[str]:
     conflicts: list[str] = []
     for kind, variable in _quantifier_requirements(fragment):
@@ -758,22 +809,523 @@ def _quantifier_conflicts(statement: str, fragment: str) -> list[str]:
     return conflicts
 
 
-def _qualifier_conflicts(statement: str, fragments: list[str]) -> list[str]:
-    conflicts: list[str] = []
-    for qualifier in _MATERIAL_QUALIFIERS:
-        postures = _qualifier_postures(fragments, qualifier)
-        statement_has = bool(re.search(rf"\b{qualifier}\b", statement))
-        if postures == {False} and statement_has:
-            conflicts.append(f"not {qualifier}")
-            continue
-        opposite = _OPPOSING_QUALIFIERS.get(qualifier)
-        if (
-            postures == {True}
-            and opposite is not None
-            and not statement_has
-            and re.search(rf"\b{opposite}\b", statement)
+def _algorithm_randomization(value: str) -> AlgorithmRandomization:
+    plain = _plain_math(value)
+    if "allowed_or_required" in plain:
+        return AlgorithmRandomization.ALLOWED_OR_REQUIRED
+    randomized_algorithm = re.search(
+        r"\b(?:randomized|randomised|stochastic)\s+"
+        r"(?:(?:causal|online)\s+){0,2}(?:algorithm|policy|alg)\b",
+        plain,
+    )
+    algorithm_coins = re.search(
+        r"\b(?:algorithm|policy|alg)(?:'s|s)?(?:\s+(?:private|internal))?\s+"
+        r"(?:randomness|random coins?|coins?|random seed)\b",
+        plain,
+    )
+    coins_permitted = re.search(
+        r"\b(?:may|must|shall|can)\s+(?:also\s+)?(?:use|draw)\s+"
+        r"(?:private\s+|internal\s+)?(?:randomness|random coins?|coins?)\b",
+        plain,
+    )
+    if randomized_algorithm or algorithm_coins or coins_permitted:
+        return AlgorithmRandomization.ALLOWED_OR_REQUIRED
+
+    deterministic_algorithm = re.search(
+        r"\bdeterministic(?:-only|\s+only)?\s+"
+        r"(?:(?:causal|online)\s+){0,2}(?:algorithm|policy|alg)\b",
+        plain,
+    ) or re.search(
+        r"\b(?:algorithm|policy|alg)\s+"
+        r"(?:must|shall|is|may|can|is required to)\s+(?:be\s+)?deterministic\b",
+        plain,
+    )
+    coins_forbidden = re.search(
+        r"\b(?:may not|must not|shall not|cannot|can not|does not|no)\b[^.;]{0,48}"
+        r"\b(?:use|have|draw)?\s*(?:any\s+)?(?:private\s+|internal\s+)?"
+        r"(?:randomness|random coins?|coins?)\b",
+        plain,
+    )
+    if (
+        "deterministic_only" in plain
+        or deterministic_algorithm
+        or coins_forbidden
+        or re.search(r"\bnot randomized\b", plain)
+    ):
+        return AlgorithmRandomization.DETERMINISTIC_ONLY
+    return AlgorithmRandomization.UNSPECIFIED
+
+
+def _arrival_randomness(value: str) -> ArrivalRandomness:
+    plain = _plain_math(value)
+    if "uniform_random_permutation" in plain:
+        return ArrivalRandomness.UNIFORM_RANDOM_PERMUTATION
+    if "adversarial_or_deterministic_order" in plain:
+        return ArrivalRandomness.ADVERSARIAL_OR_DETERMINISTIC_ORDER
+    uniform = re.search(
+        r"\b(?:uniform(?:ly)?\s+random(?:ly)?|random[- ]order)\b[^.;]{0,40}"
+        r"\b(?:arrival|arrivals|order|permutation)\b",
+        plain,
+    ) or re.search(
+        r"\b(?:arrival|arrivals|order|permutation)\b[^.;]{0,40}"
+        r"\b(?:uniform(?:ly)?\s+random(?:ly)?|random[- ]order)\b",
+        plain,
+    )
+    adversarial = re.search(
+        r"\b(?:adversarial|adversarially chosen|deterministic)\b[^.;]{0,24}"
+        r"\b(?:arrival|arrivals|arrival order|order|permutation)\b",
+        plain,
+    ) or re.search(
+        r"\b(?:arrival|arrivals|arrival order|order|permutation)\b[^.;]{0,24}"
+        r"\b(?:adversarial|adversarially chosen|deterministic)\b",
+        plain,
+    )
+    if uniform and not adversarial:
+        return ArrivalRandomness.UNIFORM_RANDOM_PERMUTATION
+    if adversarial and not uniform:
+        return ArrivalRandomness.ADVERSARIAL_OR_DETERMINISTIC_ORDER
+    return ArrivalRandomness.UNSPECIFIED
+
+
+def _weight_adversary(value: str) -> WeightAdversary:
+    plain = _plain_math(value)
+    if "oblivious_before_randomness" in plain:
+        return WeightAdversary.OBLIVIOUS_BEFORE_RANDOMNESS
+    if "adaptive_after_randomness" in plain:
+        return WeightAdversary.ADAPTIVE_AFTER_RANDOMNESS
+    oblivious = re.search(r"\boblivious adversar", plain) or re.search(
+        r"\b(?:weights?|w)\b[^.;]{0,80}\b(?:fixed|chosen|committed)\b[^.;]{0,40}"
+        r"\bbefore\b[^.;]{0,40}\b(?:randomness|coins?|arrival|permutation|order)\b",
+        plain,
+    )
+    adaptive = re.search(
+        r"\b(?:weights?|weight adversary|adversary)\b[^.;]{0,80}"
+        r"\b(?:adaptive|after seeing|after observing|depends? on)\b[^.;]{0,48}"
+        r"\b(?:randomness|coins?|arrival|permutation|order|seed)\b",
+        plain,
+    )
+    if oblivious and not adaptive:
+        return WeightAdversary.OBLIVIOUS_BEFORE_RANDOMNESS
+    if adaptive and not oblivious:
+        return WeightAdversary.ADAPTIVE_AFTER_RANDOMNESS
+    return WeightAdversary.UNSPECIFIED
+
+
+def _feasibility_requirement(value: str) -> FeasibilityRequirement:
+    plain = _plain_math(value)
+    if "pathwise" in plain and not re.search(r"\b(?:value|reward|weight)\b", plain):
+        return FeasibilityRequirement.PATHWISE
+    if "in_expectation" in plain and "feasibility" in plain:
+        return FeasibilityRequirement.IN_EXPECTATION
+    if "high_probability" in plain and "feasibility" in plain:
+        return FeasibilityRequirement.HIGH_PROBABILITY
+    feasibility_subject = re.search(
+        r"\b(?:feasib(?:le|ility)|independen(?:t|ce)|accepted (?:prefix|set))\b",
+        plain,
+    )
+    if not feasibility_subject:
+        return FeasibilityRequirement.UNSPECIFIED
+    high_probability = re.search(
+        r"\b(?:feasib(?:le|ility)|independen(?:t|ce))\b[^.;]{0,60}"
+        r"\b(?:with high probability|probably)\b",
+        plain,
+    )
+    expected = re.search(
+        r"\b(?:expected feasibility|feasib(?:le|ility)\s+(?:only\s+)?in expectation)\b",
+        plain,
+    )
+    pathwise = re.search(
+        r"\b(?:pathwise|pointwise|for every realization|in every realization|"
+        r"for each realization|deterministically conditional on every realization)\b",
+        plain,
+    ) or re.search(
+        r"\b(?:feasibility|independence)\b[^.;]{0,32}\bdeterministically\b",
+        plain,
+    )
+    if pathwise:
+        return FeasibilityRequirement.PATHWISE
+    if expected:
+        return FeasibilityRequirement.IN_EXPECTATION
+    if high_probability:
+        return FeasibilityRequirement.HIGH_PROBABILITY
+    return FeasibilityRequirement.UNSPECIFIED
+
+
+def _value_guarantee(value: str) -> ValueGuarantee:
+    plain = _plain_math(value)
+    if "in_expectation" in plain:
+        return ValueGuarantee.IN_EXPECTATION
+    if "pathwise_value" in plain:
+        return ValueGuarantee.PATHWISE
+    if "high_probability_value" in plain:
+        return ValueGuarantee.HIGH_PROBABILITY
+    expected_feasibility_only = bool(
+        re.search(r"\b(?:expected feasibility|feasib(?:le|ility)\s+in expectation)\b", plain)
+    ) and not re.search(r"\b(?:value|weight|reward|cost|objective|guarantee|bound)\b", plain)
+    if not expected_feasibility_only and re.search(r"\b(?:expectation|expected)\b|\be_", plain):
+        return ValueGuarantee.IN_EXPECTATION
+    if re.search(
+        r"\b(?:value|weight|reward|cost|objective|guarantee|bound)\b[^.;]{0,80}"
+        r"\b(?:pathwise|pointwise|in every realization|for every realization)\b",
+        plain,
+    ) or re.search(
+        r"\b(?:pathwise|pointwise|in every realization|for every realization)\b[^.;]{0,80}"
+        r"\b(?:value|weight|reward|cost|objective|guarantee|bound)\b",
+        plain,
+    ):
+        return ValueGuarantee.PATHWISE
+    if re.search(
+        r"\b(?:value|weight|reward|cost|objective|guarantee|bound)\b[^.;]{0,80}"
+        r"\bwith high probability\b",
+        plain,
+    ):
+        return ValueGuarantee.HIGH_PROBABILITY
+    return ValueGuarantee.UNSPECIFIED
+
+
+def _expectation_sources(value: str) -> list[Literal["arrival_order", "algorithm_coins"]]:
+    plain = _plain_math(value)
+    if not re.search(r"\b(?:expectation|expected)\b|\be_", plain):
+        return []
+    sources: list[Literal["arrival_order", "algorithm_coins"]] = []
+    expectation_spans = " ".join(
+        match.group(0)
+        for match in re.finditer(
+            r"(?:expectation|expected|e_)[^.;]{0,180}",
+            plain,
+        )
+    )
+    if re.search(
+        r"\b(?:arrival|arrival_order|permutation|uniform order|random order|pi)\b|\bπ\b",
+        expectation_spans,
+    ):
+        sources.append("arrival_order")
+    if re.search(
+        r"\b(?:algorithm coins?|algorithm_coins|random coins?|private randomness|"
+        r"internal randomness|seed)\b",
+        expectation_spans,
+    ) or re.search(r"\be_\s*(?:π|pi)?\s*,?\s*r\b", expectation_spans):
+        sources.append("algorithm_coins")
+    return sources
+
+
+def _randomness_facts(value: str) -> RandomnessFacts:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, dict) and any(key in RandomnessFacts.model_fields for key in decoded):
+        try:
+            return RandomnessFacts.model_validate(decoded)
+        except ValueError:
+            # Malformed model output is uncertain rather than a keyword-derived hard stop.
+            pass
+    return RandomnessFacts(
+        algorithm_randomization=_algorithm_randomization(value),
+        arrival_randomness=_arrival_randomness(value),
+        weight_adversary=_weight_adversary(value),
+        expectation_over=_expectation_sources(value),
+        feasibility_requirement=_feasibility_requirement(value),
+        value_guarantee=_value_guarantee(value),
+    )
+
+
+def _randomness_clause_facts(key: str, raw_value: str) -> RandomnessFacts:
+    direct = _randomness_facts(raw_value)
+    if direct != RandomnessFacts():
+        return direct
+    return _randomness_facts("\n".join(_clause_fragments(raw_value, clause_key=key)))
+
+
+def _merge_randomness_facts(facts: Iterable[RandomnessFacts]) -> RandomnessFacts:
+    merged = RandomnessFacts()
+    for item in facts:
+        updates: dict[str, object] = {}
+        for field in (
+            "algorithm_randomization",
+            "arrival_randomness",
+            "weight_adversary",
+            "feasibility_requirement",
+            "value_guarantee",
         ):
-            conflicts.append(f"{qualifier}, not {opposite}")
+            incoming = getattr(item, field)
+            current = getattr(merged, field)
+            if current.value == "unspecified" and incoming.value != "unspecified":
+                updates[field] = incoming
+        if item.expectation_over:
+            updates["expectation_over"] = list(
+                dict.fromkeys([*merged.expectation_over, *item.expectation_over])
+            )
+        if updates:
+            merged = merged.model_copy(update=updates)
+    return merged
+
+
+def _randomness_conflicts(
+    contract: RandomnessFacts,
+    statement: RandomnessFacts,
+) -> list[str]:
+    conflicts: list[str] = []
+    if (
+        contract.algorithm_randomization is AlgorithmRandomization.ALLOWED_OR_REQUIRED
+        and statement.algorithm_randomization is AlgorithmRandomization.DETERMINISTIC_ONLY
+    ):
+        conflicts.append(
+            "algorithm_randomization: contract=allowed_or_required, "
+            "statement=deterministic_only (not randomized)"
+        )
+    elif (
+        contract.algorithm_randomization is AlgorithmRandomization.DETERMINISTIC_ONLY
+        and statement.algorithm_randomization is AlgorithmRandomization.ALLOWED_OR_REQUIRED
+    ):
+        conflicts.append(
+            "algorithm_randomization: contract=deterministic_only (not randomized), "
+            "statement=allowed_or_required"
+        )
+    if (
+        contract.arrival_randomness is ArrivalRandomness.UNIFORM_RANDOM_PERMUTATION
+        and statement.arrival_randomness is ArrivalRandomness.ADVERSARIAL_OR_DETERMINISTIC_ORDER
+    ):
+        conflicts.append(
+            "arrival_randomness: contract=uniform_random_permutation, "
+            "statement=adversarial_or_deterministic_order"
+        )
+    elif (
+        contract.arrival_randomness is ArrivalRandomness.ADVERSARIAL_OR_DETERMINISTIC_ORDER
+        and statement.arrival_randomness is ArrivalRandomness.UNIFORM_RANDOM_PERMUTATION
+    ):
+        conflicts.append(
+            "arrival_randomness: contract=adversarial_or_deterministic_order, "
+            "statement=uniform_random_permutation"
+        )
+    if (
+        contract.weight_adversary is WeightAdversary.OBLIVIOUS_BEFORE_RANDOMNESS
+        and statement.weight_adversary is WeightAdversary.ADAPTIVE_AFTER_RANDOMNESS
+    ):
+        conflicts.append(
+            "weight_adversary: contract=oblivious_before_randomness, "
+            "statement=adaptive_after_randomness"
+        )
+    if (
+        contract.feasibility_requirement is FeasibilityRequirement.PATHWISE
+        and statement.feasibility_requirement
+        in {FeasibilityRequirement.IN_EXPECTATION, FeasibilityRequirement.HIGH_PROBABILITY}
+    ):
+        conflicts.append(
+            "feasibility_requirement: contract=pathwise, "
+            f"statement={statement.feasibility_requirement.value}"
+        )
+    if contract.value_guarantee is ValueGuarantee.IN_EXPECTATION and statement.value_guarantee in {
+        ValueGuarantee.PATHWISE,
+        ValueGuarantee.HIGH_PROBABILITY,
+    }:
+        conflicts.append(
+            f"value_guarantee: contract=in_expectation, statement={statement.value_guarantee.value}"
+        )
+    if (
+        contract.value_guarantee is ValueGuarantee.IN_EXPECTATION
+        and statement.value_guarantee is ValueGuarantee.IN_EXPECTATION
+        and contract.expectation_over
+        and statement.expectation_over
+    ):
+        missing_sources = sorted(set(contract.expectation_over) - set(statement.expectation_over))
+        if missing_sources:
+            conflicts.append(
+                "expectation_over: contract="
+                f"{contract.expectation_over}, statement={statement.expectation_over}; "
+                f"removed required source(s) {missing_sources}"
+            )
+    return conflicts
+
+
+def _randomness_warnings(
+    contract: RandomnessFacts,
+    statement: RandomnessFacts,
+) -> list[str]:
+    warnings: list[str] = []
+    scalar_fields = (
+        "algorithm_randomization",
+        "arrival_randomness",
+        "weight_adversary",
+        "feasibility_requirement",
+        "value_guarantee",
+    )
+    for field in scalar_fields:
+        contract_value = getattr(contract, field)
+        statement_value = getattr(statement, field)
+        if contract_value.value != "unspecified" and statement_value.value == "unspecified":
+            warnings.append(
+                f"{field}: contract={contract_value.value}, statement=unspecified; "
+                "no explicit opposing value was found"
+            )
+    if contract.expectation_over and not statement.expectation_over:
+        warnings.append(
+            "expectation_over: contract="
+            f"{contract.expectation_over}, statement=[]; no explicit removal was found"
+        )
+    return warnings
+
+
+def _randomness_decision(
+    normalized_statement: str,
+    claim_contract: dict[str, str],
+) -> RandomnessDecision:
+    relevant_keys: list[str] = []
+    contract_facts: list[RandomnessFacts] = []
+    for key, raw_value in claim_contract.items():
+        fragments = _clause_fragments(raw_value, clause_key=key)
+        contract_facts.append(_randomness_clause_facts(key, raw_value))
+        material = f"{key} {' '.join(fragments)}".casefold()
+        if re.search(
+            r"\b(?:random|randomized|randomised|stochastic|coin|arrival|permutation|"
+            r"expectation|expected|feasib|pathwise|pointwise|realization|oblivious)\w*\b",
+            material,
+        ):
+            relevant_keys.append(key)
+    contract = _merge_randomness_facts(contract_facts)
+    statement = _randomness_facts(normalized_statement)
+    conflicts = _randomness_conflicts(contract, statement)
+    warnings = _randomness_warnings(contract, statement) if not conflicts else []
+    if conflicts:
+        detail = "Material structured randomness conflict(s): " + "; ".join(conflicts)
+        rule = "explicit opposing structured randomness values block research"
+    elif warnings:
+        detail = (
+            "Structured randomness comparison is non-materially incomplete; "
+            "the frozen claim contract remains canonical and research may continue."
+        )
+        rule = "unknown or absent structured values warn and continue"
+    else:
+        detail = "Structured randomness facts are aligned; pathwise feasibility is orthogonal."
+        rule = "compare orthogonal random sources, guarantee mode, and feasibility mode"
+    return RandomnessDecision(
+        contract_clause_keys=list(dict.fromkeys(relevant_keys)),
+        contract=contract,
+        statement=statement,
+        decision_rule=rule,
+        material_contradiction=bool(conflicts),
+        material_conflicts=conflicts,
+        warnings=warnings,
+        detail=detail,
+    )
+
+
+def _mode(value: str, patterns: tuple[tuple[str, str], ...]) -> str:
+    plain = _plain_math(value)
+    for mode, pattern in patterns:
+        if re.search(pattern, plain):
+            return mode
+    return "unspecified"
+
+
+def _clause_values(
+    category: TargetClauseCategory,
+    value: str,
+) -> dict[str, str | list[str]]:
+    plain = _plain_math(value)
+    if category is TargetClauseCategory.QUANTIFIERS:
+        return {
+            "quantifiers": [
+                f"{kind} {variable or '*'}" for kind, variable in _quantifier_requirements(value)
+            ]
+        }
+    if category is TargetClauseCategory.CONSTANTS:
+        return {
+            "scope": _mode(
+                value,
+                (
+                    ("instance_dependent", r"\b(?:instance[- ]dependent|may depend on)\b"),
+                    ("universal", r"\b(?:universal|independent of (?:the )?instance)\b"),
+                ),
+            ),
+            "numeric_values": re.findall(r"(?<![a-z_])\d+(?:\.\d+)?(?![a-z0-9_])", plain),
+        }
+    if category is TargetClauseCategory.DOMAIN:
+        return {
+            "finiteness": _mode(
+                value,
+                (("infinite", r"\binfinite\b"), ("finite", r"\bfinite\b")),
+            )
+        }
+    if category is TargetClauseCategory.INFORMATION_MODEL:
+        return {
+            "unseen_information": _mode(
+                value,
+                (
+                    (
+                        "allowed",
+                        r"\b(?:may|can)\b[^.;]{0,32}\b(?:inspect|use|access)\b[^.;]{0,32}"
+                        r"\b(?:unseen|unrevealed|future)\b",
+                    ),
+                    (
+                        "forbidden",
+                        r"\b(?:only revealed|no access to (?:unseen|unrevealed|future)|"
+                        r"not known until arrival|without (?:unseen|unrevealed|future))\b",
+                    ),
+                ),
+            )
+        }
+    if category is TargetClauseCategory.ONLINE_DECISIONS:
+        return {
+            "timing": _mode(
+                value,
+                (
+                    ("deferred", r"\b(?:defer|delay|buffer|wait before deciding)\w*\b"),
+                    ("immediate", r"\bimmediate(?:ly)?\b"),
+                ),
+            ),
+            "revision": _mode(
+                value,
+                (
+                    ("revocable", r"\b(?:revocable|undo|revoke|change)\w*\b"),
+                    ("irrevocable", r"\birrevocable\w*\b"),
+                ),
+            ),
+        }
+    if category is TargetClauseCategory.FEASIBILITY:
+        return {"feasibility_requirement": _feasibility_requirement(value).value}
+    if category is TargetClauseCategory.RANDOMNESS:
+        facts = _randomness_facts(value)
+        return {
+            key: item if isinstance(item, list) else str(item)
+            for key, item in facts.model_dump(mode="json").items()
+        }
+    if category is TargetClauseCategory.POLARITY:
+        return {"requested_outcome": classify_requested_polarity(value).value}
+    if category in {TargetClauseCategory.ADDITIVE_TERMS, TargetClauseCategory.CONCLUSION}:
+        comparisons = []
+        for match in re.finditer(r"(.+?)\s*(<=|>=|=|<|>)\s*(.+)", plain):
+            comparisons.append(
+                " ".join(
+                    [
+                        *_comparison_lexemes(match.group(1)),
+                        match.group(2),
+                        *_comparison_lexemes(match.group(3)),
+                    ]
+                )
+            )
+        return {"comparisons": comparisons}
+    return {}
+
+
+def _opposing_field_conflicts(
+    category: TargetClauseCategory,
+    contract_values: dict[str, str | list[str]],
+    statement_values: dict[str, str | list[str]],
+) -> list[str]:
+    conflicts: list[str] = []
+    opposing_fields: dict[TargetClauseCategory, tuple[str, ...]] = {
+        TargetClauseCategory.CONSTANTS: ("scope",),
+        TargetClauseCategory.DOMAIN: ("finiteness",),
+        TargetClauseCategory.INFORMATION_MODEL: ("unseen_information",),
+        TargetClauseCategory.ONLINE_DECISIONS: ("timing", "revision"),
+        TargetClauseCategory.FEASIBILITY: ("feasibility_requirement",),
+    }
+    for field in opposing_fields.get(category, ()):
+        expected = contract_values.get(field, "unspecified")
+        observed = statement_values.get(field, "unspecified")
+        if expected != "unspecified" and observed != "unspecified" and expected != observed:
+            conflicts.append(f"{field}: contract={expected}, statement={observed}")
     return conflicts
 
 
@@ -939,6 +1491,36 @@ def validate_target_contract(
     issues: list[str] = []
     warnings: list[str] = []
 
+    randomness_decision = _randomness_decision(normalized_statement, claim_contract)
+    local_randomness = {
+        key: _randomness_clause_facts(key, raw_value) for key, raw_value in claim_contract.items()
+    }
+    randomness_conflicts_by_key: dict[str, list[str]] = {}
+    for conflict in randomness_decision.material_conflicts:
+        field = conflict.partition(":")[0]
+        specified_keys: list[str] = []
+        for candidate_key, candidate in local_randomness.items():
+            candidate_value = getattr(candidate, field)
+            if isinstance(candidate_value, list):
+                if candidate_value:
+                    specified_keys.append(candidate_key)
+            elif candidate_value.value != "unspecified":
+                specified_keys.append(candidate_key)
+
+        owner = next(
+            iter(specified_keys),
+            randomness_decision.contract_clause_keys[0]
+            if randomness_decision.contract_clause_keys
+            else next(iter(claim_contract)),
+        )
+        randomness_conflicts_by_key.setdefault(owner, []).append(conflict)
+
+    if randomness_decision.warnings and randomness_decision.contract_clause_keys:
+        warnings.extend(
+            f"Structured randomness uncertainty: {warning}"
+            for warning in randomness_decision.warnings
+        )
+
     polarity_clause_key: str | None = None
     if "polarity" in claim_contract:
         polarity_clause_key = "polarity"
@@ -956,12 +1538,32 @@ def validate_target_contract(
     for key, raw_value in claim_contract.items():
         fragments = _clause_fragments(raw_value, clause_key=key)
         category = _clause_category(key, raw_value)
+        clause_text = "\n".join(fragments)
+        contract_values = _clause_values(category, clause_text)
+        statement_values = _clause_values(category, normalized_statement)
         conflicts: list[str] = []
         clause_warnings: list[str] = []
 
         for fragment in fragments:
             conflicts.extend(_quantifier_conflicts(normalized_statement, fragment))
-        conflicts.extend(_qualifier_conflicts(statement, fragments))
+        conflicts.extend(_opposing_field_conflicts(category, contract_values, statement_values))
+        randomness_conflicts = randomness_conflicts_by_key.get(key, [])
+        conflicts.extend(randomness_conflicts)
+        if randomness_conflicts:
+            for conflict in randomness_conflicts:
+                field = conflict.partition(":")[0]
+                contract_value = getattr(randomness_decision.contract, field)
+                statement_value = getattr(randomness_decision.statement, field)
+                contract_values[field] = (
+                    list(contract_value)
+                    if isinstance(contract_value, list)
+                    else contract_value.value
+                )
+                statement_values[field] = (
+                    list(statement_value)
+                    if isinstance(statement_value, list)
+                    else statement_value.value
+                )
 
         is_polarity_clause = polarity_decision is not None and key == polarity_clause_key
         if is_polarity_clause:
@@ -979,25 +1581,60 @@ def validate_target_contract(
             if _is_compact_formal_clause(fragment) and not _comparison_aligned(
                 statement, fragment_value
             ):
-                conflicts.append("compact formal comparison")
+                conflicts.append(
+                    "compact formal comparison: "
+                    f"contract={_comparison_lexemes(fragment_value)}, "
+                    f"statement={statement_values.get('comparisons', [])}"
+                )
             elif category is TargetClauseCategory.CONCLUSION and _comparison_direction_conflict(
                 statement, fragment_value
             ):
-                conflicts.append("reversed comparison direction")
+                conflicts.append(
+                    "reversed comparison direction: "
+                    f"contract={contract_values.get('comparisons', [])}, "
+                    f"statement={statement_values.get('comparisons', [])}"
+                )
             if re.fullmatch(r"\d+(?:\.\d+)?", fragment_value) and not re.search(
                 rf"(?<![a-z_]){re.escape(fragment_value)}(?![a-z0-9_])", statement
             ):
-                conflicts.append(f"numeric value {fragment_value}")
+                statement_numeric_values = re.findall(
+                    r"(?<![a-z_])\d+(?:\.\d+)?(?![a-z0-9_])", statement
+                )
+                conflicts.append(
+                    f"numeric value {fragment_value}: contract="
+                    f"{contract_values.get('numeric_values', [fragment_value])}, "
+                    f"statement={statement_numeric_values}"
+                )
 
         conflicts = list(dict.fromkeys(conflicts))
         passed = not conflicts
         if is_polarity_clause and passed:
             detail = polarity_decision.detail  # type: ignore[union-attr]
+        elif key in randomness_decision.contract_clause_keys and passed:
+            detail = randomness_decision.detail
         elif passed:
             detail = "No high-confidence contradiction detected."
         else:
-            detail = "Explicit contradiction(s): " + ", ".join(conflicts)
-        checks.append(TargetClauseCheck(key=key, category=category, passed=passed, detail=detail))
+            detail = (
+                "Explicit structured contradiction(s): "
+                + "; ".join(conflicts)
+                + ". Compared contract values="
+                + json.dumps(contract_values, sort_keys=True, ensure_ascii=False)
+                + "; statement values="
+                + json.dumps(statement_values, sort_keys=True, ensure_ascii=False)
+                + "."
+            )
+        checks.append(
+            TargetClauseCheck(
+                key=key,
+                category=category,
+                passed=passed,
+                detail=detail,
+                contract_values=contract_values,
+                statement_values=statement_values,
+                material_conflicts=conflicts,
+            )
+        )
         if not passed:
             issues.append(f"Claim-contract clause {key!r} is not aligned: {detail}")
         for warning in clause_warnings:
@@ -1011,12 +1648,18 @@ def validate_target_contract(
         blocking_issues=issues,
         warnings=warnings,
         polarity=polarity_decision,
+        randomness=randomness_decision,
     )
 
 
 __all__ = [
+    "AlgorithmRandomization",
+    "ArrivalRandomness",
     "BranchOutcome",
+    "FeasibilityRequirement",
     "PolarityDecision",
+    "RandomnessDecision",
+    "RandomnessFacts",
     "ScientificArtifactDeclaration",
     "ScientificObligationDeclaration",
     "ScientificResult",
@@ -1027,6 +1670,8 @@ __all__ = [
     "TargetClauseCheck",
     "TargetContractAlignment",
     "TargetPolarity",
+    "ValueGuarantee",
+    "WeightAdversary",
     "classify_requested_polarity",
     "exact_statement_fingerprint",
     "is_explicit_definition_declaration",

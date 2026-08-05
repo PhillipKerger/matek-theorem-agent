@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Replaced the remaining broad randomized/deterministic qualifier heuristic with structured
+  randomness alignment. Target artifacts now compare algorithm randomization, arrival order,
+  weight-adversary timing, expectation sources, pathwise feasibility, and value-guarantee mode as
+  orthogonal fields. Randomized policies with deterministic invariants, preprocessing,
+  tie-breaking, or seed-conditioned proofs proceed; deterministic-only/no-coin and adversarial-
+  order replacements still block with the exact compared values. Clause-specific structured
+  comparisons now cover information access and online-decision modes as well, while uncertain
+  prose records a warning and continues with the frozen contract.
 - Made pre-research polarity alignment structured and local. Requested-outcome polarity is now a
   compact structured value (`affirmative_proof`, `disproof`, `classification`, `construction`,
   `investigation`, or `ambiguous`) derived only from the leading directive of the `polarity`

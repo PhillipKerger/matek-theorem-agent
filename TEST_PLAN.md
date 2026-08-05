@@ -112,9 +112,15 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   research still starts; target-identification evidence remains fail closed.
 - Target-contract alignment accepts the persisted matroid-secretary paraphrase, including literal
   forbidden examples such as “no `+β`,” long explanatory clauses, and malformed transport Unicode
-  escapes. It still rejects explicit reversed symbolic quantifiers/inequalities, opposing
-  randomized/deterministic qualifiers, structured numeric changes, and compact formal-expression
-  drift; missing domain or edge-case prose alone is nonblocking.
+  escapes. The regression corpus compares structured positive and negative fixtures for
+  quantifiers, constants, domain, information access, online decisions, feasibility, randomness,
+  benchmark/conclusion, and polarity. A randomized algorithm with pathwise feasibility,
+  deterministic preprocessing/tie-breaking, seed conditioning, fixed-before-randomness weights,
+  random-order arrivals, and private coins passes. Explicit deterministic-only/no-coin policies,
+  adversarial-order replacements, removed expectation sources, feasibility weakening, structured
+  numeric changes, reversed symbolic quantifiers/inequalities, and compact formal-expression drift
+  fail with both compared values and a concrete conflict. Missing or uncertain prose is warning-
+  only and does not prevent research scheduling.
 - Event-driven research configuration defaults and migration of legacy
   `maximum_assignments_per_round`/`maximum_rounds` and `--max-rounds` inputs to
   `max_pending_assignments`/`max_coordinator_decisions` without reintroducing barriers.
