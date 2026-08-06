@@ -37,12 +37,14 @@ from matek_theorem_agent.openai_client import (
 )
 from matek_theorem_agent.scientific import (
     BranchOutcome,
+    MaterialityVerdict,
     ScientificArtifactDeclaration,
     ScientificObligationDeclaration,
     ScientificResult,
     ScientificResultDisposition,
     ScientificResultKind,
     ScientificScope,
+    TargetMaterialityAssessment,
 )
 from matek_theorem_agent.source_provenance import (
     SourceVerificationRecord,
@@ -910,13 +912,15 @@ async def test_prompt_compiler_checks_hash_placeholders_and_writes_contract(
     bad_client = StaticClient(
         [compiled_problem(covered_compiled_prompt("Prove [INSERT TARGET HERE]."))]
     )
-    with pytest.raises(StageValidationError, match="unresolved editorial"):
-        await compile_prompt(
-            client=bad_client,
-            problem_text="Prove P.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path / "bad",
-        )
+    recovered = await compile_prompt(
+        client=bad_client,
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path / "bad",
+    )
+    assert recovered.prompt_validation.passed is True
+    assert recovered.prompt_validation.warnings
+    assert "[INSERT TARGET HERE]" not in recovered.compiled_prompt
 
 
 @pytest.mark.asyncio
@@ -1004,7 +1008,7 @@ async def test_prompt_compiler_incident_randomized_policy_reaches_research_bound
 
 
 @pytest.mark.asyncio
-async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
+async def test_prompt_compiler_warns_when_k_server_target_drops_additive_beta(
     tmp_path: Path,
 ) -> None:
     payload = CompiledProblem(
@@ -1024,17 +1028,21 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
     )
     client = StaticClient([payload])
 
-    with pytest.raises(StageValidationError, match="compact formal comparison"):
-        await compile_prompt(
-            client=client,
-            problem_text="Prove the k-server bound including its additive constant.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path,
-        )
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove the k-server bound including its additive constant.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
 
     assert len(client.requests) == 1
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
+    assert result.target_alignment.materiality_review is not None
+    assert result.target_alignment.materiality_review.status == "unavailable"
     persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
-    assert persisted["passed"] is False
+    assert persisted["passed"] is True
+    assert persisted["blocking_issues"] == []
     additive_check = next(
         check for check in persisted["checks"] if check["category"] == "additive_terms"
     )
@@ -1078,7 +1086,7 @@ async def test_prompt_compiler_rejects_k_server_target_that_drops_additive_beta(
         ),
     ],
 )
-async def test_prompt_compiler_blocks_material_target_clause_drift(
+async def test_prompt_compiler_warns_on_heuristic_target_clause_drift(
     tmp_path: Path,
     statement: str,
     contract: dict[str, str],
@@ -1092,18 +1100,135 @@ async def test_prompt_compiler_blocks_material_target_clause_drift(
         compiled_prompt=covered_compiled_prompt(),
     )
 
-    with pytest.raises(StageValidationError, match="does not match the claim contract"):
-        await compile_prompt(
-            client=StaticClient([payload]),
-            problem_text="Exercise deterministic target-clause validation.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path,
-        )
+    result = await compile_prompt(
+        client=StaticClient([payload]),
+        problem_text="Exercise deterministic target-clause validation.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
 
     persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
+    assert persisted["blocking_issues"] == []
     check = next(item for item in persisted["checks"] if item["category"] == expected_category)
     assert check["passed"] is False
     assert missing_marker in check["detail"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_only_blocks_a_reviewer_confirmed_target_conflict(
+    tmp_path: Path,
+) -> None:
+    payload = CompiledProblem(
+        title="Changed constant",
+        normalized_statement="For every n, cost(n) <= 2 * OPT(n).",
+        claim_contract={"conclusion": "cost(n) <= 3 * OPT(n)"},
+        compiled_prompt=covered_compiled_prompt(),
+    )
+    assessment = TargetMaterialityAssessment(
+        verdict=MaterialityVerdict.CONFIRMED_CONFLICT,
+        rationale="The normalized statement changes the approximation factor from 3 to 2.",
+        clause_keys=["conclusion"],
+    )
+    client = StaticClient([payload, assessment])
+
+    with pytest.raises(StageValidationError, match="does not match the claim contract"):
+        await compile_prompt(
+            client=client,
+            problem_text="Prove the factor-three bound.",
+            framework_path=FRAMEWORK,
+            prompts_dir=tmp_path,
+            alignment_review_settings=ModelSettings(
+                model="gpt-5.6-terra",
+                reasoning_effort="medium",
+                web_search=False,
+            ),
+        )
+
+    persisted = json.loads((tmp_path / "target_alignment.json").read_text(encoding="utf-8"))
+    assert persisted["passed"] is False
+    assert persisted["materiality_review"]["verdict"] == "CONFIRMED_CONFLICT"
+    assert len(client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_continues_when_reviewer_clears_a_possible_conflict(
+    tmp_path: Path,
+) -> None:
+    payload = CompiledProblem(
+        title="Scoped negation",
+        normalized_statement=(
+            "Future weights are not known, and ALG makes immediate and irrevocable decisions."
+        ),
+        claim_contract={
+            "online_decisions": (
+                "decisions may not be deferred and accepted elements may not be revoked"
+            )
+        },
+        compiled_prompt=covered_compiled_prompt(),
+    )
+    assessment = TargetMaterialityAssessment(
+        verdict=MaterialityVerdict.NO_MATERIAL_CONFLICT,
+        rationale="Both texts require immediate, irrevocable decisions; the negation has scope.",
+        clause_keys=["online_decisions"],
+    )
+    client = StaticClient([payload, assessment])
+
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove the online theorem.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+        alignment_review_settings=ModelSettings(
+            model="gpt-5.6-terra", reasoning_effort="medium", web_search=False
+        ),
+    )
+
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
+    assert result.target_alignment.materiality_review is not None
+    assert result.target_alignment.materiality_review.verdict is (
+        MaterialityVerdict.NO_MATERIAL_CONFLICT
+    )
+    assert result.calls.model_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_prompt_compiler_continues_when_materiality_reviewer_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    payload = CompiledProblem(
+        title="Scoped negation",
+        normalized_statement=(
+            "Future weights are not known, and ALG makes immediate and irrevocable decisions."
+        ),
+        claim_contract={
+            "online_decisions": (
+                "decisions may not be deferred and accepted elements may not be revoked"
+            )
+        },
+        compiled_prompt=covered_compiled_prompt(),
+    )
+    client = StaticClient([payload])
+
+    result = await compile_prompt(
+        client=client,
+        problem_text="Prove the online theorem.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+        alignment_review_settings=ModelSettings(
+            model="gpt-5.6-terra", reasoning_effort="medium", web_search=False
+        ),
+    )
+
+    assert len(client.requests) == 2
+    assert result.target_alignment is not None
+    assert result.target_alignment.passed is True
+    assert result.target_alignment.blocking_issues == []
+    assert result.target_alignment.materiality_review is not None
+    assert result.target_alignment.materiality_review.status == "unavailable"
+    assert any("review was unavailable" in warning for warning in result.target_alignment.warnings)
 
 
 @pytest.mark.asyncio
@@ -1169,28 +1294,29 @@ async def test_prompt_compiler_downgrades_unrepairable_optional_sentence(
 
 
 @pytest.mark.asyncio
-async def test_prompt_compiler_preserves_artifacts_on_target_critical_repair_failure(
+async def test_prompt_compiler_removes_unrepairable_target_placeholder_and_warns(
     tmp_path: Path,
 ) -> None:
     payload = compiled_problem(covered_compiled_prompt("Prove [INSERT TARGET HERE]."))
 
-    with pytest.raises(StageValidationError, match=r"\[INSERT TARGET HERE\]"):
-        await compile_prompt(
-            client=StaticClient([payload]),
-            problem_text="Prove P.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path,
-        )
+    result = await compile_prompt(
+        client=StaticClient([payload]),
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path,
+    )
 
     assert (tmp_path / "compiled_problem.json").is_file()
     assert (tmp_path / "compiled_research_prompt.md").is_file()
+    assert "[INSERT TARGET HERE]" not in result.compiled_prompt
     validation = json.loads((tmp_path / "prompt_validation.json").read_text(encoding="utf-8"))
-    assert validation["passed"] is False
-    assert validation["diagnostics"][0]["disposition"] == "target_critical_failure"
+    assert validation["passed"] is True
+    assert validation["warnings"]
+    assert validation["diagnostics"][0]["disposition"] == "removed_target_critical"
 
 
 @pytest.mark.asyncio
-async def test_prompt_compiler_returns_a_terminal_clarification_request(
+async def test_prompt_compiler_selects_and_warns_on_an_ambiguous_interpretation(
     tmp_path: Path,
 ) -> None:
     clarification = CompiledProblem(
@@ -1216,13 +1342,16 @@ async def test_prompt_compiler_returns_a_terminal_clarification_request(
         prompts_dir=tmp_path,
     )
 
-    assert result.needs_clarification
-    assert "compiled_prompt" not in result.artifacts.paths
+    assert not result.needs_clarification
+    assert result.compiled_problem.assumed_interpretation == (
+        "Extend a bounded operator from a subspace."
+    )
+    assert result.compiled_problem.assumption_warning
+    assert "compiled_prompt" in result.artifacts.paths
     assert (tmp_path / "compiled_problem.json").is_file()
-    request = (tmp_path / "clarification_request.md").read_text(encoding="utf-8")
-    assert "stopped before mathematical research" in request
-    assert "Which objects are being extended?" in request
-    assert "start a new MATEK run" in request
+    assert not (tmp_path / "clarification_request.md").exists()
+    assert result.prompt_validation.warnings
+    assert "assumed" in result.compiled_prompt.casefold()
 
 
 @pytest.mark.asyncio
@@ -1280,13 +1409,14 @@ async def test_prompt_compiler_rejects_missing_framework_sections_and_downgrades
     tmp_path: Path,
 ) -> None:
     incomplete = StaticClient([compiled_problem("Current task statement\nProve the theorem.")])
-    with pytest.raises(StageValidationError, match="preserve the reusable framework"):
-        await compile_prompt(
-            client=incomplete,
-            problem_text="Prove P.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path / "incomplete",
-        )
+    incomplete_result = await compile_prompt(
+        client=incomplete,
+        problem_text="Prove P.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path / "incomplete",
+    )
+    assert incomplete_result.prompt_validation.passed is True
+    assert incomplete_result.prompt_validation.warnings
 
     bad_source = compiled_problem()
     bad_source.source_ledger = [
@@ -1392,13 +1522,14 @@ async def test_prompt_compiler_allows_a_verified_empty_source_ledger(tmp_path: P
     assert sourced_result.source_ledger[0]["verified"] is True
 
     unledgered = compiled_problem(covered_compiled_prompt(f"See {VERIFIED_SOURCE_URL}."))
-    with pytest.raises(StageValidationError, match="absent from its verified source ledger"):
-        await compile_prompt(
-            client=StaticClient([unledgered], tool_metadata=web_source_metadata()),
-            problem_text="Prove the cited fixture statement.",
-            framework_path=FRAMEWORK,
-            prompts_dir=tmp_path / "unledgered",
-        )
+    unledgered_result = await compile_prompt(
+        client=StaticClient([unledgered], tool_metadata=web_source_metadata()),
+        problem_text="Prove the cited fixture statement.",
+        framework_path=FRAMEWORK,
+        prompts_dir=tmp_path / "unledgered",
+    )
+    assert unledgered_result.prompt_validation.passed is True
+    assert unledgered_result.prompt_validation.warnings
 
 
 @pytest.mark.asyncio
@@ -1461,9 +1592,11 @@ async def test_malformed_required_literature_source_is_quarantined_not_aborted(
     )
 
     assert result.compiled_problem.literature_status is LiteratureStatus.UNKNOWN
-    assert result.compiled_problem.source_ledger[0].verified is False
-    assert "all literature claims associated" in result.compiled_prompt
-    assert result.source_verification.warnings
+    assert result.compiled_problem.source_ledger == []
+    assert any(
+        "removed after one bounded repair" in warning
+        for warning in result.source_verification.warnings
+    )
 
 
 @pytest.mark.asyncio

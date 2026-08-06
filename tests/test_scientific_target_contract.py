@@ -81,7 +81,7 @@ def test_structured_prose_omissions_do_not_block_without_an_explicit_conflict(
     assert alignment.passed is True
 
 
-def test_structured_numeric_value_still_blocks_an_explicit_change() -> None:
+def test_structured_numeric_change_is_preserved_as_a_diagnostic_warning() -> None:
     alignment = validate_target_contract(
         (
             "For every connected planar graph, including the empty graph and one-vertex graphs, "
@@ -90,8 +90,10 @@ def test_structured_numeric_value_still_blocks_an_explicit_change() -> None:
         {"constants": json.dumps({"factor": 3})},
     )
 
-    assert alignment.passed is False
-    assert "numeric value 3" in " ".join(alignment.blocking_issues)
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
+    assert "numeric value 3" in " ".join(alignment.warnings)
 
 
 def test_existing_quantitative_domain_contract_remains_aligned() -> None:
@@ -112,14 +114,16 @@ def test_existing_quantitative_domain_contract_remains_aligned() -> None:
     assert alignment.passed is True
 
 
-def test_comparison_clause_rejects_an_extra_material_rhs_term() -> None:
+def test_comparison_clause_reports_an_extra_material_rhs_term() -> None:
     alignment = validate_target_contract(
         "For every k, cost_ALG <= k * OPT + gamma + beta.",
         {"conclusion": "cost_ALG <= k * OPT + beta"},
     )
 
-    assert alignment.passed is False
-    assert "compact formal comparison" in " ".join(alignment.blocking_issues)
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
+    assert "compact formal comparison" in " ".join(alignment.warnings)
 
 
 @pytest.mark.parametrize(
@@ -143,9 +147,11 @@ def test_structured_false_qualifier_is_a_negative_requirement(
 ) -> None:
     alignment = validate_target_contract(statement, contract)
 
-    assert alignment.passed is expected_passed
+    assert alignment.passed is True
     if not expected_passed:
-        assert "not randomized" in " ".join(alignment.blocking_issues)
+        assert not alignment.blocking_issues
+        assert alignment.alignment_warnings
+        assert "not randomized" in " ".join(alignment.warnings)
 
 
 @pytest.mark.parametrize(
@@ -178,8 +184,10 @@ def test_structured_quantifier_polarity_cannot_be_reversed(
         {"quantifiers": contract_value},
     )
 
-    assert alignment.passed is False
-    assert "quantifier" in " ".join(alignment.blocking_issues).casefold()
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
+    assert "quantifier" in " ".join(alignment.warnings).casefold()
 
 
 def test_matroid_secretary_paraphrase_does_not_fail_on_explanatory_prose() -> None:
@@ -312,7 +320,9 @@ def test_nearby_unrelated_negation_does_not_hide_permitted_deferral_or_revocatio
         },
     )
 
-    assert alignment.passed is False
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
     check = alignment.checks[0]
     assert check.contract_values == {
         "timing": "deferred",
@@ -323,7 +333,7 @@ def test_nearby_unrelated_negation_does_not_hide_permitted_deferral_or_revocatio
     }
 
 
-def test_long_prose_conclusion_still_blocks_reversed_comparison() -> None:
+def test_long_prose_conclusion_reports_reversed_comparison() -> None:
     alignment = validate_target_contract(
         (
             "A separate normalization has C >= 1. For every finite matroid M and weight function "
@@ -339,8 +349,10 @@ def test_long_prose_conclusion_still_blocks_reversed_comparison() -> None:
         },
     )
 
-    assert alignment.passed is False
-    assert "reversed comparison direction" in " ".join(alignment.blocking_issues)
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
+    assert "reversed comparison direction" in " ".join(alignment.warnings)
 
 
 # --- Structured polarity alignment (P0 reliability fix) ---------------------------------
@@ -423,14 +435,16 @@ def test_excluded_or_framework_disproof_words_alone_do_not_fail_polarity(
     assert alignment.passed is True
 
 
-def test_explicit_structured_polarity_mismatch_still_blocks() -> None:
+def test_explicit_structured_polarity_mismatch_is_diagnostic() -> None:
     alignment = validate_target_contract(
         "Disprove the stated conjecture by exhibiting a counterexample.",
         {"polarity": "affirmative_proof"},
     )
 
-    assert alignment.passed is False
-    assert "refute/disprove polarity" in " ".join(alignment.blocking_issues)
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
+    assert "refute/disprove polarity" in " ".join(alignment.warnings)
     assert alignment.polarity is not None
     assert alignment.polarity.material_contradiction is True
     assert alignment.polarity.contract_polarity is TargetPolarity.AFFIRMATIVE_PROOF
@@ -561,7 +575,9 @@ def test_explicit_deterministic_only_algorithm_reports_structured_randomness_con
         _RANDOMNESS_CONTRACT,
     )
 
-    assert alignment.passed is False
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
     assert alignment.randomness is not None
     assert alignment.randomness.material_contradiction is True
     assert alignment.randomness.contract.algorithm_randomization is (
@@ -586,7 +602,9 @@ def test_adversarial_arrival_replacement_reports_compared_structured_values() ->
         _RANDOMNESS_CONTRACT,
     )
 
-    assert alignment.passed is False
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
     assert alignment.randomness is not None
     assert alignment.randomness.contract.arrival_randomness is (
         ArrivalRandomness.UNIFORM_RANDOM_PERMUTATION
@@ -594,10 +612,10 @@ def test_adversarial_arrival_replacement_reports_compared_structured_values() ->
     assert alignment.randomness.statement.arrival_randomness is (
         ArrivalRandomness.ADVERSARIAL_OR_DETERMINISTIC_ORDER
     )
-    assert "arrival_randomness" in " ".join(alignment.blocking_issues)
+    assert "arrival_randomness" in " ".join(alignment.warnings)
 
 
-def test_expected_value_replaced_by_pathwise_value_fails_without_blaming_feasibility() -> None:
+def test_expected_value_replaced_by_pathwise_value_is_diagnosed_separately() -> None:
     alignment = validate_target_contract(
         (
             "There is a randomized online policy with private coins under a uniformly random "
@@ -607,11 +625,13 @@ def test_expected_value_replaced_by_pathwise_value_fails_without_blaming_feasibi
         _RANDOMNESS_CONTRACT,
     )
 
-    assert alignment.passed is False
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
     assert alignment.randomness is not None
     assert alignment.randomness.contract.value_guarantee is ValueGuarantee.IN_EXPECTATION
     assert alignment.randomness.statement.value_guarantee is ValueGuarantee.PATHWISE
-    assert "value_guarantee" in " ".join(alignment.blocking_issues)
+    assert "value_guarantee" in " ".join(alignment.warnings)
 
 
 def test_uncertain_randomness_alignment_warns_and_uses_frozen_contract() -> None:
@@ -713,7 +733,9 @@ def test_clause_specific_structured_conflict_corpus(
 ) -> None:
     alignment = validate_target_contract(statement, {key: contract})
 
-    assert alignment.passed is False
+    assert alignment.passed is True
+    assert not alignment.blocking_issues
+    assert alignment.alignment_warnings
     check = alignment.checks[0]
     assert check.passed is False
     assert check.contract_values

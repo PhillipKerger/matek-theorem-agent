@@ -44,9 +44,9 @@
 - [x] Existing API end-to-end fixture still passes through the explicit API backend.
 - [x] Codex end-to-end fixture passes the same stage, artifact, and gate checks.
 - [x] Resume preserves the frozen backend and records any explicit provider migration.
-- [x] Normalized source hashes reuse the exact frozen target/contract/prompt, clause alignment
-  fails closed, and confirmed `--migrate-target REASON` migrations persist across resume and
-  invalidate affected evidence.
+- [x] Normalized source hashes reuse the exact frozen target/contract/prompt, clause extractors are
+  warning-only unless a bounded reviewer confirms material conflict, and confirmed
+  `--migrate-target REASON` migrations persist across resume and invalidate affected evidence.
 - [x] Legacy graph snapshots remain byte-preserving/readable while new content-addressed
   revisions, checkpoint replay, reconstruction, and corruption rejection are covered offline.
 - [x] `matek graph migrate-legacy` defaults to an external integrity-protected plan with no graph
@@ -73,8 +73,10 @@
 - [x] Framework preserved verbatim and hash checked.
 - [x] Pre-research target alignment uses clause-local structured comparisons; randomized policies,
   pathwise feasibility, deterministic tie-breaking/preprocessing, expectation sources, and arrival
-  models are represented separately, with uncertainty warning-only and concrete compared values on
-  every hard failure.
+  models are represented separately. Extractors are diagnostic only; one bounded materiality
+  review may confirm a blocking conflict, while uncertainty or review failure remains warning-only.
+- [x] Workflow errors receive a best-effort Terra-medium prose explanation without changing the
+  deterministic failure, consuming a different provider, or making ordinary `doctor` nonlocal.
 - [x] Adaptive research registry and independent audit suite implemented.
 - [x] Recoverable worker/provider/source failures are durable coordinator events; integrity
   failures alone hard-stop research.

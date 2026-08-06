@@ -105,11 +105,11 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 - Stage-boundary status and artifact-integrity validation.
 - Artifact hash and framework integrity checks.
 - Placeholder detection in compiled prompts.
-- Ambiguous input produces a clarification request and no downstream model or command calls.
+- Ambiguous input freezes the most likely interpretation, emits a warning, and reaches research.
 - Fully resolved literature matches require verified primary-source evidence and retain known
   result provenance.
-- An unavailable literature-support arXiv source is quarantined and its claims are downgraded while
-  research still starts; target-identification evidence remains fail closed.
+- An unavailable source is quarantined or removed, its claims are downgraded, and research still
+  starts from the explicit compiled or assumed target.
 - Target-contract alignment accepts the persisted matroid-secretary paraphrase, including literal
   forbidden examples such as “no `+β`,” long explanatory clauses, and malformed transport Unicode
   escapes. The regression corpus compares structured positive and negative fixtures for
@@ -122,8 +122,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   random-order arrivals, and private coins passes. Explicit deterministic-only/no-coin policies,
   adversarial-order replacements, removed expectation sources, feasibility weakening, structured
   numeric changes, reversed symbolic quantifiers/inequalities, and compact formal-expression drift
-  fail with both compared values and a concrete conflict. Missing or uncertain prose is warning-
-  only and does not prevent research scheduling.
+  produce typed warnings and one bounded materiality review. Only a reviewer-confirmed conflict
+  blocks; reviewer failure or uncertainty reaches research.
 - Event-driven research configuration defaults and migration of legacy
   `maximum_assignments_per_round`/`maximum_rounds` and `--max-rounds` inputs to
   `max_pending_assignments`/`max_coordinator_decisions` without reintroducing barriers.
@@ -212,7 +212,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 9. Resume does not repeat paid model calls.
 10. Framework file modified: doctor/run fail with actionable integrity message unless a
     custom framework is explicitly selected.
-11. Ambiguous problem: clarification is reported and all research/manuscript/Lean stages skip.
+11. Ambiguous problem: the selected assumed theorem is reported with alternatives and research
+    starts.
 12. Existing theorem: exact source/hypothesis matching is recorded without a novelty claim.
 13. Post-manuscript Lean confirmation: approve, decline, five-minute timeout-to-proceed,
     noninteractive auto-proceed, and crash-safe decision reuse.

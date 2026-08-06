@@ -156,6 +156,28 @@
   "additionalProperties": false,
   "description": "Structured model output specified by ``compiled_problem.schema.json``.",
   "properties": {
+    "assumed_interpretation": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Assumed Interpretation"
+    },
+    "assumption_warning": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Assumption Warning"
+    },
     "candidate_interpretations": {
       "items": {
         "type": "string"
@@ -239,6 +261,8 @@
     "clarification_reason",
     "clarification_questions",
     "candidate_interpretations",
+    "assumed_interpretation",
+    "assumption_warning",
     "literature_status",
     "literature_resolution_summary"
   ],

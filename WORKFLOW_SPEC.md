@@ -27,39 +27,37 @@ The compiler receives:
 - web search (enabled by default, omitted under the global `--no-web-search` policy);
 - the structured output schema.
 
-It first decides whether the input uniquely identifies one mathematical target and exact success
-criterion. A concise input is sufficient when it does. If choosing a target would require
-guessing between materially different interpretations, the compiler returns
-`needs_clarification` with a reason and focused questions. MATEK persists that request, skips
-all research/manuscript/Lean stages, writes the final report, and asks the user to revise the
-problem file and start a new run.
+It first identifies the most likely exact mathematical target and success criterion. A concise
+input is sufficient. If several readings remain plausible, it chooses the best-supported
+conventional interpretation, freezes it as an explicit assumption, preserves the alternatives
+and unresolved details, emits a visible warning, and continues to research.
 
 Otherwise it returns a full adapted prompt plus a formal claim contract, a source ledger, and a
 literature classification: `unknown`, `no_exact_match_found`, `partially_resolved`, or
 `fully_resolved`. Placeholder validation flags only strong editorial markers; ordinary
 mathematical bracket notation, citations, links, code, and LaTeX are protected. MATEK persists
 the compiled result and validation diagnostics before attempting one bounded, sentence-only
-repair. An unresolved marker blocks the workflow only in the exact target or success criterion;
-an optional sentence is removed with a recorded warning. Partial/full resolution claims require
-verified sources and an exact statement-and-hypothesis comparison.
+repair. An unresolved generated sentence is removed with a recorded warning; the normalized
+statement and claim contract remain authoritative. Partial/full resolution claims require verified
+sources and an exact statement-and-hypothesis comparison.
 
-Before admission, deterministic target alignment interprets each clause from its explicit key and
-records a hash-bound check. Quantifiers, constants, domain, information access, online decisions,
-feasibility, randomness, benchmark/conclusion, and polarity each use a small clause-specific
-structured comparison. Randomness records algorithm randomization, arrival model, weight-adversary
+Before admission, target alignment records hash-bound clause diagnostics. Quantifiers, constants,
+domain, information access, online decisions, feasibility, randomness, benchmark/conclusion, and
+polarity each use a small clause-specific comparison, but heuristic/regex/legacy results have no
+blocking authority. If any suggests a possible material conflict, one short LLM review compares
+the complete statement and contract with negation, scope, temporal order, and mathematical
+equivalence in view. Only a structured `CONFIRMED_CONFLICT` naming known clause keys blocks;
+`NO_MATERIAL_CONFLICT`, reviewer uncertainty, malformed output, or reviewer unavailability warns
+and continues. Randomness still records algorithm randomization, arrival model, weight-adversary
 timing, expectation sources, feasibility mode, and value-guarantee mode as orthogonal fields. A
 randomized policy with deterministic/pathwise feasibility, deterministic preprocessing or
-tie-breaking, or a proof conditioned on the realized seed remains randomized. It blocks only an
-explicit high-confidence structured contradiction: reversed symbolic quantifiers, a changed
-structured numeric value, opposing clause-local modes, drift in a compact formal comparison, or a
-material polarity contradiction. Every failure records the compared values and exact material
-conflict. Polarity is compared as a compact
+tie-breaking, or a proof conditioned on the realized seed remains randomized. Polarity is a compact
 structured value (`affirmative_proof`, `disproof`, `classification`, `construction`,
 `investigation`, or `ambiguous`) derived only from the leading requested-outcome directive of the
 `polarity` clause and the normalized statement. It never scans framework templates, literature
 summaries, excluded-outcome enumerations, or audit vocabulary, so overloaded words such as
 `counterexample`, `refuted`, `disproof`, and `barrier` can never on their own flip an affirmative
-request into a disproof. A hard stop fires only for an affirmative-proof-versus-disproof mismatch.
+request into a disproof.
 Missing token overlap in generated prose is nonblocking; negative examples such as “no `+β` is
 permitted” are never converted into positive requirements; and non-material or ambiguous polarity
 wording produces a recorded `prompt_validation_warning`, reuses the frozen canonical target, and
@@ -83,10 +81,8 @@ these is the prompt-compilation/target-binding stage in `application.py` and `st
 | Gate | Input | Hard stop only when | On uncertainty |
 | --- | --- | --- | --- |
 | Canonical target binding | normalized source hash, frozen registry target | user input changed and requires an explicit migration | reuse the stored frozen target |
-| Target alignment (quantifier/constant/domain/information/decision) | normalized statement, matching structured contract clause | explicit opposing values in the same semantic field | pass; record compared values and a warning |
-| Target alignment (feasibility/randomness/conclusion) | structured algorithm type, arrival/adversary model, expectation sources, feasibility and value modes | explicit deterministic-only replacement, opposing arrival model, removed required random source, pathwise/expected-mode replacement, or other concrete structured conflict | pass; preserve pathwise feasibility separately from algorithm randomization and record a warning |
-| Target alignment (polarity) | compact structured polarity of the `polarity` clause and statement | contract `affirmative_proof` versus statement `disproof` (or the reverse) | warn, reuse canonical target, continue |
-| Source validation | source ledger, active proof dependencies | an active proof dependency truly requires a source that cannot be resolved | auto-repair once, then warn and continue |
+| Target alignment | normalized statement, structured contract, typed heuristic warnings, one materiality review | reviewer returns `CONFIRMED_CONFLICT` with known clause keys | warn and continue; reviewer failure is nonblocking |
+| Source validation | source ledger | never for research scheduling | auto-repair/remove once, downgrade claims, warn and continue |
 | Graph schema/index validation | knowledge-graph store and index | corruption that local repair/rebuild cannot fix | repair/rebuild locally, retry once |
 | Provider response validation | structured model output | schema-invalid output after a bounded regenerate | bounded regenerate/retry |
 | Literature/provenance lookup | source verification report | never for research scheduling | warn; never imply a mathematical failure |
@@ -98,10 +94,9 @@ warnings.
 
 The mandatory pre-research gate audit searches for validators that scan whole prompts, treat
 `deterministic` as the unqualified negation of `randomized`, conflate execution-wise invariants
-with an algorithm distribution, or convert an LLM/keyword suspicion into a fail-closed result.
-Each hard stop must name its clause-local structured conflict; uncertainty is warning-only. The
-current fail-closed alignment reasons are the concrete conflicts enumerated in the inventory
-above, never the isolated presence or absence of a word.
+with an algorithm distribution, or convert a keyword suspicion into a fail-closed result.
+Uncertainty is warning-only; only the bounded semantic review can confirm a material target
+conflict.
 
 Source identity uses normalized DOI values as publication-version keys. If one source label carries
 multiple distinct DOIs, prompt and worker ingestion deterministically retain one source node per
@@ -111,9 +106,8 @@ one DOI with another. This ambiguity is warning-only unless an active proof depe
 requires one publication identity and no usable source can be retained.
 
 Every source states whether it identifies the target or supports a literature claim. Failure to
-verify target-identification evidence pauses for clarification. Failure to resolve literature-only
-evidence instead preserves the source-verification report, marks the source and dependent claims
-unverified, qualifies or removes those claims from the compiled prompt, and continues research.
+verify either kind preserves the source-verification report, marks or removes the source and
+dependent claims, downgrades literature status to unknown, and continues with the explicit target.
 Both `export.arxiv.org` and `arxiv.org/abs/<id>` are deterministic arXiv resolution routes.
 Quarantined literature evidence remains ineligible for candidate acceptance and bibliography use.
 

@@ -5,12 +5,14 @@ specific mathematical problem.
 
 Requirements:
 
-- First determine whether the user description uniquely identifies one mathematical problem,
-  setting, and exact success criterion. A short description is acceptable when it does.
-- If materially different interpretations remain and choosing one would require guessing, return
-  `status = "needs_clarification"`. Give a concise reason, focused questions the user can answer,
-  and any plausible competing interpretations. Leave the compiled prompt and claim contract
-  empty. Do not continue by silently choosing a target.
+- Determine the most likely mathematical problem, setting, and exact success criterion intended
+  by the user. A short or imperfect description is acceptable. Use standard mathematical
+  convention, supplied context, and checked literature to resolve omitted details.
+- If materially different interpretations remain, choose the most likely one and return
+  `status = "compiled"`. State that choice in `assumed_interpretation`, put a plain-language notice
+  in `assumption_warning`, list alternatives in descending likelihood, and preserve unresolved
+  details in `unresolved_ambiguities`. The normalized statement and claim contract must encode the
+  chosen version exactly. Do not stop merely because clarification would be useful.
 - Use the full framework and preserve its section order and methodological strength.
 - State unambiguously that there are no allowed terminal reductions. Reductions, proper
   subclasses, weaker conclusions, added hypotheses, equivalent reformulations, and isolated
@@ -55,9 +57,9 @@ Requirements:
   Set the `polarity` clause to a single compact structured value — `affirmative_proof`, `disproof`,
   `classification`, `construction`, or `investigation` — that names the requested outcome. State
   and preserve the exact prove-versus-refute posture. State excluded or insufficient outcomes
-  elsewhere (for example in `edge_cases`), never inside `polarity`. If the input does not settle
-  one of these material choices, request clarification instead of strengthening or weakening the
-  theorem.
+  elsewhere (for example in `edge_cases`), never inside `polarity`. If the input leaves a material
+  choice open, select the most conventional likely reading, record it as an explicit assumption,
+  and continue without silently strengthening or weakening the theorem.
 - Use public web search aggressively to verify definitions, known results, primary sources,
   exact bottlenecks, and bibliographic metadata.
 - Classify the exact target's relationship to existing literature as `unknown`,

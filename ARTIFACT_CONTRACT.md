@@ -181,14 +181,14 @@ Record SHA-256 hashes for immutable inputs, accepted proof package, approved the
 manuscript source, bibliography, and final verification outputs.
 
 `prompts/target_alignment.json` binds the compiled normalized statement and the canonical sorted
-claim contract to separate SHA-256 digests. It records every deterministic clause check, compared
-contract/statement values, and concrete blocking conflicts. Its dedicated randomness record keeps
+claim contract to separate SHA-256 digests. Schema v2 records every diagnostic clause check,
+compared values, typed warning origin, and the optional bounded materiality-review verdict and
+provenance. Its dedicated randomness record keeps
 algorithm type, arrival model, adversary timing, expectation sources, feasibility mode, and value
-mode distinct, so pathwise feasibility cannot negate a randomized algorithm. An explicit
-structured contradiction is preserved for diagnosis and blocks research admission. Passing
-alignment means only that this narrow guard found no high-confidence conflict; it does not certify
-semantic equivalence or mathematical truth. Missing lexical overlap and ambiguous vocabulary in
-generated prose are warning-only, and negated examples are not treated as positive requirements.
+mode distinct, so pathwise feasibility cannot negate a randomized algorithm. Extractor conflicts
+are preserved for diagnosis but do not block. Only an LLM review recorded as
+`CONFIRMED_CONFLICT` blocks research; absent, uncertain, malformed, or unavailable review is
+warning-only. Passing alignment does not certify semantic equivalence or mathematical truth.
 `target-registry.json` is keyed by the normalized source-problem SHA-256 and integrity-binds the
 canonical exact statement, contract JSON, compiled prompt, target node, version, compatibility
 observations, and explicit migrations. Same-source reruns re-materialize the canonical statement,

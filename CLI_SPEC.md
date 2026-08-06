@@ -70,6 +70,10 @@ temporary directory and are deleted afterward. Ordinary `doctor` never runs this
 
 Every failure includes an exact remediation command. In particular, an unsigned-in user is
 directed to run `codex login`, choose **Sign in with ChatGPT**, and rerun `matek doctor`.
+Once a run and selected backend exist, workflow errors additionally receive one best-effort
+plain-language explanation and suggested recovery from the configured diagnostic model (GPT 5.6
+Terra, medium effort by default). The call is accounted, never changes the deterministic error,
+and never switches providers. Ordinary `doctor` makes no such call.
 
 ## `matek run PROBLEM_FILE`
 
@@ -391,6 +395,5 @@ Scientific failure is represented in the report/status, not necessarily as a pro
 Recoverable provider, schema, evidence, scientific, and resource failures likewise return a
 truthful paused or partial status after checkpointing. Artifact/state corruption, unsafe paths,
 security failures, and unauthorized writes retain hard-failure exit semantics.
-An input that does not uniquely identify a mathematical target similarly completes with
-`NEEDS_PROBLEM_CLARIFICATION`: research is not launched, and the terminal output and report ask
-the user to revise the problem file and start a new run.
+An input with several plausible mathematical targets proceeds under the most likely explicitly
+stated assumption. The terminal output, status, and report surface that assumption and warning.

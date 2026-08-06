@@ -12,7 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ..config import ModelSettings
 from ..openai_client import ModelClient, ModelRequest
-from ..scientific import TargetContractAlignment, validate_target_contract
+from ..scientific import (
+    AlignmentWarning,
+    AlignmentWarningOrigin,
+    MaterialityReviewRecord,
+    MaterialityVerdict,
+    TargetContractAlignment,
+    TargetMaterialityAssessment,
+    validate_target_contract,
+)
 from ..source_identifiers import source_identifiers, tool_metadata_source_identifiers
 from ..source_provenance import (
     IdentifierVerifier,
@@ -235,7 +243,7 @@ class PromptPlaceholderRepair(BaseModel):
 class PlaceholderDisposition(StrEnum):
     REPAIRED = "repaired"
     REMOVED_OPTIONAL = "removed_optional"
-    TARGET_CRITICAL_FAILURE = "target_critical_failure"
+    REMOVED_TARGET_CRITICAL = "removed_target_critical"
 
 
 class PlaceholderDiagnostic(BaseModel):
@@ -336,6 +344,8 @@ class CompiledProblem(BaseModel):
     clarification_reason: str | None = None
     clarification_questions: list[str] = Field(default_factory=list)
     candidate_interpretations: list[str] = Field(default_factory=list)
+    assumed_interpretation: str | None = None
+    assumption_warning: str | None = None
     literature_status: LiteratureStatus = LiteratureStatus.UNKNOWN
     literature_resolution_summary: str | None = None
 
@@ -389,6 +399,15 @@ class CompiledProblem(BaseModel):
             raise ValueError("compiled output requires a nonempty claim_contract")
         if self.clarification_reason is not None or self.clarification_questions:
             raise ValueError("compiled output must not contain a clarification request")
+        if self.assumed_interpretation is not None:
+            self.assumed_interpretation = self.assumed_interpretation.strip()
+            if not self.assumed_interpretation:
+                raise ValueError("assumed_interpretation must not be blank")
+            if not self.assumption_warning or not self.assumption_warning.strip():
+                raise ValueError("an assumed interpretation requires an explicit warning")
+            self.assumption_warning = self.assumption_warning.strip()
+        elif self.assumption_warning is not None:
+            raise ValueError("assumption_warning requires an assumed_interpretation")
         if self.literature_status is LiteratureStatus.NO_EXACT_MATCH_FOUND and (
             not self.literature_resolution_summary or not self.literature_resolution_summary.strip()
         ):
@@ -671,21 +690,24 @@ async def _recover_prompt_placeholders(
                     continue
 
         if target_critical:
+            compiled.compiled_prompt = _remove_sentence(compiled.compiled_prompt, start, end)
+            warning = (
+                f"Removed an unresolved target-section editorial sentence after bounded repair: "
+                f"{token}. The normalized statement and claim contract remain authoritative."
+            )
+            validation.warnings.append(warning)
             validation.diagnostics.append(
                 PlaceholderDiagnostic(
                     token=token,
                     section=section,
                     sentence=sentence,
                     target_critical=True,
-                    disposition=PlaceholderDisposition.TARGET_CRITICAL_FAILURE,
+                    disposition=PlaceholderDisposition.REMOVED_TARGET_CRITICAL,
                     detail=repair_detail,
                 )
             )
             persist(validation)
-            raise StageValidationError(
-                "Compiled prompt contains an unresolved editorial placeholder in the exact "
-                f"target or success criterion: {token}"
-            )
+            continue
 
         compiled.compiled_prompt = _remove_sentence(compiled.compiled_prompt, start, end)
         warning = (
@@ -986,6 +1008,250 @@ def _render_clarification_request(compiled: CompiledProblem) -> str:
     return "\n".join(lines)
 
 
+def _assumption_prompt(assumption: str, problem_text: str) -> str:
+    """Build a concise usable mandate when a compiler declines to choose a target."""
+
+    section_bodies = {
+        "Current task statement": (f"Work on this explicit assumed interpretation: {assumption}"),
+        "Exact success criterion": (
+            "Establish or refute that exact assumed statement, preserving every condition "
+            "stated in the supplied problem text."
+        ),
+        "Insufficient outcomes": (
+            "A survey, an unsupported conjecture, or a proof of only a weaker variant is not "
+            "a complete solution."
+        ),
+        "Known starting point and exact bottleneck": (
+            "Begin from the supplied statement and identify definitions or missing conventions "
+            "that materially affect the proof."
+        ),
+        "Potential master lemmas": (
+            "Develop precise intermediate lemmas only when they advance the assumed exact "
+            "target and record all remaining gaps."
+        ),
+        "Multiagent research protocol": (
+            "Explore independent proof, disproof, structural, computational, and literature "
+            "routes, then redirect work using durable evidence."
+        ),
+        "Adversarial auditing requirements": (
+            "Check quantifiers, boundary cases, hidden assumptions, theorem hypotheses, and any "
+            "claimed transfer back to the target."
+        ),
+        "Candidate-solution protocol": (
+            "Submit a candidate only with a complete checkable argument for the unchanged "
+            "assumed target and no hidden gap."
+        ),
+        "Intermediate outcomes": (
+            "Preserve useful partial results, counterexamples, reductions, and exact open "
+            "obligations without presenting them as completion."
+        ),
+        "Stopping and reporting policy": (
+            "Continue while resources permit and report the strongest established result plus "
+            "the exact remaining obstruction truthfully."
+        ),
+        "Source and public-search policy": (
+            "Verify external mathematical and bibliographic claims independently before using "
+            "them as accepted evidence."
+        ),
+        "Final-response format": (
+            "Return concrete mathematical statements, proof details, counterexamples, and "
+            "explicit unresolved obligations in the required structured schema."
+        ),
+    }
+    sections = [f"{name}\n{section_bodies[name]}" for name in _FRAMEWORK_SECTIONS]
+    sections.append("Original supplied problem\n" + problem_text.strip())
+    return "\n\n".join(sections)
+
+
+def _compile_assumed_interpretation(
+    compiled: CompiledProblem,
+    *,
+    problem_text: str,
+) -> CompiledProblem:
+    """Convert a legacy clarification response into an explicit best-effort target."""
+
+    assumption = next(
+        (item.strip() for item in compiled.candidate_interpretations if item.strip()),
+        problem_text.strip(),
+    )
+    warning = (
+        "The supplied problem admits more than one plausible reading. MATEK is proceeding with "
+        f"this most likely assumed version: {assumption}"
+    )
+    ambiguities = list(
+        dict.fromkeys(
+            [
+                *compiled.unresolved_ambiguities,
+                *(
+                    [compiled.clarification_reason.strip()]
+                    if compiled.clarification_reason and compiled.clarification_reason.strip()
+                    else []
+                ),
+                *(
+                    f"Open clarification: {question}"
+                    for question in compiled.clarification_questions
+                ),
+            ]
+        )
+    )
+    return CompiledProblem(
+        status=PromptCompilationStatus.COMPILED,
+        title="Assumed interpretation of the supplied problem",
+        normalized_statement=assumption,
+        claim_contract=ClaimContract(
+            entries=[ClaimContractEntry(key="assumed_target", value=assumption)]
+        ),
+        compiled_prompt=_assumption_prompt(assumption, problem_text),
+        source_ledger=[],
+        unresolved_ambiguities=ambiguities,
+        candidate_interpretations=compiled.candidate_interpretations,
+        assumed_interpretation=assumption,
+        assumption_warning=warning,
+        literature_status=LiteratureStatus.UNKNOWN,
+    )
+
+
+def _unavailable_materiality_review(
+    alignment: TargetContractAlignment,
+    *,
+    settings: ModelSettings,
+    reason: str,
+) -> TargetContractAlignment:
+    warning = (
+        "Target-alignment materiality review was unavailable; the canonical contract remains "
+        f"authoritative and research continues. {reason}"
+    )
+    review_warning = AlignmentWarning(
+        warning_id="alignment-review-unavailable",
+        origin=AlignmentWarningOrigin.LLM,
+        clause_keys=list(
+            dict.fromkeys(key for item in alignment.alignment_warnings for key in item.clause_keys)
+        ),
+        observation=warning,
+        statement_sha256=alignment.statement_sha256,
+        contract_sha256=alignment.contract_sha256,
+    )
+    return alignment.model_copy(
+        update={
+            "passed": True,
+            "blocking_issues": [],
+            "warnings": list(dict.fromkeys([*alignment.warnings, warning])),
+            "alignment_warnings": [*alignment.alignment_warnings, review_warning],
+            "materiality_review": MaterialityReviewRecord(
+                status="unavailable",
+                rationale=reason,
+                model=settings.model,
+                reasoning_effort=settings.reasoning_effort,
+            ),
+        }
+    )
+
+
+async def _review_target_alignment(
+    *,
+    client: ModelClient,
+    alignment: TargetContractAlignment,
+    normalized_statement: str,
+    claim_contract: dict[str, str],
+    settings: ModelSettings,
+) -> tuple[TargetContractAlignment, list[str], list[dict[str, Any]]]:
+    """Review possible material drift without letting review failure suppress research."""
+
+    if not alignment.alignment_warnings:
+        return alignment, [], []
+    review_settings = settings.model_copy(
+        update={
+            "reasoning_mode": "standard",
+            "reasoning_effort": "medium",
+            "web_search": False,
+            "maximum_web_search_calls": 1,
+            "max_output_tokens": min(settings.max_output_tokens, 1_200),
+            "maximum_subagents": 0,
+        }
+    )
+    try:
+        result = await client.generate_structured(
+            ModelRequest(
+                instructions=(
+                    "Compare the normalized mathematical statement with the canonical claim "
+                    "contract. Account for negation, sentence and clause scope, temporal order, "
+                    "quantifier order, and distinctions such as pathwise feasibility versus an "
+                    "expected value guarantee. Do not infer conflict from isolated words. Return "
+                    "CONFIRMED_CONFLICT only when the statement genuinely changes the theorem; "
+                    "otherwise return NO_MATERIAL_CONFLICT with a concise reason."
+                ),
+                input_text=json.dumps(
+                    {
+                        "canonical_claim_contract": claim_contract,
+                        "normalized_statement": normalized_statement,
+                        "diagnostic_observations": [
+                            warning.model_dump(mode="json")
+                            for warning in alignment.alignment_warnings
+                        ],
+                        "statement_sha256": alignment.statement_sha256,
+                        "contract_sha256": alignment.contract_sha256,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                settings=review_settings,
+            ),
+            TargetMaterialityAssessment,
+        )
+    except Exception as exc:
+        unavailable = _unavailable_materiality_review(
+            alignment,
+            settings=review_settings,
+            reason=f"{type(exc).__name__}.",
+        )
+        return unavailable, [], []
+
+    assessment = result.parsed
+    known_keys = set(claim_contract)
+    if any(key not in known_keys for key in assessment.clause_keys):
+        unavailable = _unavailable_materiality_review(
+            alignment,
+            settings=review_settings,
+            reason="The reviewer named an unknown contract clause.",
+        )
+        return unavailable, [result.response_id], [dict(item) for item in result.tool_metadata]
+
+    review = MaterialityReviewRecord(
+        status="completed",
+        verdict=assessment.verdict,
+        rationale=assessment.rationale,
+        clause_keys=assessment.clause_keys,
+        response_id=result.response_id,
+        model=review_settings.model,
+        reasoning_effort=review_settings.reasoning_effort,
+    )
+    if assessment.verdict is MaterialityVerdict.CONFIRMED_CONFLICT:
+        issue = (
+            "Materiality reviewer confirmed a mathematical target conflict: " + assessment.rationale
+        )
+        reviewed = alignment.model_copy(
+            update={
+                "passed": False,
+                "blocking_issues": [issue],
+                "materiality_review": review,
+            }
+        )
+    else:
+        warning = (
+            "Target-alignment warning reviewed; no material mathematical conflict was found, "
+            f"so research continues. {assessment.rationale}"
+        )
+        reviewed = alignment.model_copy(
+            update={
+                "passed": True,
+                "blocking_issues": [],
+                "warnings": list(dict.fromkeys([*alignment.warnings, warning])),
+                "materiality_review": review,
+            }
+        )
+    return reviewed, [result.response_id], [dict(item) for item in result.tool_metadata]
+
+
 async def compile_prompt(
     *,
     client: ModelClient,
@@ -998,6 +1264,7 @@ async def compile_prompt(
     placeholder_allowlist: Collection[str] = (),
     source_verifier: IdentifierVerifier | None = None,
     placeholder_repair_generation: int = 0,
+    alignment_review_settings: ModelSettings | None = None,
 ) -> PromptCompilationResult:
     """Compile and validate a problem, optionally writing contracted prompt artifacts.
 
@@ -1051,6 +1318,13 @@ async def compile_prompt(
         CompiledProblem,
     )
     compiled = model_result.parsed
+    assumption_warning: str | None = None
+    if compiled.status is PromptCompilationStatus.NEEDS_CLARIFICATION:
+        compiled = _compile_assumed_interpretation(compiled, problem_text=problem_text)
+        assumption_warning = compiled.assumption_warning
+    response_ids = [model_result.response_id]
+    model_calls = 1
+    provider_metadata = list(model_result.tool_metadata)
     target_alignment = (
         validate_target_contract(
             compiled.normalized_statement,
@@ -1059,6 +1333,30 @@ async def compile_prompt(
         if compiled.status is PromptCompilationStatus.COMPILED
         else None
     )
+    if target_alignment is not None and target_alignment.alignment_warnings:
+        if alignment_review_settings is None:
+            target_alignment = _unavailable_materiality_review(
+                target_alignment,
+                settings=ModelSettings(
+                    model="gpt-5.6-terra",
+                    reasoning_mode="standard",
+                    reasoning_effort="medium",
+                    web_search=False,
+                    max_output_tokens=1_200,
+                ),
+                reason="No materiality reviewer was configured.",
+            )
+        else:
+            target_alignment, review_response_ids, review_metadata = await _review_target_alignment(
+                client=client,
+                alignment=target_alignment,
+                normalized_statement=compiled.normalized_statement,
+                claim_contract=compiled.claim_contract.as_dict(),
+                settings=alignment_review_settings,
+            )
+            response_ids.extend(review_response_ids)
+            model_calls += len(review_response_ids)
+            provider_metadata.extend(review_metadata)
     destination = ensure_stage_directory(prompts_dir) if prompts_dir is not None else None
     if destination is not None and target_alignment is not None:
         atomic_write_json(destination / "target_alignment.json", target_alignment)
@@ -1080,9 +1378,6 @@ async def compile_prompt(
     compiled.source_ledger = _normalize_evidence_links(
         [SourceLedgerEntry.model_validate(entry) for entry in compiled.source_ledger]
     )
-    response_ids = [model_result.response_id]
-    model_calls = 1
-    provider_metadata = list(model_result.tool_metadata)
     repair_warning: str | None = None
     initial_issues = validate_source_ledger(compiled.source_ledger)
     if initial_issues and compiled.source_ledger:
@@ -1132,21 +1427,21 @@ async def compile_prompt(
         and entry.source_id in invalid_source_ids
     ]
     if invalid_target_identification:
-        raise StageValidationError(
-            "Source ledger repair failed for target-identification source(s): "
+        repair_warning = (
+            "Malformed target-identification source(s) were quarantined; MATEK is proceeding "
+            "with the explicit assumed/compiled theorem instead: "
             + ", ".join(invalid_target_identification)
+            + "."
         )
     quarantined_malformed = [
         entry.source_id
         for entry in compiled.source_ledger
         if entry.required_for_claim and entry.source_id in invalid_source_ids
     ]
-    removed_optional = [
-        entry.source_id
-        for entry in compiled.source_ledger
-        if entry.source_id in invalid_source_ids and not entry.required_for_claim
+    removed_invalid = [
+        entry.source_id for entry in compiled.source_ledger if entry.source_id in invalid_source_ids
     ]
-    if removed_optional:
+    if removed_invalid:
         compiled.source_ledger = [
             entry for entry in compiled.source_ledger if entry.source_id not in invalid_source_ids
         ]
@@ -1187,15 +1482,18 @@ async def compile_prompt(
         issue for issue in ledger_issues if "marked verified without independent proof" not in issue
     ]
     if structural_issues:
-        raise StageValidationError("Source ledger verification failed: " + " ".join(ledger_issues))
-    if unverified_target_identification:
-        raise StageValidationError(
-            "Source verification failed for target-identification source(s): "
-            + ", ".join(unverified_target_identification)
+        verification.warnings.append(
+            "Source-ledger structure remains imperfect and cannot block mathematical research: "
+            + " ".join(structural_issues)
         )
     quarantined_literature = list(
         dict.fromkeys(
-            [*quarantined_malformed, *unverified_required_literature, *unverified_optional]
+            [
+                *quarantined_malformed,
+                *unverified_target_identification,
+                *unverified_required_literature,
+                *unverified_optional,
+            ]
         )
     )
     if quarantined_literature:
@@ -1217,11 +1515,12 @@ async def compile_prompt(
                 if entry.source_id in quarantined_literature
             ],
         )
-    if removed_optional:
+    if removed_invalid:
         warning = (
-            "Optional malformed source(s) were removed after one bounded repair attempt: "
-            + ", ".join(removed_optional)
-            + ". Literature claims were downgraded to unknown."
+            "Malformed source(s) were removed after one bounded repair attempt: "
+            + ", ".join(removed_invalid)
+            + ". Source-dependent claims were quarantined and literature status was "
+            "downgraded to unknown."
         )
         verification.warnings.append(warning)
         compiled.literature_status = LiteratureStatus.UNKNOWN
@@ -1262,21 +1561,24 @@ async def compile_prompt(
         model_calls += len(repair_response_ids)
         coverage_issues = validate_framework_coverage(compiled.compiled_prompt)
         if coverage_issues:
-            raise StageValidationError(
-                "Compiled prompt does not preserve the reusable framework: "
-                + " ".join(coverage_issues)
+            prompt_validation.warnings.append(
+                "Compiled prompt formatting is incomplete, but the exact statement and claim "
+                "contract are usable and research continues: " + " ".join(coverage_issues)
             )
         _enforce_exact_target_persistence(compiled)
         ledger_identifiers = _ledger_identifiers(compiled.source_ledger)
         prompt_identifiers = source_identifiers(compiled.compiled_prompt)
         unrepresented_prompt_sources = sorted(prompt_identifiers - ledger_identifiers)
         if unrepresented_prompt_sources:
-            raise StageValidationError(
-                "Compiled prompt cites identifiers absent from its verified source ledger: "
+            prompt_validation.warnings.append(
+                "Compiled prompt mentions source identifier(s) absent from the verified ledger; "
+                "they are unverified leads and cannot support acceptance: "
                 + ", ".join(unrepresented_prompt_sources)
             )
     else:
         persist_prompt_snapshot(prompt_validation)
+    if assumption_warning:
+        prompt_validation.warnings.insert(0, assumption_warning)
 
     artifacts = ArtifactManifest()
     if destination is not None:

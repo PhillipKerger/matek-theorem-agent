@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict, field_validator
+
 from .budget import BudgetExceeded
 from .models import FailureCategory
 from .state import ArtifactIntegrityError, StateCorruptionError
@@ -28,6 +30,23 @@ _INTEGRITY_MARKERS = (
     "unauthorized write",
     "verification certificate inventory mismatch",
 )
+
+
+class FailureExplanation(BaseModel):
+    """Brief user-facing explanation produced after an operational failure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    explanation: str
+    suggested_resolution: str
+
+    @field_validator("explanation", "suggested_resolution")
+    @classmethod
+    def text_is_nonblank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("failure explanation text must not be blank")
+        return normalized
 
 
 def classify_failure(exc: BaseException) -> FailureCategory:
@@ -78,4 +97,4 @@ def recovery_obligations(exc: BaseException, category: FailureCategory) -> list[
     return list(dict.fromkeys(obligations))
 
 
-__all__ = ["classify_failure", "recovery_obligations"]
+__all__ = ["FailureExplanation", "classify_failure", "recovery_obligations"]

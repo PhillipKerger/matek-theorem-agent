@@ -9,9 +9,9 @@ problem.md + CLI/environment/project configuration
        -> OpenAI Responses API backend (advanced; explicit API selection)
   -> intake + normalized source SHA-256 + contract extraction
   -> framework compiler (live search enabled)
-       -> clarification request + final report, when no unique target can be identified
-       -> compiled_research_prompt.md + compiled_problem.json, otherwise
-  -> deterministic target-clause alignment + source-hash target registry
+       -> explicit assumed target + warning, when several readings are plausible
+       -> compiled_research_prompt.md + compiled_problem.json
+  -> warning-first target-clause diagnostics + bounded materiality review + target registry
   -> verified prior-literature classification
   -> durable event-driven research coordinator
        -> durable explore/consolidate/bottleneck/adversarial-audit/synthesize phase state
@@ -144,10 +144,11 @@ attempts, artifact hashes, failure information, provider call/session IDs, and c
 Writes use a temporary file and atomic rename. Resume preserves the original provider unless the
 user explicitly requests and records a provenance-changing migration.
 
-A successful prompt-compilation call may terminate with `NEEDS_PROBLEM_CLARIFICATION`. This is a
-truthful completed outcome rather than a guessed claim contract: downstream stages are skipped,
-clarification questions are persisted, and the final report directs the user to revise the input
-and start a new run.
+A prompt-compiler response that identifies several plausible readings is normalized into one
+explicit assumed target: the most likely interpretation is frozen, alternatives and ambiguities
+are persisted, a warning is surfaced, and research starts. Historical
+`NEEDS_PROBLEM_CLARIFICATION` artifacts remain readable, but new compiler ambiguity does not stop
+the workflow.
 
 Every stage handoff validates required upstream statuses and recorded artifact hashes before the
 next stage can start. The manuscript-to-Lean handoff additionally persists the user's approval,
@@ -309,16 +310,16 @@ the ledger. A bounded antichain search exposes `open_cut_search_capped` rather t
 minimality.
 
 Before research, `prompts/target_alignment.json` hash-binds the compiler's theorem and exact claim
-contract and checks for explicit contradictions; it is not a mathematical proof. Clause keys
-control interpretation so incidental prose cannot recategorize a constants or conclusion clause.
-Each check persists its compared structured values and concrete conflicts. Randomness has a
+contract and records possible conflicts; it is not a mathematical proof. Clause keys control
+interpretation so incidental prose cannot recategorize a constants or conclusion clause. Each
+check persists its compared structured values and concrete conflicts as typed warnings. Randomness has a
 dedicated record for algorithm randomization, arrival randomness, weight-adversary timing,
 expectation sources, feasibility mode, and value-guarantee mode; pathwise feasibility is therefore
-not an algorithm-type signal. Reversed symbolic quantifiers or polarity, explicitly opposing
-clause-local modes, changed structured numeric values, and compact formal-comparison drift block.
-Missing or ambiguous prose tokens do not: generated paraphrases, abbreviations, deterministic
-tie-breaking, and negative examples are too weak a basis for aborting an otherwise valid run and
-produce warnings when a structured comparison remains uncertain.
+not an algorithm-type signal. A possible conflict requests one bounded semantic review over the
+complete statement and contract. Only `CONFIRMED_CONFLICT` blocks; `NO_MATERIAL_CONFLICT`, unknown
+clause keys, malformed output, or unavailable review warns and continues. Generated paraphrases,
+abbreviations, deterministic tie-breaking, and negative examples are too weak a basis for aborting
+an otherwise valid run.
 The first aligned result for a normalized source hash is frozen in `target-registry.json`;
 same-source reruns receive those exact statement, contract, and prompt bytes while literature
 refresh stays run-local. A new aligned statement with the same contract is recorded as a cosmetic
@@ -462,5 +463,9 @@ Domain models do not import the SDK, CLI presentation, or subprocess implementat
   provider records as audit history.
 - A recoverable Codex error checkpoints and pauses with exact resume obligations; an integrity
   error hard-stops. Neither path ever falls through to API billing.
+- Once a run and selected backend exist, a workflow error triggers one best-effort diagnostic-model
+  call for a plain-language explanation and suggested recovery. This call uses GPT 5.6 Terra at
+  medium effort by default, is accounted and persisted, cannot alter the failure classification,
+  and never causes a Codex-to-API fallback. Failure of the explainer is itself warning-only.
 - Completed paid/allowance-consuming stages are not repeated merely because report generation
   failed.

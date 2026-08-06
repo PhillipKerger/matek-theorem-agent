@@ -15,7 +15,7 @@ MATEK should be cited in any scholarly, technical, or public work in which it is
 produced work should contain a clear statement of AI usage. Users are also encouraged to share
 knowledge graphs that can serve as starting points for future work.
 
-The current package version is **0.6.0**.
+The current package version is **0.7.0**.
 
 | At a glance | Default behavior |
 | --- | --- |
@@ -140,6 +140,8 @@ For the default Codex backend, this is a useful starting configuration:
 ```toml
 [codex]
 model = "gpt-5.6-sol"
+diagnostic_model = "gpt-5.6-terra" # alignment review and error explanations
+diagnostic_effort = "medium"
 research_coordinator_effort = "max"
 research_worker_effort = "xhigh"
 audit_effort = "xhigh"        # independent proof auditors
@@ -183,7 +185,8 @@ to what the selected Codex model and account support. `max` is the default for c
 the final research judgment; `xhigh` is the default for workers and independent audits. These are
 Codex reasoning-effort values, not a separate Codex `pro` mode. The direct API backend additionally
 defaults `reasoning.mode = "pro"` and configures roles separately under
-`[api.models.research_coordinator]`, `[api.models.research_worker]`, and `[api.models.audit]`; it
+`[api.models.research_coordinator]`, `[api.models.research_worker]`, `[api.models.audit]`, and
+`[api.models.diagnostic]`; the diagnostic role disables web search and uses medium effort. It
 uses `api.max_concurrent_model_calls`, and its usage is bounded by
 `api.limits.maximum_cost_usd`. The final research judge uses the coordinator role settings. Codex
 has no global call-count ceiling by default, but users may set
@@ -421,11 +424,12 @@ proposed proof. A short description is enough when it uniquely identifies:
 
 A standard problem name, citation, or link is helpful when available. The prompt compiler can
 research definitions, background, and existing results before producing the detailed research
-prompt used by later agents. It will not guess between materially different targets.
+prompt used by later agents.
 
-If MATEK cannot identify one unique problem and success criterion, it exits before launching
-research agents. The terminal response and saved run report explain the ambiguity, ask focused
-clarification questions, and instruct you to revise the problem file before starting a new run.
+If several targets remain plausible, MATEK selects the interpretation best supported by standard
+usage, the supplied context, and checked literature. It states the exact assumed theorem, records
+the alternatives, warns in the terminal and run report, and launches research. You can then revise
+the problem if the visible assumption was not what you intended.
 
 ## Finding the results
 
@@ -436,7 +440,7 @@ recognizable while separate problems and repeated attempts cannot overwrite one 
 ```text
 .matek/runs/<run-id>/
 ├── input/          # preserved problem and resolved invocation/configuration
-├── prompts/        # compiled research prompt or clarification request
+├── prompts/        # compiled research prompt, exact target, warnings, and source audit
 ├── research/       # phase state, typed reports, lemma audits, computations, candidates, audits
 ├── research-history/ # prior research trees archived by a forced generation/provider migration
 ├── manuscript/     # paper.tex, references.bib, paper.pdf, and build log
@@ -515,7 +519,10 @@ available for later synthesis.
 
 The normalized source file hash freezes the theorem before research. The prompt compiler first
 writes `prompts/target_alignment.json`, which hash-binds the statement and contract and checks each
-clause for explicit contradictions. The graph then stores the aligned statement, canonical
+clause for possible conflicts. Those extractor findings are typed diagnostics, not hard gates. If
+one appears material, a short context-aware reviewer compares the full statement and contract;
+only its structured `CONFIRMED_CONFLICT` verdict can pause research. Reviewer uncertainty or
+failure warns and continues. The graph then stores the aligned statement, canonical
 contract, and compiled prompt in `target-registry.json`. On a later run, an unchanged normalized
 source hash is the deliberately cheap deterministic sanity check: MATEK treats the graph entry as
 authoritative and rematerializes its statement, contract, and prompt byte-for-byte while allowing
@@ -526,10 +533,11 @@ does not attempt semantic equivalence or migrate silently; use
 `matek run problem.md --migrate-target "reason"` only for an intentional versioned migration.
 MATEK asks for confirmation unless `--yes` is supplied and marks affected proof evidence stale.
 The reason and authorization persist through resume and feed the durable target-migration event;
-resume never silently invents or broadens that authorization. Alignment is a narrow contradiction
-guard, not a proof of semantic equivalence or of the theorem. Reversed symbolic quantifiers or
+resume never silently invents or broadens that authorization. Alignment is a narrow materiality
+review, not a proof of semantic equivalence or of the theorem. Reversed symbolic quantifiers or
 polarity, opposing qualifiers, changed structured numeric values, and compact formal-expression
-drift block research. Missing words in generated prose do not. In particular, contract examples
+drift are warnings unless the reviewer confirms an actual theorem change. Missing words in
+generated prose do not block. In particular, contract examples
 inside prohibitions—such as “no `+β` is permitted”—are not required to appear positively in the
 statement. Research, manuscript, bibliography, and Lean verification retain their own gates.
 
@@ -799,6 +807,10 @@ not promise free, unlimited, or plan-specific usage.
 MATEK never silently switches from Codex mode to API mode. A missing installation, failed
 login, unavailable model, usage limit, search failure, or Codex runtime error checkpoints the
 run and returns an actionable error; it cannot unexpectedly create Platform API charges.
+For workflow errors after a run has been initialized, MATEK also asks the configured diagnostic
+model (GPT 5.6 Terra, medium effort by default) for a short plain-language explanation and recovery
+suggestion. This is best effort, uses the already selected backend, is recorded in usage, and can
+never replace the deterministic error. Ordinary `matek doctor` remains model-call-free.
 
 ### CLI reference
 
@@ -870,6 +882,8 @@ allow_automatic_fallback = false
 [codex]
 executable = "codex"
 model = "gpt-5.6-sol"
+diagnostic_model = "gpt-5.6-terra"
+diagnostic_effort = "medium"
 research_coordinator_effort = "max"
 research_worker_effort = "xhigh"
 audit_effort = "xhigh"
@@ -982,14 +996,12 @@ re-runs frozen deterministic checks natively.
   access is available and run `matek resume RUN_ID`; MATEK will not switch to API billing.
 - **Run time limit reached:** completed calls and artifacts remain checkpointed. Increase the
   frozen allowance explicitly with `matek resume RUN_ID --time-limit-minutes N` if desired.
-- **Prompt alignment paused after a valid compilation:** upgrade to a release with the
-  contradiction-only alignment guard, inspect `prompts/target_alignment.json` beside
-  `compiled_problem.json`, and run `matek resume RUN_ID`. The completed compiler response is
-  replayed from the run-local model journal and deterministically rechecked rather than purchased
-  again. Negated requirements such as `may not revoke` or `may not defer` are treated as
-  prohibitions, and a heuristic disagreement over an integrity-valid frozen target warns and
-  continues instead of reporting state corruption. Use `--force-stage prompt_compilation` only
-  when you intentionally want a fresh bounded prompt-repair generation.
+- **Prompt alignment paused after a valid compilation:** inspect the persisted materiality review
+  in `prompts/target_alignment.json` beside `compiled_problem.json`. Current MATEK pauses only for
+  `CONFIRMED_CONFLICT`; heuristic findings, negated requirements, reviewer uncertainty, and
+  reviewer failure warn and continue. Correct the source problem or use an intentional
+  `--migrate-target` when the confirmed conflict is real; use `--force-stage prompt_compilation`
+  only when you intentionally want a fresh compiler generation.
 - **Repeat run reports a canonical-contract change although `problem.md` is unchanged:** version
   0.6.0 and later select the frozen target by normalized source hash before considering fresh
   compiler wording. Upgrade MATEK and run `matek resume RUN_ID`; the saved compiler work can be

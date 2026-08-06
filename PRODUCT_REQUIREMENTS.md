@@ -56,27 +56,24 @@ formalization, and generates a reproducible final report.
   match against authoritative sources and compare its exact hypotheses and conclusion.
 - If the exact target is already known, preserve that provenance and prohibit unsupported novelty
   claims while allowing proof reconstruction, exposition, and formalization.
-- If the input does not uniquely identify a target, stop before research, persist a clarification
-  request and focused questions, report the outcome to the user, and require a new run from a
-  clarified problem file.
+- If the input admits several plausible targets, select the most likely conventional reading,
+  persist the exact assumed theorem and alternatives, warn the user, and start research. A useful
+  clarification question is never by itself a research-blocking condition.
 - Save source citations and search evidence separately from the prompt text.
 - Classify sources as target-identification or literature-support evidence. Unavailable
   literature-only evidence must be preserved and quarantined while research continues; it may not
-  support acceptance or the final bibliography. Unavailable target-identification evidence must
-  not be guessed around.
+  support acceptance or the final bibliography. Unavailable target-identification evidence is
+  downgraded to an unverified lead; the explicit compiled or assumed theorem remains authoritative.
 - Resolve arXiv identifiers through both `export.arxiv.org` and `arxiv.org/abs/<id>`.
-- Before research, deterministically inspect the compiled statement against every applicable
-  claim-contract clause and persist `prompts/target_alignment.json`. Block only explicit,
-  high-confidence contradictions found by clause-specific structured comparison: quantifier
-  order/scope, constant scope or value, domain qualifiers, information access, online decision
-  timing, feasibility mode, random sources and expectation mode, benchmark/conclusion form, or
-  requested-outcome polarity. Randomized algorithms may have pathwise deterministic feasibility,
-  deterministic preprocessing or tie-breaking, and proofs conditioned on a realized seed; none
-  of those facts makes the algorithm deterministic-only. Every blocking record includes the
-  compared structured values and concrete conflict. Lexical absence or ambiguous vocabulary is
-  not evidence of a mismatch. Negated prohibitions such as `may not defer` and `may not revoke`
-  must never be interpreted as positive permissions. Record uncertainty as a warning, retain the
-  frozen canonical contract, and start research.
+- Before research, inspect the compiled statement against every applicable claim-contract clause
+  and persist typed diagnostic warnings in `prompts/target_alignment.json`. Heuristic, regex, and
+  legacy extractors never block research. When they suggest a possible material change, request
+  one short context-aware materiality review. Block only when that review returns a structured
+  `CONFIRMED_CONFLICT` naming the affected contract clause; reviewer uncertainty, failure, or
+  malformed output is warning-only. Randomized algorithms may have pathwise deterministic
+  feasibility, deterministic preprocessing or tie-breaking, and proofs conditioned on a realized
+  seed; none of those facts makes the algorithm deterministic-only. Negation, clause scope,
+  temporal order, and equivalent mathematical formulations must be considered by the reviewer.
 - Bind the first aligned statement, canonical contract, and compiled prompt for a normalized
   source hash in `.matek/knowledge/<graph-name>/target-registry.json`. Later runs with the same
   source hash reuse those canonical bytes while refreshing literature separately. A new aligned
@@ -429,6 +426,9 @@ Generate machine-readable and human-readable reports with:
 - costs/tokens when available;
 - reproducibility instructions;
 - relative links to artifacts.
+- for workflow errors, a best-effort plain-language model explanation and suggested recovery path,
+  using the configured diagnostic model without changing the deterministic failure or silently
+  switching providers. If that call is unavailable, retain and report the original error alone.
 
 ## Status taxonomy
 

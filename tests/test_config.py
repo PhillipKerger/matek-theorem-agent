@@ -120,7 +120,12 @@ def test_role_specific_research_defaults() -> None:
     assert config.models.research_worker.reasoning_mode == "pro"
     assert config.models.research_worker.reasoning_effort == "xhigh"
     assert config.models.audit.reasoning_effort == "xhigh"
+    assert config.models.diagnostic.model == "gpt-5.6-terra"
+    assert config.models.diagnostic.reasoning_effort == "medium"
+    assert config.models.diagnostic.web_search is False
     assert config.codex.model == "gpt-5.6-sol"
+    assert config.codex.diagnostic_model == "gpt-5.6-terra"
+    assert config.codex.diagnostic_effort == "medium"
     assert config.codex.research_coordinator_effort == "max"
     assert config.codex.research_worker_effort == "xhigh"
     assert config.research.maximum_pending_assignments == 1_024
@@ -577,6 +582,8 @@ def test_checked_in_example_config_loads() -> None:
     assert config.models.audit.reasoning_effort == "xhigh"
     assert config.models.research is config.models.research_worker
     assert config.codex.model == "gpt-5.6-sol"
+    assert config.codex.diagnostic_model == "gpt-5.6-terra"
+    assert config.codex.diagnostic_effort == "medium"
     assert config.codex.research_coordinator_effort == "max"
     assert config.codex.research_worker_effort == "xhigh"
     assert config.codex.research_effort == "xhigh"

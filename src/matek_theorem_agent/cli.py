@@ -211,7 +211,10 @@ def _live_runner(config: AppConfig) -> WorkflowRunner:
         model_client: ModelClient = CodexCliModelClient(
             workspace_root,
             executable=config.codex.executable,
-            model=config.codex.model,
+            # Every durable request carries its explicit model. Leaving the adapter
+            # unpinned permits the configured Terra diagnostic role without changing
+            # the selected Codex backend or any billing boundary.
+            model=None,
             persist_sessions=config.codex.persist_sessions,
             skip_git_repo_check=config.codex.skip_git_repo_check,
             extra_args=config.codex.extra_args,
@@ -299,6 +302,12 @@ def _abort(exc: BaseException, *, verbose: bool = False) -> NoReturn:
     message = redact_text(str(exc)).strip() or type(exc).__name__
     console.print("[red]Error:[/red] ", end="")
     console.print(message, markup=False)
+    explanation = getattr(exc, "matek_user_explanation", None)
+    if isinstance(explanation, dict) and explanation.get("available") is True:
+        console.print("[bold]What happened:[/bold] ", end="")
+        console.print(str(explanation.get("explanation", "")), markup=False)
+        console.print("[bold]Suggested resolution:[/bold] ", end="")
+        console.print(str(explanation.get("suggested_resolution", "")), markup=False)
     if verbose:
         console.print(f"[dim]Exception type: {type(exc).__name__}; exit code: {code}[/dim]")
     raise typer.Exit(code=code)
@@ -682,6 +691,12 @@ def _print_result(result: WorkflowResult) -> None:
             console.print("  • ", Text(_compact_terminal_text(obligation)), sep="")
         if len(obligations) > 5:
             console.print(f"  • … and {len(obligations) - 5} more in the full report")
+    explanation = result.report.report.error_explanation
+    if explanation.get("available") is True:
+        console.print("[bold]What happened:[/bold] ", end="")
+        console.print(str(explanation.get("explanation", "")), markup=False)
+        console.print("[bold]Suggested resolution:[/bold] ", end="")
+        console.print(str(explanation.get("suggested_resolution", "")), markup=False)
 
 
 def _project_graph(graph_name: str | None = None) -> KnowledgeGraph:
@@ -1607,6 +1622,27 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
                 f"{clarification.get('reason', 'the intended target is ambiguous')}"
             )
             console.print("Revise the problem file and start a new run.")
+        target_assumption = state.metadata.get("target_assumption", {})
+        if isinstance(target_assumption, dict) and target_assumption.get("assumed_interpretation"):
+            console.print(
+                "[yellow]Assumed target:[/yellow] "
+                + str(target_assumption["assumed_interpretation"])
+            )
+        prompt_warnings = state.metadata.get("prompt_validation_warnings", [])
+        if isinstance(prompt_warnings, list) and prompt_warnings:
+            console.print(f"Prompt/alignment warnings: {len(prompt_warnings)}")
+            for warning in prompt_warnings[:5]:
+                console.print(f"  - {_compact_terminal_text(str(warning))}")
+        error_explanation = state.metadata.get("error_explanation", {})
+        if isinstance(error_explanation, dict) and error_explanation.get("available") is True:
+            console.print(
+                "Error explanation: "
+                + _compact_terminal_text(str(error_explanation.get("explanation", "")))
+            )
+            console.print(
+                "Suggested resolution: "
+                + _compact_terminal_text(str(error_explanation.get("suggested_resolution", "")))
+            )
         backend = state.metadata.get("backend", {})
         if not isinstance(backend, dict):
             backend = {}

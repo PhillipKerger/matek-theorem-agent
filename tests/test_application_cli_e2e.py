@@ -12,7 +12,6 @@ import typer
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
-import matek_theorem_agent.application as application_module
 import matek_theorem_agent.cli as cli_module
 from matek_theorem_agent.application import (
     LEAN_CONSENT_TIMEOUT_SECONDS,
@@ -36,6 +35,7 @@ from matek_theorem_agent.config import (
     merge_config,
 )
 from matek_theorem_agent.execution.base import CommandRequest, CommandResult
+from matek_theorem_agent.failures import FailureExplanation
 from matek_theorem_agent.intake import ingest_problem
 from matek_theorem_agent.knowledge_graph import (
     GraphNotInitializedError,
@@ -971,40 +971,41 @@ def make_problem(project_root: Path) -> Path:
     return problem
 
 
-class ClarificationOnlyModel:
+class ClarificationOnlyModel(ResearchWorkflowModel):
     def __init__(self) -> None:
-        self.requests: list[tuple[ModelRequest, type[BaseModel]]] = []
+        super().__init__(accepted=False)
 
     async def generate_structured(
         self,
         request: ModelRequest,
         output_type: type[Any],
     ) -> ModelResult[Any]:
-        self.requests.append((request, output_type))
-        assert output_type is CompiledProblem
-        parsed = CompiledProblem(
-            status=PromptCompilationStatus.NEEDS_CLARIFICATION,
-            clarification_reason=(
-                "The description names an extension problem but not its domain or target."
-            ),
-            clarification_questions=[
-                "What mathematical objects are being extended?",
-                "What exact conclusion should be proved?",
-            ],
-            candidate_interpretations=[
-                "An operator-extension theorem.",
-                "A combinatorial extension problem.",
-            ],
-            unresolved_ambiguities=["The domain and success criterion are both ambiguous."],
-        )
-        return ModelResult(
-            parsed=parsed,
-            response_id="clarification-response",
-            input_tokens=10,
-            output_tokens=5,
-            total_tokens=15,
-            estimated_cost_usd=None,
-        )
+        if output_type is CompiledProblem:
+            self.requests.append((request, output_type))
+            parsed = CompiledProblem(
+                status=PromptCompilationStatus.NEEDS_CLARIFICATION,
+                clarification_reason=(
+                    "The description names an extension problem but not its domain or target."
+                ),
+                clarification_questions=[
+                    "What mathematical objects are being extended?",
+                    "What exact conclusion should be proved?",
+                ],
+                candidate_interpretations=[
+                    "Prove P(n) for every natural number n.",
+                    "A combinatorial extension problem.",
+                ],
+                unresolved_ambiguities=["The domain and success criterion are both ambiguous."],
+            )
+            return ModelResult(
+                parsed=parsed,
+                response_id="clarification-response",
+                input_tokens=10,
+                output_tokens=5,
+                total_tokens=15,
+                estimated_cost_usd=None,
+            )
+        return await super().generate_structured(request, output_type)
 
 
 class PlaceholderRecoveryWorkflowModel(ResearchWorkflowModel):
@@ -1064,7 +1065,35 @@ class PlaceholderRecoveryWorkflowModel(ResearchWorkflowModel):
         return await super().generate_structured(request, output_type)
 
 
-def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
+class ExplainingFailureModel(ResearchWorkflowModel):
+    async def generate_structured(
+        self,
+        request: ModelRequest,
+        output_type: type[Any],
+    ) -> ModelResult[Any]:
+        if output_type is FailureExplanation:
+            self.requests.append((request, output_type))
+            return ModelResult(
+                parsed=FailureExplanation(
+                    explanation=(
+                        "The research scheduler rejected an undersized initial portfolio; this "
+                        "is an orchestration error, not evidence against the theorem."
+                    ),
+                    suggested_resolution=(
+                        "Resume with a coordinator response containing the configured number "
+                        "of distinct initial assignments."
+                    ),
+                ),
+                response_id="failure-explanation-response",
+                input_tokens=8,
+                output_tokens=12,
+                total_tokens=20,
+                estimated_cost_usd=0.002,
+            )
+        return await super().generate_structured(request, output_type)
+
+
+def test_ambiguous_problem_uses_a_visible_assumption_and_enters_research(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1077,7 +1106,14 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     backend = ForbiddenBackend()
     codex = ForbiddenCodex()
     runner = WorkflowRunner(
-        AppConfig(project_root=project),
+        AppConfig(
+            project_root=project,
+            research=ResearchSettings(
+                minimum_initial_agents=4,
+                maximum_concurrent_agents=2,
+                maximum_rounds=1,
+            ),
+        ),
         WorkflowDependencies(
             model_client=model,  # type: ignore[arg-type]
             execution_backend=backend,
@@ -1102,28 +1138,31 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     assert "no automatic API fallback" in normalized_output
     assert "MATEK run summary" in invocation.output
     assert "Problem solved?" in invocation.output
-    assert "UNDETERMINED" in invocation.output
-    assert "Where it stopped" in invocation.output
-    assert "Prompt compilation" in invocation.output
+    assert "RESEARCH_PARTIAL" in invocation.output
     assert "Full report" in invocation.output
-    assert "stopped before research" in invocation.output
-    assert "What mathematical objects are being extended?" in invocation.output
     [run_root] = (project / ".matek" / "runs").iterdir()
     state = StateStore(run_root).load()
-    assert state.scientific_status is ScientificStatus.NEEDS_PROBLEM_CLARIFICATION
+    assert state.scientific_status is ScientificStatus.RESEARCH_PARTIAL
     assert state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.SUCCEEDED
-    assert state.stages[StageName.RESEARCH].status is StageStatus.SKIPPED
+    assert state.stages[StageName.RESEARCH].status is StageStatus.SUCCEEDED
     assert state.stages[StageName.MANUSCRIPT].status is StageStatus.SKIPPED
     assert state.stages[StageName.LEAN_VERIFICATION].status is StageStatus.SKIPPED
     assert state.stages[StageName.REPORT].status is StageStatus.SUCCEEDED
-    assert len(model.requests) == 1
+    assert len(model.requests) > 1
     assert backend.calls == 0
     assert codex.calls == 0
-    clarification = (run_root / "prompts" / "clarification_request.md").read_text(encoding="utf-8")
+    assert not (run_root / "prompts" / "clarification_request.md").exists()
+    assumed = state.metadata["target_assumption"]
+    assert assumed["assumed_interpretation"] == "Prove P(n) for every natural number n."
+    assert assumed["warning"]
+    assert state.metadata["prompt_validation_warnings"]
     report = (run_root / "report" / "REPORT.md").read_text(encoding="utf-8")
-    assert "start a new MATEK run" in clarification
-    assert "Problem clarification required" in report
-    assert "revise the problem file" in report.lower()
+    assert "Prove P(n) for every natural number n." in report
+
+    status_result = CliRunner().invoke(app, ["status", state.run_id])
+    assert status_result.exit_code == 0, status_result.output
+    assert "Assumed target" in status_result.output
+    assert "Prompt/alignment warnings" in status_result.output
 
     request_count = len(model.requests)
     monkeypatch.setattr(cli_module, "_offline_runner", lambda config: runner)
@@ -1134,6 +1173,87 @@ def test_ambiguous_problem_stops_before_research_and_asks_for_clarification(
     assert state.run_id in resumed.output
     assert "MATEK run summary" in resumed.output
     assert len(model.requests) == request_count
+
+
+@pytest.mark.asyncio
+async def test_workflow_error_gets_a_best_effort_terra_explanation(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    problem = make_problem(project)
+    model = ExplainingFailureModel(accepted=False)
+    runner = WorkflowRunner(
+        AppConfig(
+            project_root=project,
+            research=ResearchSettings(
+                minimum_initial_agents=8,
+                maximum_concurrent_agents=2,
+                maximum_rounds=1,
+            ),
+        ),
+        WorkflowDependencies(
+            model_client=model,
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
+        ),
+    )
+
+    result = await runner.run_new(
+        problem,
+        project,
+        options=WorkflowOptions(research_only=True),
+        environment_snapshot={"fixture": "offline-error-explanation"},
+    )
+
+    explanation = result.report.report.error_explanation
+    assert explanation["available"] is True
+    assert explanation["model"] == "gpt-5.6-terra"
+    assert explanation["reasoning_effort"] == "medium"
+    assert "not evidence against the theorem" in explanation["explanation"]
+    request, output_type = next(item for item in model.requests if item[1] is FailureExplanation)
+    assert output_type is FailureExplanation
+    assert request.settings.model == "gpt-5.6-terra"
+    assert request.settings.reasoning_effort == "medium"
+    assert request.settings.web_search is False
+    report = (result.state.run_root / "report" / "REPORT.md").read_text(encoding="utf-8")
+    assert "Coordinator decision 1 has 4 assignments; at least 8 are required" in report
+    assert "Error explanation" in report
+
+
+@pytest.mark.asyncio
+async def test_unavailable_error_explainer_never_masks_the_original_failure(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    problem = make_problem(project)
+    runner = WorkflowRunner(
+        AppConfig(
+            project_root=project,
+            research=ResearchSettings(
+                minimum_initial_agents=8,
+                maximum_concurrent_agents=2,
+                maximum_rounds=1,
+            ),
+        ),
+        WorkflowDependencies(
+            model_client=ResearchWorkflowModel(accepted=False),
+            execution_backend=ForbiddenBackend(),
+            codex_client=ForbiddenCodex(),
+            source_verifier=AlwaysVerifiedIdentifierVerifier(),
+        ),
+    )
+
+    result = await runner.run_new(
+        problem,
+        project,
+        options=WorkflowOptions(research_only=True),
+        environment_snapshot={"fixture": "offline-error-explanation-unavailable"},
+    )
+
+    assert result.report.report.error_explanation["available"] is False
+    report = (result.state.run_root / "report" / "REPORT.md").read_text(encoding="utf-8")
+    assert "Coordinator decision 1 has 4 assignments; at least 8 are required" in report
 
 
 @pytest.mark.asyncio
@@ -1250,7 +1370,7 @@ async def test_optional_placeholder_downgrade_reaches_truthful_final_report(
 
 
 @pytest.mark.asyncio
-async def test_force_prompt_stage_reuses_compiler_and_retries_only_bounded_repair(
+async def test_target_placeholder_removal_reaches_research_without_a_forced_retry(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
@@ -1261,30 +1381,17 @@ async def test_force_prompt_stage_reuses_compiler_and_retries_only_bounded_repai
     )
     runner = placeholder_recovery_runner(project, model)
 
-    paused = await runner.run_new(make_problem(project), project)
-    assert paused.report.report.workflow_status == "PAUSED_RETRIABLE"
-    assert any(
-        "[INSERT TARGET HERE]" in issue.get("message", "")
-        for issue in paused.report.report.execution_issues
-    )
+    result = await runner.run_new(make_problem(project), project)
 
-    [run_root] = (project / ".matek" / "runs").iterdir()
-    failed = StateStore(run_root).load()
-    assert failed.stages[StageName.PROMPT_COMPILATION].status is StageStatus.FAILED
-    assert (run_root / "prompts" / "compiled_problem.json").is_file()
-    assert (run_root / "prompts" / "prompt_validation.json").is_file()
-    assert failed.metadata["prompt_compilation_recovery"]["artifacts_preserved"]
-
-    resumed = await runner.resume(
-        project,
-        run_id=failed.run_id,
-        force_stage=StageName.PROMPT_COMPILATION,
-    )
-
-    assert resumed.state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.SUCCEEDED
-    assert resumed.state.metadata["prompt_validation_generation"] == 1
+    assert result.report.report.workflow_status == "COMPLETE_WITH_WARNINGS"
+    assert result.state.stages[StageName.PROMPT_COMPILATION].status is StageStatus.SUCCEEDED
+    assert result.state.stages[StageName.RESEARCH].status is StageStatus.SUCCEEDED
     assert model.compiler_calls == 1
-    assert model.repair_calls == 2
+    assert model.repair_calls == 1
+    validation = json.loads(
+        (result.state.run_root / "prompts" / "prompt_validation.json").read_text(encoding="utf-8")
+    )
+    assert validation["diagnostics"][0]["disposition"] == "removed_target_critical"
 
 
 @pytest.mark.parametrize("provider", ["codex", "api"])
@@ -2058,9 +2165,8 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_hash_valid_frozen_target_parser_disagreement_warns_and_reaches_research(
+async def test_hash_valid_frozen_target_reuse_reaches_research_without_semantic_reparse(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -2072,23 +2178,6 @@ async def test_hash_valid_frozen_target_parser_disagreement_warns_and_reaches_re
         options=WorkflowOptions(research_only=True, run_name="frozen-target-first"),
         environment_snapshot={"fixture": "offline"},
     )
-    real_validate = application_module.validate_target_contract
-
-    def report_parser_disagreement(
-        normalized_statement: str,
-        claim_contract: dict[str, str],
-    ) -> Any:
-        alignment = real_validate(normalized_statement, claim_contract)
-        return alignment.model_copy(
-            update={
-                "passed": False,
-                "blocking_issues": [
-                    "Synthetic heuristic disagreement over negated online-decision prose."
-                ],
-            }
-        )
-
-    monkeypatch.setattr(application_module, "validate_target_contract", report_parser_disagreement)
     second = await runner.run_new(
         problem,
         project,
@@ -2099,10 +2188,11 @@ async def test_hash_valid_frozen_target_parser_disagreement_warns_and_reaches_re
     assert first.state.metadata["knowledge_graph"]["canonical_target"]["status"] == "created"
     assert second.state.metadata["knowledge_graph"]["canonical_target"]["status"] == "reused"
     assert second.state.stages[StageName.RESEARCH].status is StageStatus.SUCCEEDED
-    warnings = second.state.metadata["prompt_validation_warnings"]
-    assert any(
-        "integrity-valid target registry remains canonical" in warning for warning in warnings
+    alignment = json.loads(
+        (second.state.run_root / "prompts" / "target_alignment.json").read_text(encoding="utf-8")
     )
+    assert alignment["passed"] is True
+    assert alignment["blocking_issues"] == []
 
 
 @pytest.mark.asyncio

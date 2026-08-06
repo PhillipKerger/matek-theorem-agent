@@ -82,6 +82,11 @@
       "title": "Configuration",
       "type": "object"
     },
+    "error_explanation": {
+      "additionalProperties": true,
+      "title": "Error Explanation",
+      "type": "object"
+    },
     "execution_issues": {
       "items": {
         "additionalProperties": true,

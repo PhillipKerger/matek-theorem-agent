@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-06
+
+- Made target alignment warning-first. Clause extractors now produce typed, hash-bound diagnostics
+  but cannot stop research. A possible conflict gets one short context-aware GPT 5.6 Terra review;
+  only `CONFIRMED_CONFLICT` with known clause keys blocks, while uncertainty, malformed output, or
+  reviewer failure continues with a warning. The review accounts for negation, scope, temporal
+  order, equivalent comparisons, and pathwise-feasibility versus expected-value guarantees.
+- Ambiguous problem descriptions now proceed under the most likely explicitly recorded theorem
+  interpretation instead of stopping for clarification. Generated prompt placeholders and
+  unverified source metadata are removed or downgraded with warnings so the exact statement and
+  contract can reach research. Research coordinator and worker prompts were shortened to their
+  mathematical and orchestration essentials.
+- Workflow errors now receive one best-effort GPT 5.6 Terra medium-effort explanation and suggested
+  recovery path through the already selected backend. The explanation is persisted and surfaced in
+  status/reports, never replaces the deterministic failure, and cannot trigger API fallback.
 - Made online-decision alignment negation-aware: prohibitions such as `may not revoke`,
   `cannot buffer`, and `may not defer` now reinforce irrevocable/immediate semantics instead of
   being read as permissions. Explicitly permitted deferral or revocation still conflicts with an

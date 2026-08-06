@@ -64,6 +64,7 @@ class FinalReport(BaseModel):
     prompt_validation_warnings: list[str] = Field(default_factory=list)
     source_provenance_warnings: list[str] = Field(default_factory=list)
     execution_issues: list[dict[str, Any]] = Field(default_factory=list)
+    error_explanation: dict[str, Any] = Field(default_factory=dict)
     root_failure: dict[str, Any] = Field(default_factory=dict)
     manuscript_findings: list[dict[str, Any]] = Field(default_factory=list)
     stage_statuses: dict[str, str] = Field(default_factory=dict)
@@ -380,6 +381,11 @@ def build_final_report(
             if isinstance(metadata.get("execution_issues", []), list)
             else []
         ),
+        error_explanation=(
+            dict(metadata.get("error_explanation", {}))
+            if isinstance(metadata.get("error_explanation", {}), dict)
+            else {}
+        ),
         root_failure=root_failure,
         manuscript_findings=manuscript_findings,
         stage_statuses=stage_statuses,
@@ -589,6 +595,18 @@ def render_report_markdown(report: FinalReport) -> str:
     if report.source_provenance_warnings:
         lines.extend(["", "## Source provenance warnings", ""])
         lines.extend(f"- {warning}" for warning in report.source_provenance_warnings)
+    if report.error_explanation.get("available") is True:
+        lines.extend(
+            [
+                "",
+                "## Error explanation",
+                "",
+                str(report.error_explanation.get("explanation", "")),
+                "",
+                "Suggested resolution: "
+                + str(report.error_explanation.get("suggested_resolution", "")),
+            ]
+        )
     lines.extend(
         [
             "",

@@ -88,6 +88,16 @@ class ModelsSettings(_StrictSettings):
     manuscript: ModelSettings = Field(
         default_factory=lambda: ModelSettings(max_output_tokens=120_000)
     )
+    diagnostic: ModelSettings = Field(
+        default_factory=lambda: ModelSettings(
+            model="gpt-5.6-terra",
+            reasoning_mode="standard",
+            reasoning_effort="medium",
+            web_search=False,
+            maximum_web_search_calls=1,
+            max_output_tokens=2_000,
+        )
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -178,6 +188,10 @@ class CodexSettings(_StrictSettings):
     )
     audit_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "xhigh"
     manuscript_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "high"
+    diagnostic_model: str = "gpt-5.6-terra"
+    diagnostic_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = (
+        "medium"
+    )
     formalization_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = (
         "xhigh"
     )
@@ -224,6 +238,14 @@ class CodexSettings(_StrictSettings):
             raise ValueError(
                 "codex.model must not be blank; durable request identity requires an explicit model"
             )
+        return normalized
+
+    @field_validator("diagnostic_model")
+    @classmethod
+    def _diagnostic_model_must_be_pinned(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("codex.diagnostic_model must not be blank")
         return normalized
 
     @field_validator("extra_args")
@@ -728,6 +750,7 @@ class AppConfig(_StrictSettings):
             self.models.research_worker.model,
             self.models.audit.model,
             self.models.manuscript.model,
+            self.models.diagnostic.model,
         }
         missing = sorted(selected - self.pricing.models.keys())
         if missing:
@@ -814,6 +837,7 @@ class AppConfig(_StrictSettings):
                 self.models.research_worker,
                 self.models.audit,
                 self.models.manuscript,
+                self.models.diagnostic,
             )
         )
 

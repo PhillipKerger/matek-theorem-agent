@@ -20,7 +20,7 @@ from .budget import BudgetExceeded, BudgetTracker, UsageRecord
 from .codex_client import CodexClient
 from .config import AppConfig, ModelSettings, config_as_toml, load_config, merge_config
 from .execution.base import ExecutionBackend
-from .failures import classify_failure, recovery_obligations
+from .failures import FailureExplanation, classify_failure, recovery_obligations
 from .intake import ingest_problem
 from .knowledge_graph import (
     GraphMergeResult,
@@ -51,7 +51,7 @@ from .reporting import (
     write_final_report,
 )
 from .resources import resource_path, resource_paths
-from .scientific import validate_target_contract
+from .scientific import TargetContractAlignment, bind_target_contract_identity
 from .source_provenance import (
     BoundedHttpSourceVerifier,
     IdentifierVerifier,
@@ -387,6 +387,7 @@ class WorkflowRunner:
         graph: KnowledgeGraph,
         compiled: CompiledProblem,
         persist_prompt_artifacts: bool,
+        target_alignment: TargetContractAlignment | None = None,
     ) -> CompiledProblem:
         """Rebind compiler output to the source-hash target before research.
 
@@ -418,31 +419,16 @@ class WorkflowRunner:
                 "compiled_prompt": frozen.compiled_prompt,
             },
         )
-        alignment = validate_target_contract(
-            rebound.normalized_statement,
-            rebound.claim_contract.as_dict(),
+        identity_alignment = bind_target_contract_identity(
+            rebound.normalized_statement, rebound.claim_contract.as_dict()
         )
-        alignment_warnings = list(alignment.warnings)
-        if not alignment.passed:
-            alignment_warnings = list(
-                dict.fromkeys(
-                    [
-                        *alignment_warnings,
-                        (
-                            "Frozen-target semantic revalidation reported a possible wording "
-                            "conflict, but the integrity-valid target registry remains canonical; "
-                            "continuing without changing the target. "
-                            + " ".join(alignment.blocking_issues)
-                        ),
-                    ]
-                )
-            )
-        if alignment_warnings:
-            existing = state.metadata.get("prompt_validation_warnings")
-            merged = list(existing) if isinstance(existing, list) else []
-            state.metadata["prompt_validation_warnings"] = list(
-                dict.fromkeys([*merged, *alignment_warnings])
-            )
+        alignment = (
+            target_alignment
+            if target_alignment is not None
+            and target_alignment.statement_sha256 == identity_alignment.statement_sha256
+            and target_alignment.contract_sha256 == identity_alignment.contract_sha256
+            else identity_alignment
+        )
         if persist_prompt_artifacts:
             prompts_root = state.run_root / "prompts"
             atomic_write_json(
@@ -789,6 +775,7 @@ class WorkflowRunner:
             "research_worker": self.config.models.research_worker,
             "audit": self.config.models.audit,
             "manuscript": self.config.models.manuscript,
+            "diagnostic": self.config.models.diagnostic,
         }.get(category)
         if base is None:
             raise ValueError(f"unknown model settings category: {category}")
@@ -801,13 +788,18 @@ class WorkflowRunner:
             "research_worker": self.config.codex.research_worker_effort,
             "audit": self.config.codex.audit_effort,
             "manuscript": self.config.codex.manuscript_effort,
+            "diagnostic": self.config.codex.diagnostic_effort,
         }[category]
         return base.model_copy(
             update={
                 # Codex execution is configured by [codex].model rather than the
                 # API-role tables. Carry that exact value into the durable request
                 # key so a cache hit can never stand in for another executed model.
-                "model": self.config.codex.model,
+                "model": (
+                    self.config.codex.diagnostic_model
+                    if category == "diagnostic"
+                    else self.config.codex.model
+                ),
                 "reasoning_effort": effort,
                 "maximum_subagents": (
                     self.config.effective_hierarchical_subagent_limit
@@ -1441,6 +1433,14 @@ class WorkflowRunner:
                         ]
                     )
                 )
+            await self._add_failure_explanation(
+                state=state,
+                logger=logger,
+                budget=budget,
+                exc=exc,
+                category=category,
+            )
+            state.metadata["usage"] = budget.snapshot().model_dump(mode="json")
             self._sync_backend_metadata(state)
             store.save(state)
             if state.stages[StageName.REPORT].status is not StageStatus.SUCCEEDED:
@@ -1592,6 +1592,111 @@ class WorkflowRunner:
             budget=budget,
             logger=logger,
             provider=self.config.backend.provider,
+        )
+
+    async def _add_failure_explanation(
+        self,
+        *,
+        state: RunState,
+        logger: RunLogger,
+        budget: BudgetTracker,
+        exc: Exception,
+        category: FailureCategory,
+    ) -> None:
+        """Best-effort prose guidance that can never replace the original failure."""
+
+        failed_stage = next(
+            (
+                stage.value
+                for stage, record in reversed(list(state.stages.items()))
+                if record.status in {StageStatus.FAILED, StageStatus.INTERRUPTED}
+            ),
+            "workflow",
+        )
+        deterministic_obligations = recovery_obligations(exc, category)
+        diagnostic_settings = self._model_settings("diagnostic")
+        settings = diagnostic_settings.model_copy(
+            update={
+                "reasoning_mode": "standard",
+                "reasoning_effort": "medium",
+                "web_search": False,
+                "maximum_web_search_calls": 1,
+                "max_output_tokens": min(
+                    diagnostic_settings.max_output_tokens,
+                    1_200,
+                ),
+                "maximum_subagents": 0,
+            }
+        )
+        try:
+            result = await AccountingModelClient(
+                self.dependencies.model_client,
+                stage="error_explanation",
+                budget=budget,
+                logger=logger,
+                provider=self.config.backend.provider,
+                role="error-explainer",
+            ).generate_structured(
+                ModelRequest(
+                    instructions=(
+                        "Explain this MATEK failure to a mathematician in plain language. State "
+                        "what failed, distinguish a technical execution issue from a mathematical "
+                        "claim, and suggest the shortest safe recovery path. Do not claim the "
+                        "problem is false, do not invent missing artifacts, do not expose secrets, "
+                        "and do not override the deterministic failure class or obligations."
+                    ),
+                    input_text=json.dumps(
+                        {
+                            "failure_category": category.value,
+                            "failure_stage": failed_stage,
+                            "exception_type": type(exc).__name__,
+                            "redacted_error": redact_text(str(exc))[:2_000],
+                            "deterministic_recovery_obligations": deterministic_obligations,
+                            "run_id": state.run_id,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    settings=settings,
+                ),
+                FailureExplanation,
+            )
+        except Exception as explanation_error:
+            state.metadata["error_explanation"] = {
+                "available": False,
+                "model": settings.model,
+                "reasoning_effort": settings.reasoning_effort,
+                "failure": type(explanation_error).__name__,
+            }
+            logger.event(
+                "error.explanation.unavailable",
+                level="WARNING",
+                data={"error_type": type(explanation_error).__name__},
+            )
+            return
+
+        explanation = {
+            "available": True,
+            "explanation": result.parsed.explanation,
+            "suggested_resolution": result.parsed.suggested_resolution,
+            "response_id": result.response_id,
+            "model": settings.model,
+            "reasoning_effort": settings.reasoning_effort,
+            "failure_stage": failed_stage,
+            "failure_type": type(exc).__name__,
+        }
+        state.metadata["error_explanation"] = explanation
+        try:
+            exc.__dict__["matek_user_explanation"] = explanation
+        except (AttributeError, TypeError):
+            pass
+        logger.event(
+            "error.explanation.created",
+            data={
+                "response_id": result.response_id,
+                "model": settings.model,
+                "failure_stage": failed_stage,
+            },
         )
 
     @staticmethod
@@ -1985,6 +2090,7 @@ class WorkflowRunner:
                     ),
                     source_verifier=self._source_verifier(state.run_root),
                     placeholder_repair_generation=_prompt_validation_generation(state),
+                    alignment_review_settings=self._model_settings("diagnostic"),
                 )
         except Exception as exc:
             prompt_dir = state.run_root / "prompts"
@@ -2038,6 +2144,20 @@ class WorkflowRunner:
                 "prompt_validation_generation": result.prompt_validation.repair_generation,
             }
         )
+        if result.compiled_problem.assumed_interpretation is not None:
+            state.metadata["target_assumption"] = {
+                "assumed_interpretation": result.compiled_problem.assumed_interpretation,
+                "warning": result.compiled_problem.assumption_warning,
+                "alternatives": result.compiled_problem.candidate_interpretations,
+                "ambiguities": result.compiled_problem.unresolved_ambiguities,
+            }
+        for warning in state.metadata.get("prompt_validation_warnings", []):
+            logger.event(
+                "prompt.validation.warning",
+                level="WARNING",
+                stage=StageName.PROMPT_COMPILATION,
+                data={"warning": str(warning)},
+            )
         if result.needs_clarification:
             state.scientific_status = ScientificStatus.NEEDS_PROBLEM_CLARIFICATION
             state.metadata.update(
@@ -2079,6 +2199,7 @@ class WorkflowRunner:
                     graph=graph,
                     compiled=result.compiled_problem,
                     persist_prompt_artifacts=True,
+                    target_alignment=result.target_alignment,
                 )
             except Exception as exc:
                 self._failure(state, store, logger, StageName.PROMPT_COMPILATION, exc)

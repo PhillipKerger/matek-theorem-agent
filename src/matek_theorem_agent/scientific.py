@@ -495,13 +495,84 @@ class TargetClauseCheck(_ScientificModel):
     material_conflicts: list[str] = Field(default_factory=list)
 
 
+class AlignmentWarningOrigin(StrEnum):
+    """Origin of a non-authoritative target-alignment observation."""
+
+    DETERMINISTIC_STRUCTURED = "deterministic_structured"
+    HEURISTIC_EXTRACTOR = "heuristic_extractor"
+    REGEX = "regex"
+    LLM = "LLM"
+    LEGACY_RECOVERY = "legacy_recovery"
+
+
+class AlignmentWarning(_ScientificModel):
+    """A visible concern that cannot by itself prevent research."""
+
+    warning_id: str
+    origin: AlignmentWarningOrigin
+    clause_keys: list[str] = Field(default_factory=list)
+    observation: str
+    statement_sha256: str
+    contract_sha256: str
+
+
+class MaterialityVerdict(StrEnum):
+    NO_MATERIAL_CONFLICT = "NO_MATERIAL_CONFLICT"
+    CONFIRMED_CONFLICT = "CONFIRMED_CONFLICT"
+
+
+class TargetMaterialityAssessment(_ScientificModel):
+    """Small structured output requested from the independent semantic reviewer."""
+
+    verdict: MaterialityVerdict
+    rationale: str
+    clause_keys: list[str] = Field(default_factory=list)
+
+    @field_validator("rationale")
+    @classmethod
+    def rationale_is_nonblank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("materiality rationale must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def confirmed_conflict_names_clauses(self) -> TargetMaterialityAssessment:
+        if self.verdict is MaterialityVerdict.CONFIRMED_CONFLICT and not self.clause_keys:
+            raise ValueError(
+                "a confirmed conflict must identify at least one claim-contract clause"
+            )
+        return self
+
+
+class MaterialityReviewRecord(_ScientificModel):
+    """Durable result and provenance for one bounded materiality review."""
+
+    status: Literal["completed", "unavailable"]
+    verdict: MaterialityVerdict | None = None
+    rationale: str
+    clause_keys: list[str] = Field(default_factory=list)
+    response_id: str | None = None
+    model: str
+    reasoning_effort: str
+
+    @model_validator(mode="after")
+    def completed_review_has_verdict(self) -> MaterialityReviewRecord:
+        if self.status == "completed" and self.verdict is None:
+            raise ValueError("a completed materiality review must include a verdict")
+        return self
+
+
 class TargetContractAlignment(_ScientificModel):
+    schema_version: Literal[2] = 2
     statement_sha256: str
     contract_sha256: str
     passed: bool
     checks: list[TargetClauseCheck]
     blocking_issues: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    alignment_warnings: list[AlignmentWarning] = Field(default_factory=list)
+    materiality_review: MaterialityReviewRecord | None = None
     polarity: PolarityDecision | None = None
     randomness: RandomnessDecision | None = None
 
@@ -1700,23 +1771,74 @@ def validate_target_contract(
         for warning in clause_warnings:
             warnings.append(f"Claim-contract clause {key!r} polarity: {warning}")
 
+    statement_sha256 = sha256(normalized_statement.encode("utf-8")).hexdigest()
+    contract_sha256 = sha256(canonical_contract.encode("utf-8")).hexdigest()
+    observations = [
+        AlignmentWarning(
+            warning_id=f"alignment-{index:04d}",
+            origin=AlignmentWarningOrigin.HEURISTIC_EXTRACTOR,
+            clause_keys=[check.key],
+            observation=f"Claim-contract clause {check.key!r}: {check.detail}",
+            statement_sha256=statement_sha256,
+            contract_sha256=contract_sha256,
+        )
+        for index, check in enumerate(
+            (check for check in checks if check.material_conflicts),
+            start=1,
+        )
+    ]
+    diagnostic_warnings = [
+        *warnings,
+        *(
+            [
+                "Heuristic target-alignment observations require semantic review and do not "
+                "block research on their own: " + " ".join(issues)
+            ]
+            if issues
+            else []
+        ),
+    ]
     return TargetContractAlignment(
-        statement_sha256=sha256(normalized_statement.encode("utf-8")).hexdigest(),
-        contract_sha256=sha256(canonical_contract.encode("utf-8")).hexdigest(),
-        passed=not issues,
+        statement_sha256=statement_sha256,
+        contract_sha256=contract_sha256,
+        # Generated-prose extraction is advisory. The prompt stage may change this only
+        # after an independent materiality reviewer confirms a genuine theorem change.
+        passed=True,
         checks=checks,
-        blocking_issues=issues,
-        warnings=warnings,
+        blocking_issues=[],
+        warnings=diagnostic_warnings,
+        alignment_warnings=observations,
         polarity=polarity_decision,
         randomness=randomness_decision,
     )
 
 
+def bind_target_contract_identity(
+    normalized_statement: str,
+    claim_contract: dict[str, str],
+) -> TargetContractAlignment:
+    """Hash-bind a canonical target without repeating semantic prose extraction."""
+
+    canonical_contract = "\n".join(
+        f"{key}\0{value}" for key, value in sorted(claim_contract.items())
+    )
+    return TargetContractAlignment(
+        statement_sha256=sha256(normalized_statement.encode("utf-8")).hexdigest(),
+        contract_sha256=sha256(canonical_contract.encode("utf-8")).hexdigest(),
+        passed=True,
+        checks=[],
+    )
+
+
 __all__ = [
     "AlgorithmRandomization",
+    "AlignmentWarning",
+    "AlignmentWarningOrigin",
     "ArrivalRandomness",
     "BranchOutcome",
     "FeasibilityRequirement",
+    "MaterialityReviewRecord",
+    "MaterialityVerdict",
     "PolarityDecision",
     "RandomnessDecision",
     "RandomnessFacts",
@@ -1729,9 +1851,11 @@ __all__ = [
     "TargetClauseCategory",
     "TargetClauseCheck",
     "TargetContractAlignment",
+    "TargetMaterialityAssessment",
     "TargetPolarity",
     "ValueGuarantee",
     "WeightAdversary",
+    "bind_target_contract_identity",
     "classify_requested_polarity",
     "exact_statement_fingerprint",
     "is_explicit_definition_declaration",
