@@ -250,6 +250,79 @@ def test_matroid_secretary_paraphrase_does_not_fail_on_explanatory_prose() -> No
     assert all(check.passed for check in alignment.checks)
 
 
+def test_negated_online_decision_prohibitions_preserve_immediate_irrevocable_mode() -> None:
+    alignment = validate_target_contract(
+        (
+            "ALG makes immediate irrevocable decisions, keeps every accepted prefix "
+            "independent, and returns the required expected-value guarantee."
+        ),
+        {
+            "online_decisions": (
+                "When an element's identity and weight are revealed, the algorithm must "
+                "immediately and irrevocably accept or reject it. It may not revoke, exchange, "
+                "buffer, shortlist, or defer decisions."
+            )
+        },
+    )
+
+    assert alignment.passed is True
+    assert alignment.blocking_issues == []
+    check = alignment.checks[0]
+    assert check.contract_values == {
+        "timing": "immediate",
+        "revision": "irrevocable",
+    }
+    assert check.statement_values == {
+        "timing": "immediate",
+        "revision": "irrevocable",
+    }
+
+
+@pytest.mark.parametrize(
+    ("prohibition", "field", "expected"),
+    [
+        ("The algorithm may not defer decisions.", "timing", "immediate"),
+        ("The algorithm cannot buffer or shortlist decisions.", "timing", "immediate"),
+        ("The algorithm may not revoke an accepted element.", "revision", "irrevocable"),
+        ("The algorithm must not exchange accepted elements.", "revision", "irrevocable"),
+    ],
+)
+def test_online_decision_prohibitions_are_not_read_as_permissions(
+    prohibition: str,
+    field: str,
+    expected: str,
+) -> None:
+    alignment = validate_target_contract(
+        "ALG makes immediate and irrevocable accept-or-reject decisions.",
+        {"online_decisions": prohibition},
+    )
+
+    assert alignment.passed is True
+    assert alignment.checks[0].contract_values[field] == expected
+
+
+def test_nearby_unrelated_negation_does_not_hide_permitted_deferral_or_revocation() -> None:
+    alignment = validate_target_contract(
+        "ALG makes immediate and irrevocable accept-or-reject decisions.",
+        {
+            "online_decisions": (
+                "Future weights may not be known before arrival, but decisions may be deferred "
+                "and accepted elements may be revoked."
+            )
+        },
+    )
+
+    assert alignment.passed is False
+    check = alignment.checks[0]
+    assert check.contract_values == {
+        "timing": "deferred",
+        "revision": "revocable",
+    }
+    assert {"timing", "revision"} <= {
+        conflict.partition(":")[0] for conflict in check.material_conflicts
+    }
+
+
 def test_long_prose_conclusion_still_blocks_reversed_comparison() -> None:
     alignment = validate_target_contract(
         (

@@ -114,7 +114,10 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   forbidden examples such as “no `+β`,” long explanatory clauses, and malformed transport Unicode
   escapes. The regression corpus compares structured positive and negative fixtures for
   quantifiers, constants, domain, information access, online decisions, feasibility, randomness,
-  benchmark/conclusion, and polarity. A randomized algorithm with pathwise feasibility,
+  benchmark/conclusion, and polarity. Online-decision fixtures include coordinated negated
+  prohibitions (`may not revoke, exchange, buffer, shortlist, or defer`), genuinely permitted
+  deferral/revocation, and a two-run frozen-target parser disagreement that warns and still reaches
+  research. A randomized algorithm with pathwise feasibility,
   deterministic preprocessing/tie-breaking, seed conditioning, fixed-before-randomness weights,
   random-order arrivals, and private coins passes. Explicit deterministic-only/no-coin policies,
   adversarial-order replacements, removed expectation sources, feasibility weakening, structured

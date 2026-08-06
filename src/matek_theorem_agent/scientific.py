@@ -1218,6 +1218,81 @@ def _mode(value: str, patterns: tuple[tuple[str, str], ...]) -> str:
     return "unspecified"
 
 
+def _signal_assertions(value: str, pattern: str) -> tuple[bool, bool]:
+    """Return whether a lexical signal is affirmed or explicitly negated.
+
+    This is deliberately local to one sentence/clause. It handles modal
+    prohibitions and coordinated lists such as ``may not revoke, buffer, or
+    defer`` without pretending to be a general natural-language parser.
+    """
+
+    plain = _plain_math(value)
+    affirmed = False
+    negated = False
+    for match in re.finditer(pattern, plain):
+        prefix = re.split(
+            r"[.;:]|\b(?:but|however|although)\b",
+            plain[: match.start()],
+        )[-1][-120:]
+        if re.search(r"\bnot\s+only\b[^.;]{0,96}$", prefix):
+            affirmed = True
+            continue
+        modal_matches = list(
+            re.finditer(
+                r"\b(?P<negative>(?:may|must|shall|can|could|does|do|need|is|are)\s+not|"
+                r"cannot|never)\b|"
+                r"\b(?P<positive>may|must|shall|can|could|does|do|need|is|are)\b",
+                prefix,
+            )
+        )
+        if modal_matches:
+            is_negated = modal_matches[-1].group("negative") is not None
+        else:
+            is_negated = bool(re.search(r"\b(?:not|no|without)(?:\s+[a-z-]+){0,3}\s*$", prefix))
+        negated = negated or is_negated
+        affirmed = affirmed or not is_negated
+    return affirmed, negated
+
+
+def _opposed_mode(
+    value: str,
+    *,
+    first: tuple[str, str],
+    second: tuple[str, str],
+) -> str:
+    first_affirmed, first_negated = _signal_assertions(value, first[1])
+    second_affirmed, second_negated = _signal_assertions(value, second[1])
+    first_supported = first_affirmed or second_negated
+    second_supported = second_affirmed or first_negated
+    if first_supported == second_supported:
+        return "unspecified"
+    return first[0] if first_supported else second[0]
+
+
+def _online_decision_values(value: str) -> dict[str, str | list[str]]:
+    return {
+        "timing": _opposed_mode(
+            value,
+            first=("immediate", r"\bimmediate(?:ly)?\b"),
+            second=(
+                "deferred",
+                r"\b(?:defer\w*|delay\w*|buffer\w*|shortlist\w*|"
+                r"wait(?:ing)?\s+before\s+decid\w*)\b",
+            ),
+        ),
+        "revision": _opposed_mode(
+            value,
+            first=("irrevocable", r"\birrevocable\w*\b"),
+            second=(
+                "revocable",
+                r"\b(?:revocable|undo\w*|revoke\w*|exchange\w*|"
+                r"change\w*\s+(?:(?:an?|the)\s+)?(?:prior|earlier|accepted|rejected|"
+                r"decision|choice))\b",
+            ),
+        ),
+    }
+
+
 def _clause_values(
     category: TargetClauseCategory,
     value: str,
@@ -1266,22 +1341,7 @@ def _clause_values(
             )
         }
     if category is TargetClauseCategory.ONLINE_DECISIONS:
-        return {
-            "timing": _mode(
-                value,
-                (
-                    ("deferred", r"\b(?:defer|delay|buffer|wait before deciding)\w*\b"),
-                    ("immediate", r"\bimmediate(?:ly)?\b"),
-                ),
-            ),
-            "revision": _mode(
-                value,
-                (
-                    ("revocable", r"\b(?:revocable|undo|revoke|change)\w*\b"),
-                    ("irrevocable", r"\birrevocable\w*\b"),
-                ),
-            ),
-        }
+        return _online_decision_values(value)
     if category is TargetClauseCategory.FEASIBILITY:
         return {"feasibility_requirement": _feasibility_requirement(value).value}
     if category is TargetClauseCategory.RANDOMNESS:

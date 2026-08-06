@@ -422,16 +422,26 @@ class WorkflowRunner:
             rebound.normalized_statement,
             rebound.claim_contract.as_dict(),
         )
+        alignment_warnings = list(alignment.warnings)
         if not alignment.passed:
-            raise StateCorruptionError(
-                "immutable target no longer aligns with its canonical claim contract: "
-                + " ".join(alignment.blocking_issues)
+            alignment_warnings = list(
+                dict.fromkeys(
+                    [
+                        *alignment_warnings,
+                        (
+                            "Frozen-target semantic revalidation reported a possible wording "
+                            "conflict, but the integrity-valid target registry remains canonical; "
+                            "continuing without changing the target. "
+                            + " ".join(alignment.blocking_issues)
+                        ),
+                    ]
+                )
             )
-        if alignment.warnings:
+        if alignment_warnings:
             existing = state.metadata.get("prompt_validation_warnings")
             merged = list(existing) if isinstance(existing, list) else []
             state.metadata["prompt_validation_warnings"] = list(
-                dict.fromkeys([*merged, *alignment.warnings])
+                dict.fromkeys([*merged, *alignment_warnings])
             )
         if persist_prompt_artifacts:
             prompts_root = state.run_root / "prompts"

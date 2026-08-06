@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Made online-decision alignment negation-aware: prohibitions such as `may not revoke`,
+  `cannot buffer`, and `may not defer` now reinforce irrevocable/immediate semantics instead of
+  being read as permissions. Explicitly permitted deferral or revocation still conflicts with an
+  immediate/irrevocable statement. Revalidation of an integrity-valid frozen target is now
+  warning-only, so a later heuristic disagreement can never falsely become non-retriable
+  `StateCorruptionError` or prevent research from starting.
 - Preserved conference, journal, and other publication versions as separate canonical source
   nodes when a ledger or historical upgrade contains distinct DOI values. Equivalent DOI syntax
   still deduplicates. Ambiguous aliases and lower-precedence identifiers now retain every source

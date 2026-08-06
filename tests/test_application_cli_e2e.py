@@ -12,6 +12,7 @@ import typer
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
+import matek_theorem_agent.application as application_module
 import matek_theorem_agent.cli as cli_module
 from matek_theorem_agent.application import (
     LEAN_CONSENT_TIMEOUT_SECONDS,
@@ -2053,6 +2054,54 @@ async def test_two_runs_extend_one_persistent_problem_graph(tmp_path: Path) -> N
     assert (
         coordinator_payloads[1]["knowledge_graph_memory"]["graph_revision"]
         in second_decision["rationale"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_hash_valid_frozen_target_parser_disagreement_warns_and_reaches_research(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    runner, _, _, _ = workflow_runner(project, accepted=True)
+    problem = make_problem(project)
+    first = await runner.run_new(
+        problem,
+        project,
+        options=WorkflowOptions(research_only=True, run_name="frozen-target-first"),
+        environment_snapshot={"fixture": "offline"},
+    )
+    real_validate = application_module.validate_target_contract
+
+    def report_parser_disagreement(
+        normalized_statement: str,
+        claim_contract: dict[str, str],
+    ) -> Any:
+        alignment = real_validate(normalized_statement, claim_contract)
+        return alignment.model_copy(
+            update={
+                "passed": False,
+                "blocking_issues": [
+                    "Synthetic heuristic disagreement over negated online-decision prose."
+                ],
+            }
+        )
+
+    monkeypatch.setattr(application_module, "validate_target_contract", report_parser_disagreement)
+    second = await runner.run_new(
+        problem,
+        project,
+        options=WorkflowOptions(research_only=True, run_name="frozen-target-second"),
+        environment_snapshot={"fixture": "offline"},
+    )
+
+    assert first.state.metadata["knowledge_graph"]["canonical_target"]["status"] == "created"
+    assert second.state.metadata["knowledge_graph"]["canonical_target"]["status"] == "reused"
+    assert second.state.stages[StageName.RESEARCH].status is StageStatus.SUCCEEDED
+    warnings = second.state.metadata["prompt_validation_warnings"]
+    assert any(
+        "integrity-valid target registry remains canonical" in warning for warning in warnings
     )
 
 

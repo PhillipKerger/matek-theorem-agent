@@ -986,8 +986,10 @@ re-runs frozen deterministic checks natively.
   contradiction-only alignment guard, inspect `prompts/target_alignment.json` beside
   `compiled_problem.json`, and run `matek resume RUN_ID`. The completed compiler response is
   replayed from the run-local model journal and deterministically rechecked rather than purchased
-  again. Use `--force-stage prompt_compilation` only when you intentionally want a fresh bounded
-  prompt-repair generation.
+  again. Negated requirements such as `may not revoke` or `may not defer` are treated as
+  prohibitions, and a heuristic disagreement over an integrity-valid frozen target warns and
+  continues instead of reporting state corruption. Use `--force-stage prompt_compilation` only
+  when you intentionally want a fresh bounded prompt-repair generation.
 - **Repeat run reports a canonical-contract change although `problem.md` is unchanged:** version
   0.6.0 and later select the frozen target by normalized source hash before considering fresh
   compiler wording. Upgrade MATEK and run `matek resume RUN_ID`; the saved compiler work can be

@@ -74,13 +74,16 @@ formalization, and generates a reproducible final report.
   deterministic preprocessing or tie-breaking, and proofs conditioned on a realized seed; none
   of those facts makes the algorithm deterministic-only. Every blocking record includes the
   compared structured values and concrete conflict. Lexical absence or ambiguous vocabulary is
-  not evidence of a mismatch: record a warning, retain the frozen canonical contract, and start
-  research.
+  not evidence of a mismatch. Negated prohibitions such as `may not defer` and `may not revoke`
+  must never be interpreted as positive permissions. Record uncertainty as a warning, retain the
+  frozen canonical contract, and start research.
 - Bind the first aligned statement, canonical contract, and compiled prompt for a normalized
   source hash in `.matek/knowledge/<graph-name>/target-registry.json`. Later runs with the same
   source hash reuse those canonical bytes while refreshing literature separately. A new aligned
   wording with the unchanged contract is recorded as a cosmetic paraphrase and does not replace
-  them. Contract-changing drift fails closed unless the user explicitly runs with
+  those bytes. Once registry hashes validate, later heuristic semantic revalidation is diagnostic
+  and warning-only; it must not reclassify the immutable target or run state as corrupt.
+  Contract-changing drift fails closed unless the user explicitly runs with
   `--migrate-target REASON`; that versioned migration requires confirmation unless `--yes` is
   present, persists its authorization through resume, emits the target-migration event, and
   invalidates affected evidence.

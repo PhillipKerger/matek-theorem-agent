@@ -67,6 +67,13 @@ continues to research without a manual resume. This guard is deliberately narrow
 frontier compiler authors the statement and contract. Later research, manuscript, and Lean gates
 still audit the actual mathematical claim.
 
+Online-decision extraction treats modal prohibitions as negative constraints: `may not revoke`,
+`must not exchange`, `cannot buffer`, and `may not defer` support irrevocable/immediate decisions.
+Only affirmative permission for a genuinely opposing mode is a material conflict. After initial
+admission, registry hashes—not a repeat heuristic parse—establish frozen-target integrity. A later
+parser disagreement is recorded as a warning and research continues with the unchanged canonical
+bytes.
+
 ### Pre-research gate inventory
 
 Every hard gate that can stop a run before worker research is enumerated below with its input,

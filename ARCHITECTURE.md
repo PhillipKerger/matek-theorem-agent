@@ -326,6 +326,11 @@ paraphrase and the frozen bytes remain authoritative. Contract drift fails close
 confirms `matek run PROBLEM_FILE --migrate-target REASON`, which creates a versioned migration and
 invalidates affected proof evidence.
 
+Negation-aware online-decision extraction distinguishes prohibitions from permissions. Once the
+target registry's hashes validate, repeated semantic extraction is diagnostic only: disagreements
+become warnings rather than state-corruption failures, because source-hash migration and registry
+integrity—not heuristic reparsing—govern canonical-target replacement.
+
 Canonical source nodes use verified entity keys with DOI/base-arXiv/MR/ISBN/URL precedence.
 Versions, aliases, titles, evidence links, and verification provenance merge only for the same
 entity key; title similarity cannot merge distinct identifiers. Unverified title/author records
