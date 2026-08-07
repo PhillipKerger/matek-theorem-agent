@@ -15,6 +15,7 @@ from matek_theorem_agent.codex_model_backend import (
     CodexCliModelClient,
     CodexErrorKind,
     CodexInputTooLargeError,
+    CodexInternalIsolationError,
     CodexModelUnavailableError,
     CodexNetworkOrSearchUnavailableError,
     CodexNotAuthenticatedError,
@@ -26,6 +27,7 @@ from matek_theorem_agent.codex_model_backend import (
     CodexSchemaValidationError,
     CodexStagePolicy,
     CodexUnauthorizedFileChangeError,
+    _private_workspace_snapshot,
     classify_codex_failure,
     parse_codex_auth_status,
     parse_codex_capabilities,
@@ -280,6 +282,19 @@ class WorkspaceWritingCodexBackend(FakeCodexBackend):
             else:  # pragma: no cover - fixture construction is closed above
                 raise AssertionError(f"unknown workspace-write fixture target: {self.target}")
             target.write_text("changed\n", encoding="utf-8")
+        return result
+
+
+class ForeignRunWritingCodexBackend(FakeCodexBackend):
+    def __init__(self, foreign_path: Path) -> None:
+        super().__init__(["success"])
+        self.foreign_path = foreign_path
+
+    async def run(self, request: CommandRequest) -> CommandResult:
+        result = await super().run(request)
+        if request in self.exec_requests:
+            self.foreign_path.parent.mkdir(parents=True, exist_ok=True)
+            self.foreign_path.write_text("changed\n", encoding="utf-8")
         return result
 
 
@@ -828,14 +843,12 @@ async def test_concurrent_runs_ignore_each_others_graph_and_workspace_writes(
 ) -> None:
     backend = ConcurrentWorkspaceCodexBackend()
     workers: list[CodexCliModelClient] = []
-    graph_roots: list[Path] = []
+    scratches: list[Path] = []
     for suffix in ("a", "b"):
         run_root = tmp_path / ".matek" / "runs" / f"test-run-{suffix}"
         scratch = run_root / "research" / "workspaces" / f"assignment-{suffix}" / "scratch"
         scratch.mkdir(parents=True)
-        graph_root = tmp_path / ".matek" / "knowledge" / f"graph-{suffix}"
-        graph_root.mkdir(parents=True)
-        graph_roots.append(graph_root)
+        scratches.append(scratch)
         workers.append(
             CodexCliModelClient(tmp_path, backend=backend, max_attempts=1)
             .for_stage("research", run_root=run_root, role="research-worker")
@@ -847,14 +860,33 @@ async def test_concurrent_runs_ignore_each_others_graph_and_workspace_writes(
         for worker in workers
     ]
     await asyncio.wait_for(backend.both_started.wait(), timeout=2)
-    for index, graph_root in enumerate(graph_roots):
-        (graph_root / "state.json").write_text(f'{{"revision":{index + 1}}}\n', encoding="utf-8")
+    # Both calls have taken their before snapshots and are now held in their private CWDs.
+    # Simulate a live Matroid worker producing normal sandbox and Python scratch artifacts while
+    # the Jantzen worker remains between its before and after integrity snapshots.
+    jantzen_scratch, matroid_scratch = scratches
+    before_jantzen = _private_workspace_snapshot(jantzen_scratch)
+    (matroid_scratch / ".agents").mkdir()
+    (matroid_scratch / ".codex").mkdir()
+    (matroid_scratch / ".git").mkdir()
+    pycache = matroid_scratch / "scratch" / "__pycache__"
+    pycache.mkdir(parents=True)
+    (pycache / "audit_rank1_search.cpython-311.pyc").write_bytes(b"compiled")
+    (matroid_scratch / "scratch" / "audit_rank1_search.py").write_text(
+        "print('search')\n", encoding="utf-8"
+    )
+    (matroid_scratch / "scratch" / "exact_scenario_search.py").write_text(
+        "print('scenario')\n", encoding="utf-8"
+    )
+    after_jantzen = _private_workspace_snapshot(jantzen_scratch)
+    assert before_jantzen == after_jantzen
+    assert all("test-run-b" not in str(path) for path in after_jantzen)
     backend.release.set()
 
     results = await asyncio.gather(*calls)
 
     assert [result.parsed.answer for result in results] == [42, 42]
     assert len(backend.exec_requests) == 2
+    assert all(request.cwd in scratches for request in backend.exec_requests)
 
 
 def test_research_worker_workspace_binding_rejects_broader_write_capabilities(
@@ -881,6 +913,36 @@ def test_research_worker_workspace_binding_rejects_broader_write_capabilities(
     escape.symlink_to(sibling_graph, target_is_directory=True)
     with pytest.raises(ValueError, match="canonical path"):
         client.for_workspace(scratch, writable_paths=(escape,))
+
+
+@pytest.mark.asyncio
+async def test_foreign_run_snapshot_failure_names_both_runs_without_restore_advice(
+    tmp_path: Path,
+) -> None:
+    run_a = tmp_path / ".matek" / "runs" / "run-a"
+    foreign_path = tmp_path / ".matek" / "runs" / "run-b" / "scratch.py"
+    run_a.mkdir(parents=True)
+    backend = ForeignRunWritingCodexBackend(foreign_path)
+    client = CodexCliModelClient(
+        tmp_path,
+        backend=backend,
+        max_attempts=1,
+        stage_policies={
+            "lean_formalization": CodexStagePolicy(
+                sandbox="workspace-write",
+                web_search=False,
+                allowed_write_paths=(run_a,),
+            )
+        },
+    ).for_stage("lean_formalization", run_root=run_a)
+
+    with pytest.raises(CodexInternalIsolationError) as caught:
+        await client.generate_structured(_request(web_search=False), Answer)
+
+    assert caught.value.kind is CodexErrorKind.INTERNAL_ISOLATION_BUG
+    assert "run-a" in caught.value.detail
+    assert "run-b" in caught.value.detail
+    assert "do not restore" in caught.value.remedy.casefold()
 
 
 def test_workspace_binding_validates_role_confinement_and_explicit_scratch(

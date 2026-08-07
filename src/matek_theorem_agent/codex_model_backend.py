@@ -90,6 +90,7 @@ class CodexErrorKind(StrEnum):
     OUTPUT_MISSING = "CODEX_OUTPUT_MISSING"
     SESSION_RESUME_FAILED = "CODEX_SESSION_RESUME_FAILED"
     UNAUTHORIZED_FILE_CHANGE = "CODEX_UNAUTHORIZED_FILE_CHANGE"
+    INTERNAL_ISOLATION_BUG = "CODEX_INTERNAL_ISOLATION_BUG"
     UNKNOWN_ERROR = "CODEX_UNKNOWN_ERROR"
 
 
@@ -202,6 +203,10 @@ class CodexUnauthorizedFileChangeError(CodexBackendError):
     pass
 
 
+class CodexInternalIsolationError(CodexBackendError):
+    pass
+
+
 class CodexUnknownError(CodexBackendError):
     pass
 
@@ -225,6 +230,7 @@ _ERROR_CLASSES: Mapping[CodexErrorKind, type[CodexBackendError]] = {
     CodexErrorKind.OUTPUT_MISSING: CodexOutputMissingError,
     CodexErrorKind.SESSION_RESUME_FAILED: CodexSessionResumeError,
     CodexErrorKind.UNAUTHORIZED_FILE_CHANGE: CodexUnauthorizedFileChangeError,
+    CodexErrorKind.INTERNAL_ISOLATION_BUG: CodexInternalIsolationError,
     CodexErrorKind.UNKNOWN_ERROR: CodexUnknownError,
 }
 
@@ -1121,18 +1127,15 @@ class CodexCliModelClient:
                     },
                     confinement_root=run_root,
                 )
+                bound_worker_workspace = self._bound_writable_paths is not None
                 integrity_root = (
-                    self._workspace_root
-                    if self._bound_writable_paths is not None
-                    else self._confinement_root
+                    self._workspace_root if bound_worker_workspace else self._confinement_root
                 )
                 before = (
-                    _workspace_snapshot(
-                        integrity_root,
-                        run_root,
-                        included_root=(
-                            self._workspace_root if self._bound_writable_paths is not None else None
-                        ),
+                    (
+                        _private_workspace_snapshot(integrity_root)
+                        if bound_worker_workspace
+                        else _workspace_snapshot(integrity_root, run_root)
                     )
                     if policy.sandbox == "workspace-write"
                     else None
@@ -1146,12 +1149,10 @@ class CodexCliModelClient:
                 )
                 result = await self._run_command(command, artifacts, run_root)
                 after = (
-                    _workspace_snapshot(
-                        integrity_root,
-                        run_root,
-                        included_root=(
-                            self._workspace_root if self._bound_writable_paths is not None else None
-                        ),
+                    (
+                        _private_workspace_snapshot(integrity_root)
+                        if bound_worker_workspace
+                        else _workspace_snapshot(integrity_root, run_root)
                     )
                     if before is not None
                     else None
@@ -1163,11 +1164,31 @@ class CodexCliModelClient:
                         workspace=integrity_root,
                         allowed_roots=(
                             policy.allowed_write_paths
-                            if self._bound_writable_paths is not None
+                            if bound_worker_workspace
                             else (run_root, *policy.allowed_write_paths)
                         ),
                     )
                     if unauthorized:
+                        foreign_run_ids = _foreign_run_ids(
+                            unauthorized,
+                            workspace=integrity_root,
+                            run_root=run_root,
+                        )
+                        if foreign_run_ids:
+                            raise _AttemptException(
+                                _AttemptFailure(
+                                    CodexFailureClassification(
+                                        CodexErrorKind.INTERNAL_ISOLATION_BUG,
+                                        False,
+                                        "Do not restore files: MATEK detected an internal "
+                                        "cross-run snapshot-isolation failure. Preserve both "
+                                        "runs and report this diagnostic.",
+                                    ),
+                                    "Integrity snapshot included path(s) owned by run(s) "
+                                    + ", ".join(foreign_run_ids)
+                                    + f" while checking run {run_root.name}.",
+                                )
+                            )
                         raise _AttemptException(
                             _AttemptFailure(
                                 CodexFailureClassification(
@@ -1983,42 +2004,42 @@ def _public_url_citations(item: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 def _workspace_snapshot(
     workspace: Path,
     run_root: Path,
-    *,
-    included_root: Path | None = None,
 ) -> dict[Path, tuple[str, int]]:
-    """Snapshot model-visible state while excluding application-owned run traces.
-
-    A private assignment workspace may itself live below ``run_root``.  ``included_root``
-    re-includes exactly that subtree while retaining the exclusion for sibling trace and state
-    files written by MATEK during the call.
-    """
+    """Snapshot a general workspace while excluding application-owned run traces."""
 
     resolved_workspace = workspace.resolve(strict=True)
     resolved_run_root = run_root.resolve(strict=True)
-    resolved_included = included_root.resolve(strict=True) if included_root is not None else None
-    reincluded = (
-        resolved_included
-        if resolved_included is not None
-        and (
-            resolved_included == resolved_run_root
-            or resolved_included.is_relative_to(resolved_run_root)
-        )
-        else None
-    )
 
     def disposition(path: Path) -> Literal["include", "traverse", "exclude"]:
         if not (path == resolved_run_root or path.is_relative_to(resolved_run_root)):
             return "include"
-        if reincluded is None:
-            return "exclude"
-        if path == reincluded or path.is_relative_to(reincluded):
-            return "include"
-        if reincluded.is_relative_to(path):
-            return "traverse"
         return "exclude"
 
+    return _snapshot_tree(resolved_workspace, disposition=disposition)
+
+
+def _private_workspace_snapshot(workspace: Path) -> dict[Path, tuple[str, int]]:
+    """Snapshot exactly one private worker workspace.
+
+    This deliberately has no run-root argument or exclusion/reinclusion logic.  A bound
+    research worker may write only its canonical ``scratch`` directory, so starting the walk
+    at that directory is the complete integrity domain.  In particular, a sibling run cannot
+    be observed or attributed while this snapshot is taken.
+    """
+
+    resolved_workspace = workspace.resolve(strict=True)
+    return _snapshot_tree(resolved_workspace, disposition=lambda _path: "include")
+
+
+def _snapshot_tree(
+    workspace: Path,
+    *,
+    disposition: Callable[[Path], Literal["include", "traverse", "exclude"]],
+) -> dict[Path, tuple[str, int]]:
+    """Walk one already-resolved workspace with an explicit traversal policy."""
+
     snapshot: dict[Path, tuple[str, int]] = {}
-    for root, directory_names, file_names in os.walk(resolved_workspace, followlinks=False):
+    for root, directory_names, file_names in os.walk(workspace, followlinks=False):
         root_path = Path(root)
         retained_directories: list[str] = []
         for name in directory_names:
@@ -2026,7 +2047,7 @@ def _workspace_snapshot(
             path_disposition = disposition(path)
             if path_disposition == "exclude":
                 continue
-            relative = path.relative_to(resolved_workspace)
+            relative = path.relative_to(workspace)
             try:
                 entry = path.lstat()
             except OSError:
@@ -2043,7 +2064,7 @@ def _workspace_snapshot(
             path = root_path / name
             if disposition(path) != "include":
                 continue
-            relative = path.relative_to(resolved_workspace)
+            relative = path.relative_to(workspace)
             try:
                 entry = path.lstat()
             except OSError:
@@ -2079,6 +2100,33 @@ def _unauthorized_changes(
             continue
         unauthorized.append(str(relative))
     return unauthorized
+
+
+def _foreign_run_ids(
+    changed_paths: Sequence[str],
+    *,
+    workspace: Path,
+    run_root: Path,
+) -> tuple[str, ...]:
+    """Return sibling run IDs that reached an integrity comparison unexpectedly.
+
+    Bound-worker snapshots cannot produce these paths. This defensive check protects the
+    recovery instruction if a future change accidentally broadens an integrity root.
+    """
+
+    lexical_workspace = Path(os.path.abspath(workspace))
+    lexical_run_root = Path(os.path.abspath(run_root))
+    runs_root = lexical_run_root.parent
+    foreign: set[str] = set()
+    for changed in changed_paths:
+        candidate = Path(os.path.abspath(lexical_workspace / changed))
+        try:
+            relative = candidate.relative_to(runs_root)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0] != lexical_run_root.name:
+            foreign.add(relative.parts[0])
+    return tuple(sorted(foreign))
 
 
 def _sha256_regular_file(path: Path) -> str:
@@ -2286,6 +2334,7 @@ __all__ = [
     "CodexCliModelClient",
     "CodexErrorKind",
     "CodexFailureClassification",
+    "CodexInternalIsolationError",
     "CodexJsonlSummary",
     "CodexModelUnavailableError",
     "CodexNetworkOrSearchUnavailableError",
