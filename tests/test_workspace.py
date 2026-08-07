@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -177,3 +178,24 @@ def test_run_lock_is_external_fail_fast_and_reusable_after_release(tmp_path: Pat
     assert first.lock_path.is_file()
     with RunLock(run_root):
         pass
+
+
+def test_stale_run_lock_metadata_is_reclaimed_by_the_next_owner(tmp_path: Path) -> None:
+    run_root = create_run_root(tmp_path, run_id="20260719T123456Z-stale-abcdef")
+    lock = RunLock(run_root)
+    lock.lock_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": run_root.name,
+                "pid": 999_999_999,
+                "acquired_at": "2000-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with lock:
+        owner = json.loads(lock.lock_path.read_text(encoding="utf-8"))
+        assert owner["pid"] == os.getpid()
+        assert owner["run_id"] == run_root.name

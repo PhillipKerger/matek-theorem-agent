@@ -93,6 +93,7 @@ from .workspace import (
     atomic_write_bytes,
     discover_project_root,
     latest_run_root_for_problem,
+    list_run_roots,
     sha256_file,
 )
 
@@ -400,12 +401,8 @@ def _model_role_display(config: AppConfig, role: str) -> str:
 
 def _effective_research_concurrency(config: AppConfig) -> tuple[int, str]:
     configured = config.effective_max_concurrent_first_level_agents
+    effective = config.effective_research_model_call_concurrency
     if config.backend.provider == "codex":
-        effective = min(
-            configured,
-            config.codex.max_concurrent_model_calls,
-            config.codex.max_concurrent_web_model_calls,
-        )
         ceilings = (
             f"research-agent capacity {config.research.max_concurrent_agents} "
             f"=> {configured} first-level, Codex "
@@ -413,7 +410,6 @@ def _effective_research_concurrency(config: AppConfig) -> tuple[int, str]:
             f"web {config.codex.max_concurrent_web_model_calls}"
         )
     else:
-        effective = min(configured, config.api.max_concurrent_model_calls)
         ceilings = (
             f"research-agent capacity {config.research.max_concurrent_agents} "
             f"=> {configured} first-level, API {config.api.max_concurrent_model_calls}"
@@ -1581,12 +1577,75 @@ def _elapsed_seconds(state: RunState) -> float:
     return max(0.0, (end - state.created_at).total_seconds())
 
 
+def _research_scheduler_snapshot(state: RunState) -> tuple[dict[str, int], str, dict[str, Any]]:
+    path = state.run_root / "research" / "coordinator" / "state.json"
+    if not path.is_file():
+        return {"queued": 0, "running": 0, "completed": 0}, "not_started", {}
+    scheduler = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(scheduler, dict):
+        raise ConfigError("research coordinator state is invalid")
+    assignments = scheduler.get("assignments", [])
+    if not isinstance(assignments, list):
+        raise ConfigError("research coordinator assignment state is invalid")
+    counts = {
+        status: sum(
+            isinstance(item, dict) and item.get("status") == status for item in assignments
+        )
+        for status in ("queued", "running", "completed")
+    }
+    return counts, str(scheduler.get("phase", "unknown")), scheduler
+
+
+def _capacity_values(state: RunState) -> tuple[object, object]:
+    summary = state.metadata.get("configuration_summary", {})
+    if not isinstance(summary, dict):
+        return "unknown", "unknown"
+    requested = summary.get("max_concurrent_agents", "unknown")
+    effective = summary.get(
+        "effective_research_model_call_concurrency",
+        summary.get("max_concurrent_first_level_agents", "unknown"),
+    )
+    return requested, effective
+
+
+def _print_concurrent_runs(project_root: Path) -> None:
+    rows: list[tuple[RunState, dict[str, int]]] = []
+    for run_root in list_run_roots(project_root):
+        try:
+            state = StateStore(run_root).load()
+            if state.metadata.get("workflow_status") != "RUNNING" and not any(
+                record.status is StageStatus.RUNNING for record in state.stages.values()
+            ):
+                continue
+            counts, _, _ = _research_scheduler_snapshot(state)
+        except (OSError, ValueError, StateError, json.JSONDecodeError):
+            continue
+        rows.append((state, counts))
+    if not rows:
+        return
+
+    console.print("[bold]Active run-owned capacity[/bold]")
+    for state, counts in rows:
+        graph = state.metadata.get("knowledge_graph", {})
+        graph_name = graph.get("name", "unassigned") if isinstance(graph, dict) else "unassigned"
+        requested, effective = _capacity_values(state)
+        console.print(
+            f"- Run {state.run_id}: graph {graph_name}; workspace {state.run_root}; "
+            f"requested {requested}; effective {effective}; "
+            f"active {counts['running']}; queued {counts['queued']}"
+        )
+    console.print("Global MATEK capacity constraint: none; each row owns its run-local pool.")
+
+
 @app.command()
 def status(run_id: str | None = typer.Argument(None)) -> None:
     """Show checkpoints, usage, elapsed time, and artifact paths."""
 
     try:
-        state = _load_state(_project_root(), run_id)
+        project_root = _project_root()
+        if run_id is None:
+            _print_concurrent_runs(project_root)
+        state = _load_state(project_root, run_id)
         scientific_status = str(
             state.metadata.get("research_status", state.scientific_status.value)
         )
@@ -1604,6 +1663,9 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
         ):
             scientific_status = "RECEIVED"
         console.print(f"Run [bold]{state.run_id}[/bold]")
+        graph = state.metadata.get("knowledge_graph", {})
+        graph_name = graph.get("name", "unassigned") if isinstance(graph, dict) else "unassigned"
+        console.print(f"Ownership: graph {graph_name}; workspace {state.run_root}")
         console.print(f"Scientific: {scientific_status}")
         console.print(f"Workflow: {workflow_status}")
         if root_failure:
@@ -1723,21 +1785,19 @@ def status(run_id: str | None = typer.Argument(None)) -> None:
                     )
                 )
             )
-        scheduler_path = state.run_root / "research" / "coordinator" / "state.json"
-        if scheduler_path.is_file():
-            scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
-            assignments = scheduler.get("assignments", [])
-            if not isinstance(assignments, list):
-                raise ConfigError("research coordinator assignment state is invalid")
-            counts = {
-                status: sum(
-                    isinstance(item, dict) and item.get("status") == status for item in assignments
-                )
-                for status in ("queued", "running", "completed")
-            }
+        counts, scheduler_phase, scheduler = _research_scheduler_snapshot(state)
+        requested_capacity, effective_capacity = _capacity_values(state)
+        console.print(
+            "Capacity: "
+            f"requested {requested_capacity} run-owned agent slots; "
+            f"effective {effective_capacity} concurrent model calls; "
+            f"active {counts['running']}; queued {counts['queued']}; "
+            "global wait none (no MATEK-global pool)"
+        )
+        if scheduler:
             console.print(
                 "Research coordinator: "
-                f"phase {scheduler.get('phase', 'unknown')}; "
+                f"phase {scheduler_phase}; "
                 f"decisions {len(scheduler.get('decisions', []))}; "
                 "mailbox acknowledged through event "
                 f"{scheduler.get('coordinator_ack_event_sequence', 0)}; "

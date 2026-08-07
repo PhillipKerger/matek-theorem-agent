@@ -129,13 +129,21 @@ untrusted input.
 
 Each research assignment also receives a private `0700` root at
 `research/workspaces/<assignment-id>/`; only its `scratch/` child is writable. A worker-capable
-Codex client is rebound to the assignment root with that single write path. Declared computation
+Codex client is rebound directly to that canonical scratch root, so the Codex sandbox and the
+post-call integrity snapshot have the same capability. The snapshot never covers sibling runs,
+graphs, or the project as a whole. Declared computation
 files are collected into
 `research/computations/blobs/sha256/`, bound by an immutable manifest, and replayed in a fresh
 workspace only through an injected backend that attests both filesystem confinement and disabled
 networking. The current trusted replay backend is restricted Docker; native replay is refused.
 Mutable scratch and replay workspaces are not proof evidence, and a passing replay supports only a
 proposed derivation pending mathematical/domain audit.
+
+Research call capacity is owned by one run invocation. Every adaptive-research call creates its
+own semaphore from the frozen run configuration; MATEK has no hidden process-global pool. Run
+locks are likewise keyed by run ID, while knowledge-graph transactions lock only their selected
+graph. `matek status` reports each active run's graph/workspace ownership, requested and effective
+capacity, active and queued assignments, and whether a global constraint exists.
 
 ### State machine
 

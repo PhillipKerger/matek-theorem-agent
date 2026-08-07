@@ -272,15 +272,31 @@ class WorkspaceWritingCodexBackend(FakeCodexBackend):
         result = await super().run(request)
         if request in self.exec_requests:
             if self.target == "scratch":
-                target = request.cwd / "scratch" / "certificate.txt"
+                target = request.cwd / "certificate.txt"
             elif self.target == "sibling":
-                target = request.cwd / "sibling.txt"
+                target = request.cwd.parent / "sibling.txt"
             elif self.target == "project":
                 target = self.project_root / "project-write.txt"
             else:  # pragma: no cover - fixture construction is closed above
                 raise AssertionError(f"unknown workspace-write fixture target: {self.target}")
             target.write_text("changed\n", encoding="utf-8")
         return result
+
+
+class ConcurrentWorkspaceCodexBackend(FakeCodexBackend):
+    def __init__(self) -> None:
+        super().__init__(["success", "success"])
+        self.started = 0
+        self.both_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, request: CommandRequest) -> CommandResult:
+        if "--output-last-message" in request.argv:
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            await self.release.wait()
+        return await super().run(request)
 
 
 def _run_root(tmp_path: Path) -> Path:
@@ -790,7 +806,7 @@ async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_on
     worker = (
         CodexCliModelClient(tmp_path, backend=backend)
         .for_stage("research", run_root=run_root, role="research-worker")
-        .for_workspace(assignment_root, writable_paths=(scratch,))
+        .for_workspace(scratch, writable_paths=(scratch,))
     )
 
     result = await worker.generate_structured(_request(web_search=False), Answer)
@@ -798,8 +814,8 @@ async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_on
     assert result.parsed.answer == 42
     assert (scratch / "certificate.txt").read_text(encoding="utf-8") == "changed\n"
     command = backend.exec_requests[0]
-    assert command.cwd == assignment_root
-    assert command.argv[command.argv.index("-C") + 1] == str(assignment_root)
+    assert command.cwd == scratch
+    assert command.argv[command.argv.index("-C") + 1] == str(scratch)
     assert command.argv[command.argv.index("--sandbox") + 1] == "workspace-write"
     output_path = Path(command.argv[command.argv.index("--output-last-message") + 1])
     assert output_path.is_relative_to(run_root)
@@ -807,29 +823,64 @@ async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_on
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target", ["sibling", "project"])
-async def test_research_worker_workspace_binding_rejects_sibling_and_project_writes(
+async def test_concurrent_runs_ignore_each_others_graph_and_workspace_writes(
     tmp_path: Path,
-    target: str,
+) -> None:
+    backend = ConcurrentWorkspaceCodexBackend()
+    workers: list[CodexCliModelClient] = []
+    graph_roots: list[Path] = []
+    for suffix in ("a", "b"):
+        run_root = tmp_path / ".matek" / "runs" / f"test-run-{suffix}"
+        scratch = run_root / "research" / "workspaces" / f"assignment-{suffix}" / "scratch"
+        scratch.mkdir(parents=True)
+        graph_root = tmp_path / ".matek" / "knowledge" / f"graph-{suffix}"
+        graph_root.mkdir(parents=True)
+        graph_roots.append(graph_root)
+        workers.append(
+            CodexCliModelClient(tmp_path, backend=backend, max_attempts=1)
+            .for_stage("research", run_root=run_root, role="research-worker")
+            .for_workspace(scratch, writable_paths=(scratch,))
+        )
+
+    calls = [
+        asyncio.create_task(worker.generate_structured(_request(web_search=False), Answer))
+        for worker in workers
+    ]
+    await asyncio.wait_for(backend.both_started.wait(), timeout=2)
+    for index, graph_root in enumerate(graph_roots):
+        (graph_root / "state.json").write_text(f'{{"revision":{index + 1}}}\n', encoding="utf-8")
+    backend.release.set()
+
+    results = await asyncio.gather(*calls)
+
+    assert [result.parsed.answer for result in results] == [42, 42]
+    assert len(backend.exec_requests) == 2
+
+
+def test_research_worker_workspace_binding_rejects_broader_write_capabilities(
+    tmp_path: Path,
 ) -> None:
     run_root = _run_root(tmp_path)
     assignment_root = run_root / "research" / "workspaces" / "assignment-01"
     scratch = assignment_root / "scratch"
     scratch.mkdir(parents=True)
-    backend = WorkspaceWritingCodexBackend(tmp_path, target)
-    worker = (
-        CodexCliModelClient(tmp_path, backend=backend, max_attempts=1)
-        .for_stage("research", run_root=run_root, role="research-worker")
-        .for_workspace(assignment_root, writable_paths=(scratch,))
+    sibling_graph = tmp_path / ".matek" / "knowledge" / "other-graph"
+    sibling_graph.mkdir(parents=True)
+    client = CodexCliModelClient(tmp_path, backend=FakeCodexBackend()).for_stage(
+        "research", run_root=run_root, role="research-worker"
     )
 
-    with pytest.raises(CodexUnauthorizedFileChangeError) as caught:
-        await worker.generate_structured(_request(web_search=False), Answer)
+    with pytest.raises(ValueError, match="private scratch"):
+        client.for_workspace(assignment_root, writable_paths=(assignment_root,))
+    with pytest.raises(ValueError, match="confined"):
+        client.for_workspace(sibling_graph, writable_paths=(sibling_graph,))
+    with pytest.raises(ValueError, match="canonical path"):
+        client.for_workspace(scratch, writable_paths=(scratch / "..",))
 
-    assert caught.value.kind is CodexErrorKind.UNAUTHORIZED_FILE_CHANGE
-    assert len(backend.exec_requests) == 1
-    expected = "sibling.txt" if target == "sibling" else "project-write.txt"
-    assert expected in caught.value.detail
+    escape = scratch / "escape"
+    escape.symlink_to(sibling_graph, target_is_directory=True)
+    with pytest.raises(ValueError, match="canonical path"):
+        client.for_workspace(scratch, writable_paths=(escape,))
 
 
 def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
@@ -845,7 +896,7 @@ def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
 
     with pytest.raises(ValueError, match="research-worker"):
         client.for_stage("audit", run_root=run_root, role="hostile").for_workspace(
-            assignment_root,
+            scratch,
             writable_paths=(scratch,),
         )
     with pytest.raises(ValueError, match="confined"):
@@ -854,15 +905,15 @@ def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
         )
     with pytest.raises(ValueError, match="explicit writable"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
-            assignment_root
+            scratch
         )
-    with pytest.raises(ValueError, match="operation may not target"):
+    with pytest.raises(ValueError, match="private scratch"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
             assignment_root, writable_paths=(assignment_root,)
         )
     with pytest.raises(ValueError, match="does not exist"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
-            assignment_root,
+            scratch,
             writable_paths=(assignment_root / "missing",),
         )
 
@@ -875,7 +926,7 @@ def test_workspace_binding_is_dropped_when_cloned_for_another_role(tmp_path: Pat
     bound = (
         CodexCliModelClient(tmp_path, backend=FakeCodexBackend())
         .for_stage("research", run_root=run_root, role="research-worker")
-        .for_workspace(assignment_root, writable_paths=(scratch,))
+        .for_workspace(scratch, writable_paths=(scratch,))
     )
 
     coordinator = bound.for_stage(

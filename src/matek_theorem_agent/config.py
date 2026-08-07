@@ -820,6 +820,19 @@ class AppConfig(_StrictSettings):
         return max(1, self.research.max_concurrent_agents // slots_per_worker)
 
     @property
+    def effective_research_model_call_concurrency(self) -> int:
+        """Return this run's model-call ceiling after provider-specific limits."""
+
+        first_level = self.effective_max_concurrent_first_level_agents
+        if self.backend.provider == "codex":
+            return min(
+                first_level,
+                self.codex.max_concurrent_model_calls,
+                self.codex.max_concurrent_web_model_calls,
+            )
+        return min(first_level, self.api.max_concurrent_model_calls)
+
+    @property
     def web_search_enabled(self) -> bool:
         """Whether any model stage is allowed to use live web search.
 

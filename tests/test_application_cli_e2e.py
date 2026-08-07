@@ -1219,6 +1219,11 @@ async def test_workflow_error_gets_a_best_effort_terra_explanation(tmp_path: Pat
     assert "Coordinator decision 1 has 4 assignments; at least 8 are required" in report
     assert "Error explanation" in report
 
+    # The explainer is a paid internal call, not a resumable workflow stage. Its
+    # durable usage must remain budgeted without making the next resume look corrupt.
+    resumed = await runner.resume(project, run_id=result.state.run_id)
+    assert resumed.state.metadata["error_explanation"]["available"] is True
+
 
 @pytest.mark.asyncio
 async def test_unavailable_error_explainer_never_masks_the_original_failure(
@@ -2892,3 +2897,53 @@ def test_cli_init_status_and_usage_exit_codes(
     assert repeated_init.exit_code == 2
     missing_run = cli.invoke(app, ["status", "20260719T120000Z-missing-abcdef"])
     assert missing_run.exit_code == 2
+
+
+def test_status_lists_independent_capacity_for_two_active_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    problem = make_problem(tmp_path)
+    run_ids = (
+        "20260719T120000Z-active-a-abcdef",
+        "20260719T120001Z-active-b-abcdef",
+    )
+    for index, run_id in enumerate(run_ids):
+        intake = ingest_problem(
+            problem_file=problem,
+            project_root=tmp_path,
+            config=AppConfig(project_root=tmp_path),
+            invocation={},
+            run_id=run_id,
+            snapshot={},
+        )
+        state = intake.state
+        state.metadata["workflow_status"] = "RUNNING"
+        state.metadata["knowledge_graph"] = {"name": f"graph-{index + 1}"}
+        StateStore(intake.run_root).save(state)
+        scheduler = intake.run_root / "research" / "coordinator" / "state.json"
+        scheduler.parent.mkdir(parents=True, exist_ok=True)
+        scheduler.write_text(
+            json.dumps(
+                {
+                    "phase": "researching",
+                    "assignments": [
+                        {"status": "running"},
+                        {"status": "queued"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.chdir(tmp_path)
+
+    status_result = CliRunner().invoke(app, ["status"])
+
+    assert status_result.exit_code == 0, status_result.output
+    for run_id in run_ids:
+        assert run_id in status_result.output
+    assert "graph-1" in status_result.output
+    assert "graph-2" in status_result.output
+    assert "Global MATEK capacity constraint: none" in status_result.output
+    assert "global wait none" in status_result.output

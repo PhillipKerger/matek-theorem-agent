@@ -202,6 +202,11 @@ this same pool and use web search by default. With `--no-web-search`, the web-ag
 constrains calls at the backend; the current orchestration nevertheless includes that configured
 ceiling when it computes its conservative worker-admission window.
 
+This pool is per run: simultaneous MATEK runs do not share a hidden application semaphore or
+silently reduce one another's configured capacity. `matek status` lists active runs with their
+owned graph and workspace, requested/effective capacity, active/queued assignments, and any global
+wait reason (`none` in the current design).
+
 Hierarchical mode is the Codex default:
 
 ```bash
@@ -494,7 +499,8 @@ The main scientific evidence paths are:
 See [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) for the complete tree and integrity rules.
 
 Use `matek status` for the latest run or `matek status <run-id>` for a specific run. By
-default, MATEK writes only beneath `.matek/`; editing project source requires the explicit
+default, an unqualified status also lists all active run-owned capacity before the latest run's
+details. MATEK writes only beneath `.matek/`; editing project source requires the explicit
 `--allow-project-edits` option.
 
 ### Persistent knowledge graph and Obsidian

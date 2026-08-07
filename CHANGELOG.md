@@ -4,6 +4,17 @@
 
 ## 0.7.0 — 2026-08-06
 
+- Isolated every research worker's Codex sandbox and integrity snapshot to the same canonical
+  assignment scratch directory. Concurrent runs and distinct knowledge graphs can now write in
+  the same project without being misattributed as unauthorized changes; broader, traversal, and
+  symlink capabilities remain rejected before execution.
+- Made research capacity explicitly run-owned. There is no hidden MATEK-global semaphore, and
+  status now shows active runs independently with graph/workspace ownership, requested/effective
+  capacity, active/queued assignments, and the global-wait reason. Run locks remain narrow,
+  owner-aware, and reclaim stale metadata automatically; graph locks remain scoped to one graph
+  and are released by the kernel if their process exits.
+- Fixed resume after the paid best-effort error explainer: internal `error_explanation` usage stays
+  in the durable budget journal but is no longer misparsed as an unknown resumable workflow stage.
 - Made target alignment warning-first. Clause extractors now produce typed, hash-bound diagnostics
   but cannot stop research. A possible conflict gets one short context-aware GPT 5.6 Terra review;
   only `CONFIRMED_CONFLICT` with known clause keys blocks, while uncertainty, malformed output, or

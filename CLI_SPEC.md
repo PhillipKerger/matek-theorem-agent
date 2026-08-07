@@ -279,13 +279,16 @@ ordinary resume.
 ## `matek status [RUN_ID]`
 
 Shows one backend summary, a `Research roles:` line with configured coordinator/worker models and
-efforts, the stage table, aggregate usage and elapsed time, and recorded artifact paths. When the
+efforts, run-owned graph/workspace paths, requested and effective capacity, the stage table,
+aggregate usage and elapsed time, and recorded artifact paths. When the
 canonical research checkpoint exists, it also prints `Research coordinator:` with phase, decision
 count, the acknowledged-through event cursor, and queued, active, and completed assignment counts.
 That `phase` is the coordinator scheduler lifecycle, not the separate scientific phase stored in
 `research/coordinator/scientific-phase.json`. API runs may show calculated dollar cost; Codex runs
 must not invent a dollar cost for subscription allowance. If the run ID is omitted, use the latest
-run in the current project.
+run in the current project and first list every active run independently. MATEK has no hidden
+process-global capacity pool, so status reports `global wait none`; any future explicit global cap
+must instead report its effective allocation and wait reason.
 
 The status header prints `Scientific:` and `Workflow:` separately. For a paused candidate attempt
 it also shows completed and missing mandatory audits, so `CANDIDATE_AWAITING_AUDIT` is not confused

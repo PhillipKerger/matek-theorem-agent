@@ -235,6 +235,7 @@ def _prompt_validation_generation(state: RunState) -> int:
 def _sync_paid_calls_from_usage(state: RunState, records: list[UsageRecord]) -> bool:
     """Recover durable paid response IDs into state after an interrupted stage."""
 
+    internal_stages = {"error_explanation"}
     changed = False
     for record in records:
         if record.response_id is None:
@@ -243,6 +244,10 @@ def _sync_paid_calls_from_usage(state: RunState, records: list[UsageRecord]) -> 
             raise StateCorruptionError(
                 f"paid usage {record.response_id!r} has no owning workflow stage"
             )
+        if record.stage in internal_stages:
+            # Internal paid calls remain in the usage journal and budget, but do not
+            # own a resumable workflow-stage checkpoint.
+            continue
         try:
             stage = StageName(record.stage)
         except ValueError as exc:
@@ -1185,6 +1190,11 @@ class WorkflowRunner:
                 "max_concurrent_first_level_agents": (
                     self.config.effective_max_concurrent_first_level_agents
                 ),
+                "effective_research_model_call_concurrency": (
+                    self.config.effective_research_model_call_concurrency
+                ),
+                "capacity_scope": "run",
+                "global_capacity_constraint": None,
             }
         )
         state.metadata["configuration_summary"] = summary
@@ -2269,19 +2279,10 @@ class WorkflowRunner:
                         minimum_initial_assignments=max(
                             4, self.config.research.num_first_level_agents
                         ),
+                        # This semaphore is created inside this run's research
+                        # invocation; there is no process-global MATEK capacity pool.
                         maximum_concurrent_agents=(
-                            # Initial workers and later refills share this effective pool.
-                            # Search-enabled Codex calls must satisfy both backend ceilings.
-                            min(
-                                self.config.effective_max_concurrent_first_level_agents,
-                                self.config.codex.max_concurrent_model_calls,
-                                self.config.codex.max_concurrent_web_model_calls,
-                            )
-                            if self.config.backend.provider == "codex"
-                            else min(
-                                self.config.effective_max_concurrent_first_level_agents,
-                                self.config.api.max_concurrent_model_calls,
-                            )
+                            self.config.effective_research_model_call_concurrency
                         ),
                         max_concurrent_agents=self.config.research.max_concurrent_agents,
                         maximum_pending_assignments=(self.config.research.max_pending_assignments),

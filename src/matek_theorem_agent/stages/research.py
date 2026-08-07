@@ -3369,12 +3369,12 @@ async def run_adaptive_research(
             },
             "private_artifact_workspace": {
                 "enabled": callable(getattr(worker_client, "for_workspace", None)),
-                "writable_relative_path": "scratch",
-                "declaration_path_base": "scratch",
+                "writable_relative_path": ".",
+                "declaration_path_base": ".",
                 "instruction": (
                     "When enabled, write computation code, inputs, expected stdout/stderr, and "
-                    "certificate outputs only beneath ./scratch. In artifact_manifest, paths "
-                    "are relative to ./scratch (omit the scratch/ prefix). Declare every file; "
+                    "certificate outputs only beneath the current private workspace. In "
+                    "artifact_manifest, paths are relative to that workspace. Declare every file; "
                     "MATEK rejects symlinks, undeclared files, quota excess, worker-supplied "
                     "digests, and unreplayed computation claims."
                 ),
@@ -7626,7 +7626,7 @@ async def run_adaptive_research(
         if callable(workspace_factory):
             try:
                 selected_worker_client = workspace_factory(
-                    scratch.parent,
+                    scratch,
                     writable_paths=(scratch,),
                 )
             except TypeError:

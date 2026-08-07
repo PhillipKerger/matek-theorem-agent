@@ -442,10 +442,17 @@ def find_run_root(project_root: Path, run_id: str) -> Path:
 def latest_run_root(project_root: Path) -> Path | None:
     """Return the latest valid run workspace by its embedded UTC timestamp, if any."""
 
+    valid = list_run_roots(project_root)
+    return max(valid, key=lambda item: (_run_id_timestamp(item.name), item.name), default=None)
+
+
+def list_run_roots(project_root: Path) -> list[Path]:
+    """Return every valid, non-symlinked run workspace in chronological order."""
+
     root = project_root.expanduser().resolve(strict=True)
     runs_root = ensure_path_confined(root, root / ".matek" / "runs")
     if not runs_root.is_dir():
-        return None
+        return []
     valid: list[Path] = []
     for candidate in runs_root.iterdir():
         try:
@@ -453,9 +460,9 @@ def latest_run_root(project_root: Path) -> Path | None:
             resolved = ensure_path_confined(runs_root, candidate)
         except WorkspaceError:
             continue
-        if resolved.is_dir():
+        if resolved.is_dir() and not candidate.is_symlink():
             valid.append(resolved)
-    return max(valid, key=lambda item: (_run_id_timestamp(item.name), item.name), default=None)
+    return sorted(valid, key=lambda item: (_run_id_timestamp(item.name), item.name))
 
 
 def latest_run_root_for_problem(project_root: Path, problem_file: Path) -> Path:

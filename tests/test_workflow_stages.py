@@ -2587,7 +2587,7 @@ class CandidateComputationResearchClient(SuccessfulResearchClient):
         writable_paths: tuple[Path, ...],
     ) -> CandidateComputationResearchClient:
         assert len(writable_paths) == 1
-        self.workspaces[workspace_root.name] = writable_paths[0]
+        self.workspaces[workspace_root.parent.name] = writable_paths[0]
         return self
 
     @staticmethod
@@ -5981,6 +5981,55 @@ async def test_first_complete_proof_is_audited_without_draining_the_worker_pool(
     assert list((tmp_path / "candidate" / "attempts").glob("event-*-attempt-1/package.json"))
     assert (tmp_path / "candidate" / "package.json").is_file()
     assert (tmp_path / "verdict.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_research_runs_each_receive_their_configured_capacity(
+    tmp_path: Path,
+) -> None:
+    class SharedCapacity:
+        def __init__(self) -> None:
+            self.active_workers = 0
+            self.all_started = asyncio.Event()
+
+    class RunLocalCapacityClient(SuccessfulResearchClient):
+        def __init__(self, shared: SharedCapacity) -> None:
+            super().__init__()
+            self.shared = shared
+
+        async def generate_structured(
+            self, request: ModelRequest, output_type: type[Any]
+        ) -> ModelResult[Any]:
+            if output_type is not ResearchWorkerReport:
+                return await super().generate_structured(request, output_type)
+            self.shared.active_workers += 1
+            if self.shared.active_workers == 4:
+                self.shared.all_started.set()
+            try:
+                await asyncio.wait_for(self.shared.all_started.wait(), timeout=2)
+                return await super().generate_structured(request, output_type)
+            finally:
+                self.shared.active_workers -= 1
+
+    shared = SharedCapacity()
+    clients = [RunLocalCapacityClient(shared), RunLocalCapacityClient(shared)]
+    settings = ResearchWorkflowSettings(maximum_concurrent_agents=2)
+
+    results = await asyncio.gather(
+        *(
+            run_adaptive_research(
+                client=client,
+                compiled_problem=compiled_problem(),
+                research_dir=tmp_path / f"run-{index}",
+                workflow_settings=settings,
+            )
+            for index, client in enumerate(clients)
+        )
+    )
+
+    assert all(result.outcome is ResearchOutcome.ACCEPTED for result in results)
+    assert shared.all_started.is_set()
+    assert [client.maximum_active for client in clients] == [2, 2]
 
 
 @pytest.mark.asyncio

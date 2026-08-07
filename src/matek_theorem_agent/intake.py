@@ -278,6 +278,11 @@ def ingest_problem(
                 "max_concurrent_first_level_agents": (
                     config.effective_max_concurrent_first_level_agents
                 ),
+                "effective_research_model_call_concurrency": (
+                    config.effective_research_model_call_concurrency
+                ),
+                "capacity_scope": "run",
+                "global_capacity_constraint": None,
                 "knowledge_graph_collection": ".matek/knowledge",
                 "graph_maximum_context_nodes": config.graph.maximum_context_nodes,
                 "graph_maximum_context_characters": config.graph.maximum_context_characters,

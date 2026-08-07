@@ -877,25 +877,37 @@ class CodexCliModelClient:
         """Bind one research worker to an existing private workspace.
 
         This is an explicit authority grant available only after the client has been bound to
-        the ``research-worker`` role.  Codex receives ``workspace-write`` for the private ``-C``
-        root, while MATEK's post-call guard accepts changes only beneath the declared writable
-        subdirectories.  Trace artifacts may remain in the original run root.
+        the ``research-worker`` role.  The private ``-C`` root, Codex's ``workspace-write``
+        sandbox, and MATEK's post-call guard all use the same canonical directory. Trace
+        artifacts may remain in the original run root.
         """
 
         if self._stage != "research" or self._role != "research-worker":
             raise ValueError("writable workspace binding is restricted to the research-worker role")
-        workspace = _existing_directory(workspace_root, "Codex bound workspace root")
+        if self._run_root is None:
+            raise ValueError("Codex bound workspace requires an active run root")
+        workspace = _existing_canonical_directory(
+            workspace_root, "Codex bound workspace root"
+        )
         workspace = ensure_path_confined(self._confinement_root, workspace)
-        if not writable_paths:
-            raise ValueError("Codex bound workspace requires an explicit writable path set")
-        resolved_writable: list[Path] = []
-        for path in writable_paths:
-            writable = _existing_directory(path, "Codex bound writable path")
-            writable = ensure_path_confined(workspace, writable)
-            if not os.access(writable, os.W_OK):
-                raise ValueError(f"Codex bound writable path is not writable: {path}")
-            if writable not in resolved_writable:
-                resolved_writable.append(writable)
+        private_root = _existing_directory(
+            self._run_root / "research" / "workspaces",
+            "Codex research workspace collection",
+        )
+        workspace = ensure_path_confined(private_root, workspace)
+        if workspace.name != "scratch" or workspace.parent.parent != private_root:
+            raise ValueError(
+                "Codex bound workspace must be one assignment's private scratch directory"
+            )
+        if len(writable_paths) != 1:
+            raise ValueError("Codex bound workspace requires one explicit writable path")
+        writable = _existing_canonical_directory(
+            writable_paths[0], "Codex bound writable path"
+        )
+        if writable != workspace:
+            raise ValueError("Codex bound writable path must equal its private workspace root")
+        if not os.access(writable, os.W_OK):
+            raise ValueError(f"Codex bound writable path is not writable: {writable_paths[0]}")
         return type(self)(
             workspace,
             executable=self._executable,
@@ -917,7 +929,7 @@ class CodexCliModelClient:
             _role=self._role,
             _resume_session_id=self._resume_session_id,
             _confinement_root=self._confinement_root,
-            _bound_writable_paths=tuple(resolved_writable),
+            _bound_writable_paths=(writable,),
         )
 
     def with_session(self, session_id: str) -> Self:
@@ -1109,9 +1121,14 @@ class CodexCliModelClient:
                     },
                     confinement_root=run_root,
                 )
+                integrity_root = (
+                    self._workspace_root
+                    if self._bound_writable_paths is not None
+                    else self._confinement_root
+                )
                 before = (
                     _workspace_snapshot(
-                        self._confinement_root,
+                        integrity_root,
                         run_root,
                         included_root=(
                             self._workspace_root if self._bound_writable_paths is not None else None
@@ -1130,7 +1147,7 @@ class CodexCliModelClient:
                 result = await self._run_command(command, artifacts, run_root)
                 after = (
                     _workspace_snapshot(
-                        self._confinement_root,
+                        integrity_root,
                         run_root,
                         included_root=(
                             self._workspace_root if self._bound_writable_paths is not None else None
@@ -1143,7 +1160,7 @@ class CodexCliModelClient:
                     unauthorized = _unauthorized_changes(
                         before,
                         after,
-                        workspace=self._confinement_root,
+                        workspace=integrity_root,
                         allowed_roots=(
                             policy.allowed_write_paths
                             if self._bound_writable_paths is not None
@@ -2181,6 +2198,19 @@ def _existing_directory(path: Path, label: str) -> Path:
         raise ValueError(f"{label} does not exist: {path}") from exc
     if not resolved.is_dir() or resolved == Path(resolved.anchor):
         raise ValueError(f"{label} must be a non-root directory: {path}")
+    return resolved
+
+
+def _existing_canonical_directory(path: Path, label: str) -> Path:
+    """Reject traversal and symlink spellings at a write-capability boundary."""
+
+    expanded = path.expanduser()
+    if ".." in expanded.parts:
+        raise ValueError(f"{label} must use its canonical path without traversal or symlinks")
+    resolved = _existing_directory(path, label)
+    lexical = Path(os.path.abspath(expanded))
+    if lexical != resolved:
+        raise ValueError(f"{label} must use its canonical path without traversal or symlinks")
     return resolved
 
 
