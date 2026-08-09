@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 — 2026-08-08
 
 - Fixed the post-call Codex integrity guard stopping runs for changes it cannot attribute. A
   bound research worker is no longer re-hashed after its call: Codex's `workspace-write` sandbox
