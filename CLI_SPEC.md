@@ -397,6 +397,8 @@ records the result at `ledgers/migrations/<plan-sha256>.application.json`.
 Scientific failure is represented in the report/status, not necessarily as a process crash.
 Recoverable provider, schema, evidence, scientific, and resource failures likewise return a
 truthful paused or partial status after checkpointing. Artifact/state corruption, unsafe paths,
-security failures, and unauthorized writes retain hard-failure exit semantics.
+security failures, and unauthorized writes to the user project outside `.matek` retain
+hard-failure exit semantics; unattributable changes inside the shared `.matek` state tree are
+warnings.
 An input with several plausible mathematical targets proceeds under the most likely explicitly
 stated assumption. The terminal output, status, and report surface that assumption and warning.

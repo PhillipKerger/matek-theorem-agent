@@ -15,7 +15,6 @@ from matek_theorem_agent.codex_model_backend import (
     CodexCliModelClient,
     CodexErrorKind,
     CodexInputTooLargeError,
-    CodexInternalIsolationError,
     CodexModelUnavailableError,
     CodexNetworkOrSearchUnavailableError,
     CodexNotAuthenticatedError,
@@ -27,7 +26,6 @@ from matek_theorem_agent.codex_model_backend import (
     CodexSchemaValidationError,
     CodexStagePolicy,
     CodexUnauthorizedFileChangeError,
-    _private_workspace_snapshot,
     classify_codex_failure,
     parse_codex_auth_status,
     parse_codex_capabilities,
@@ -295,6 +293,25 @@ class ForeignRunWritingCodexBackend(FakeCodexBackend):
         if request in self.exec_requests:
             self.foreign_path.parent.mkdir(parents=True, exist_ok=True)
             self.foreign_path.write_text("changed\n", encoding="utf-8")
+        return result
+
+
+class ControlDirectoryCodexBackend(FakeCodexBackend):
+    """Emulate Codex creating its own runtime control directories at its ``-C`` root."""
+
+    def __init__(self) -> None:
+        super().__init__(["success"])
+
+    async def run(self, request: CommandRequest) -> CommandResult:
+        result = await super().run(request)
+        if request in self.exec_requests:
+            for name in (".agents", ".codex", ".git"):
+                control = request.cwd / name
+                control.mkdir(exist_ok=True)
+                (control / "state.bin").write_bytes(b"codex-runtime")
+            scratch = request.cwd / "scratch"
+            scratch.mkdir(exist_ok=True)
+            (scratch / "search.py").write_text("print('search')\n", encoding="utf-8")
         return result
 
 
@@ -810,31 +827,55 @@ async def test_workspace_write_detects_unauthorized_change(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_only_scratch(
+async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_workspace(
     tmp_path: Path,
 ) -> None:
     run_root = _run_root(tmp_path)
-    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
-    scratch = assignment_root / "scratch"
-    scratch.mkdir(parents=True)
+    workspace = run_root / "research" / "workspaces" / "assignment-01"
+    (workspace / "scratch").mkdir(parents=True)
     backend = WorkspaceWritingCodexBackend(tmp_path, "scratch")
     worker = (
         CodexCliModelClient(tmp_path, backend=backend)
         .for_stage("research", run_root=run_root, role="research-worker")
-        .for_workspace(scratch, writable_paths=(scratch,))
+        .for_workspace(workspace, writable_paths=(workspace,))
     )
 
     result = await worker.generate_structured(_request(web_search=False), Answer)
 
     assert result.parsed.answer == 42
-    assert (scratch / "certificate.txt").read_text(encoding="utf-8") == "changed\n"
+    assert (workspace / "certificate.txt").read_text(encoding="utf-8") == "changed\n"
     command = backend.exec_requests[0]
-    assert command.cwd == scratch
-    assert command.argv[command.argv.index("-C") + 1] == str(scratch)
+    assert command.cwd == workspace
+    assert command.argv[command.argv.index("-C") + 1] == str(workspace)
     assert command.argv[command.argv.index("--sandbox") + 1] == "workspace-write"
     output_path = Path(command.argv[command.argv.index("--output-last-message") + 1])
     assert output_path.is_relative_to(run_root)
-    assert not output_path.is_relative_to(assignment_root)
+    assert not output_path.is_relative_to(workspace)
+
+
+@pytest.mark.asyncio
+async def test_research_worker_accepts_codex_control_directories_in_private_root(
+    tmp_path: Path,
+) -> None:
+    run_root = _run_root(tmp_path)
+    workspace = run_root / "research" / "workspaces" / "assignment-01"
+    (workspace / "scratch").mkdir(parents=True)
+    backend = ControlDirectoryCodexBackend()
+    worker = (
+        CodexCliModelClient(tmp_path, backend=backend)
+        .for_stage("research", run_root=run_root, role="research-worker")
+        .for_workspace(workspace, writable_paths=(workspace,))
+    )
+
+    result = await worker.generate_structured(_request(web_search=False), Answer)
+
+    # Codex created its runtime control directories at its own -C root; MATEK must collect
+    # the schema-valid report instead of rejecting those worker-owned directories.
+    assert result.parsed.answer == 42
+    assert (workspace / ".agents").is_dir()
+    assert (workspace / ".codex").is_dir()
+    assert (workspace / ".git").is_dir()
+    assert result.request_metadata["integrity_warnings"] == []
 
 
 @pytest.mark.asyncio
@@ -843,16 +884,16 @@ async def test_concurrent_runs_ignore_each_others_graph_and_workspace_writes(
 ) -> None:
     backend = ConcurrentWorkspaceCodexBackend()
     workers: list[CodexCliModelClient] = []
-    scratches: list[Path] = []
+    workspaces: list[Path] = []
     for suffix in ("a", "b"):
         run_root = tmp_path / ".matek" / "runs" / f"test-run-{suffix}"
-        scratch = run_root / "research" / "workspaces" / f"assignment-{suffix}" / "scratch"
-        scratch.mkdir(parents=True)
-        scratches.append(scratch)
+        workspace = run_root / "research" / "workspaces" / f"assignment-{suffix}"
+        (workspace / "scratch").mkdir(parents=True)
+        workspaces.append(workspace)
         workers.append(
             CodexCliModelClient(tmp_path, backend=backend, max_attempts=1)
             .for_stage("research", run_root=run_root, role="research-worker")
-            .for_workspace(scratch, writable_paths=(scratch,))
+            .for_workspace(workspace, writable_paths=(workspace,))
         )
 
     calls = [
@@ -860,41 +901,40 @@ async def test_concurrent_runs_ignore_each_others_graph_and_workspace_writes(
         for worker in workers
     ]
     await asyncio.wait_for(backend.both_started.wait(), timeout=2)
-    # Both calls have taken their before snapshots and are now held in their private CWDs.
-    # Simulate a live Matroid worker producing normal sandbox and Python scratch artifacts while
-    # the Jantzen worker remains between its before and after integrity snapshots.
-    jantzen_scratch, matroid_scratch = scratches
-    before_jantzen = _private_workspace_snapshot(jantzen_scratch)
-    (matroid_scratch / ".agents").mkdir()
-    (matroid_scratch / ".codex").mkdir()
-    (matroid_scratch / ".git").mkdir()
-    pycache = matroid_scratch / "scratch" / "__pycache__"
+    # Both Codex exec processes are in flight, each confined to its private assignment root.
+    # Simulate a live Matroid worker producing normal sandbox and Python scratch artifacts
+    # while the Jantzen worker's call is still running.
+    jantzen_workspace, matroid_workspace = workspaces
+    (matroid_workspace / ".agents").mkdir()
+    (matroid_workspace / ".codex").mkdir()
+    (matroid_workspace / ".git").mkdir()
+    pycache = matroid_workspace / "scratch" / "__pycache__"
     pycache.mkdir(parents=True)
     (pycache / "audit_rank1_search.cpython-311.pyc").write_bytes(b"compiled")
-    (matroid_scratch / "scratch" / "audit_rank1_search.py").write_text(
+    (matroid_workspace / "scratch" / "audit_rank1_search.py").write_text(
         "print('search')\n", encoding="utf-8"
     )
-    (matroid_scratch / "scratch" / "exact_scenario_search.py").write_text(
+    (matroid_workspace / "scratch" / "exact_scenario_search.py").write_text(
         "print('scenario')\n", encoding="utf-8"
     )
-    after_jantzen = _private_workspace_snapshot(jantzen_scratch)
-    assert before_jantzen == after_jantzen
-    assert all("test-run-b" not in str(path) for path in after_jantzen)
     backend.release.set()
 
     results = await asyncio.gather(*calls)
 
     assert [result.parsed.answer for result in results] == [42, 42]
+    # Neither run observed or attributed the sibling run's writes.
+    assert all(result.request_metadata["integrity_warnings"] == [] for result in results)
     assert len(backend.exec_requests) == 2
-    assert all(request.cwd in scratches for request in backend.exec_requests)
+    assert all(request.cwd in workspaces for request in backend.exec_requests)
+    assert jantzen_workspace != matroid_workspace
 
 
 def test_research_worker_workspace_binding_rejects_broader_write_capabilities(
     tmp_path: Path,
 ) -> None:
     run_root = _run_root(tmp_path)
-    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
-    scratch = assignment_root / "scratch"
+    workspace = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = workspace / "scratch"
     scratch.mkdir(parents=True)
     sibling_graph = tmp_path / ".matek" / "knowledge" / "other-graph"
     sibling_graph.mkdir(parents=True)
@@ -902,21 +942,21 @@ def test_research_worker_workspace_binding_rejects_broader_write_capabilities(
         "research", run_root=run_root, role="research-worker"
     )
 
-    with pytest.raises(ValueError, match="private scratch"):
-        client.for_workspace(assignment_root, writable_paths=(assignment_root,))
+    with pytest.raises(ValueError, match="private root"):
+        client.for_workspace(scratch, writable_paths=(scratch,))
     with pytest.raises(ValueError, match="confined"):
         client.for_workspace(sibling_graph, writable_paths=(sibling_graph,))
     with pytest.raises(ValueError, match="canonical path"):
-        client.for_workspace(scratch, writable_paths=(scratch / "..",))
+        client.for_workspace(workspace, writable_paths=(workspace / "..",))
 
-    escape = scratch / "escape"
+    escape = workspace / "escape"
     escape.symlink_to(sibling_graph, target_is_directory=True)
     with pytest.raises(ValueError, match="canonical path"):
-        client.for_workspace(scratch, writable_paths=(escape,))
+        client.for_workspace(workspace, writable_paths=(escape,))
 
 
 @pytest.mark.asyncio
-async def test_foreign_run_snapshot_failure_names_both_runs_without_restore_advice(
+async def test_foreign_run_changes_warn_without_stopping_or_restore_advice(
     tmp_path: Path,
 ) -> None:
     run_a = tmp_path / ".matek" / "runs" / "run-a"
@@ -936,21 +976,27 @@ async def test_foreign_run_snapshot_failure_names_both_runs_without_restore_advi
         },
     ).for_stage("lean_formalization", run_root=run_a)
 
-    with pytest.raises(CodexInternalIsolationError) as caught:
-        await client.generate_structured(_request(web_search=False), Answer)
+    result = await client.generate_structured(_request(web_search=False), Answer)
 
-    assert caught.value.kind is CodexErrorKind.INTERNAL_ISOLATION_BUG
-    assert "run-a" in caught.value.detail
-    assert "run-b" in caught.value.detail
-    assert "do not restore" in caught.value.remedy.casefold()
+    # A change below a sibling run's root can never be attributed to this call, so it is
+    # recorded as a durable warning naming both runs instead of stopping either run.
+    assert result.parsed.answer == 42
+    warnings = result.request_metadata["integrity_warnings"]
+    assert any("run-b" in warning for warning in warnings)
+    assert all("restore" not in warning.casefold() for warning in warnings)
+    call_root = Path(str(result.request_metadata["artifacts"]["call_root"]))
+    integrity = json.loads((call_root / "integrity.json").read_text(encoding="utf-8"))
+    assert integrity["disposition"] == "warning"
+    assert integrity["run_id"] == "run-a"
+    assert integrity["foreign_run_ids"] == ["run-b"]
 
 
-def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
+def test_workspace_binding_validates_role_confinement_and_explicit_root(
     tmp_path: Path,
 ) -> None:
     run_root = _run_root(tmp_path)
-    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
-    scratch = assignment_root / "scratch"
+    workspace = run_root / "research" / "workspaces" / "assignment-01"
+    scratch = workspace / "scratch"
     scratch.mkdir(parents=True)
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
@@ -958,8 +1004,8 @@ def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
 
     with pytest.raises(ValueError, match="research-worker"):
         client.for_stage("audit", run_root=run_root, role="hostile").for_workspace(
-            scratch,
-            writable_paths=(scratch,),
+            workspace,
+            writable_paths=(workspace,),
         )
     with pytest.raises(ValueError, match="confined"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
@@ -967,28 +1013,27 @@ def test_workspace_binding_validates_role_confinement_and_explicit_scratch(
         )
     with pytest.raises(ValueError, match="explicit writable"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
-            scratch
+            workspace
         )
-    with pytest.raises(ValueError, match="private scratch"):
+    with pytest.raises(ValueError, match="private root"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
-            assignment_root, writable_paths=(assignment_root,)
+            scratch, writable_paths=(scratch,)
         )
     with pytest.raises(ValueError, match="does not exist"):
         client.for_stage("research", run_root=run_root, role="research-worker").for_workspace(
-            scratch,
-            writable_paths=(assignment_root / "missing",),
+            workspace,
+            writable_paths=(workspace / "missing",),
         )
 
 
 def test_workspace_binding_is_dropped_when_cloned_for_another_role(tmp_path: Path) -> None:
     run_root = _run_root(tmp_path)
-    assignment_root = run_root / "research" / "workspaces" / "assignment-01"
-    scratch = assignment_root / "scratch"
-    scratch.mkdir(parents=True)
+    workspace = run_root / "research" / "workspaces" / "assignment-01"
+    (workspace / "scratch").mkdir(parents=True)
     bound = (
         CodexCliModelClient(tmp_path, backend=FakeCodexBackend())
         .for_stage("research", run_root=run_root, role="research-worker")
-        .for_workspace(scratch, writable_paths=(scratch,))
+        .for_workspace(workspace, writable_paths=(workspace,))
     )
 
     coordinator = bound.for_stage(

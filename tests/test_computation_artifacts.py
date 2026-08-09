@@ -174,6 +174,8 @@ def test_assignment_workspace_is_deterministic_private_and_confined(tmp_path: Pa
     assert prepare_assignment_workspace(run_root, "worker-01") == expected
     assert prepare_assignment_workspace(run_root, "worker-01") == expected
     assert stat_mode(expected) == 0o700
+    # The assignment root is the private Codex -C root and writable domain.
+    assert stat_mode(expected.parent) == 0o700
 
     with pytest.raises(ValueError, match="assignment ID"):
         assignment_workspace_path(run_root, "../escape")

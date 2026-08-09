@@ -128,11 +128,10 @@ files atomically. Reports use relative artifact paths. Generated output and prov
 untrusted input.
 
 Each research assignment also receives a private `0700` root at
-`research/workspaces/<assignment-id>/`; only its `scratch/` child is writable. A worker-capable
-Codex client is rebound directly to that canonical scratch root, so the Codex sandbox and the
-post-call integrity snapshot have the same capability. The snapshot never covers sibling runs,
-graphs, or the project as a whole. Declared computation
-files are collected into
+`research/workspaces/<assignment-id>/`. A worker-capable Codex client is rebound directly to
+that canonical root, so Codex's `workspace-write` sandbox and `-C` root are the same directory
+and Codex's own control directories (`.agents`, `.codex`, `.git`) are worker-owned state. Its
+`scratch/` child is the declared evidence area: computation files beneath it are collected into
 `research/computations/blobs/sha256/`, bound by an immutable manifest, and replayed in a fresh
 workspace only through an injected backend that attests both filesystem confinement and disabled
 networking. The current trusted replay backend is restricted Docker; native replay is refused.
@@ -229,8 +228,12 @@ The event loop is:
 Recoverable provider/schema failures are assignment or audit events, not scheduler-wide
 exceptions. Workers receive one bounded repair generation. Audits checkpoint independently, so a
 candidate with missing checks remains `AWAITING_AUDITS` and resume reuses every committed audit.
-Only security, state-corruption, path-confinement, unauthorized-write, and immutable-artifact
-integrity failures cross the orchestration boundary as hard stops.
+Only security, state-corruption, path-confinement, and immutable-artifact integrity failures
+cross the orchestration boundary as hard stops. A write-capable Codex call that changes the user
+project outside its run and `.matek` still fails closed, but changes confined to the shared
+`.matek` state tree — including a concurrent run's root, worker workspace, or knowledge graph —
+are unattributable to one call and are recorded as warnings, never as a reason to stop a run or
+restore another run's files.
 
 `ResearchContinuityState` is a derived navigation index separating promising, partial, refuted,
 and blocked routes with their mathematical evidence. It may help fit a fresh model context, but it

@@ -90,7 +90,6 @@ class CodexErrorKind(StrEnum):
     OUTPUT_MISSING = "CODEX_OUTPUT_MISSING"
     SESSION_RESUME_FAILED = "CODEX_SESSION_RESUME_FAILED"
     UNAUTHORIZED_FILE_CHANGE = "CODEX_UNAUTHORIZED_FILE_CHANGE"
-    INTERNAL_ISOLATION_BUG = "CODEX_INTERNAL_ISOLATION_BUG"
     UNKNOWN_ERROR = "CODEX_UNKNOWN_ERROR"
 
 
@@ -203,10 +202,6 @@ class CodexUnauthorizedFileChangeError(CodexBackendError):
     pass
 
 
-class CodexInternalIsolationError(CodexBackendError):
-    pass
-
-
 class CodexUnknownError(CodexBackendError):
     pass
 
@@ -230,7 +225,6 @@ _ERROR_CLASSES: Mapping[CodexErrorKind, type[CodexBackendError]] = {
     CodexErrorKind.OUTPUT_MISSING: CodexOutputMissingError,
     CodexErrorKind.SESSION_RESUME_FAILED: CodexSessionResumeError,
     CodexErrorKind.UNAUTHORIZED_FILE_CHANGE: CodexUnauthorizedFileChangeError,
-    CodexErrorKind.INTERNAL_ISOLATION_BUG: CodexInternalIsolationError,
     CodexErrorKind.UNKNOWN_ERROR: CodexUnknownError,
 }
 
@@ -883,9 +877,10 @@ class CodexCliModelClient:
         """Bind one research worker to an existing private workspace.
 
         This is an explicit authority grant available only after the client has been bound to
-        the ``research-worker`` role.  The private ``-C`` root, Codex's ``workspace-write``
-        sandbox, and MATEK's post-call guard all use the same canonical directory. Trace
-        artifacts may remain in the original run root.
+        the ``research-worker`` role.  The private ``-C`` root and Codex's ``workspace-write``
+        sandbox use the same canonical assignment root, so Codex's own control directories
+        (``.agents``, ``.codex``, ``.git``) are worker-owned state. Trace artifacts may remain
+        in the original run root.
         """
 
         if self._stage != "research" or self._role != "research-worker":
@@ -901,9 +896,9 @@ class CodexCliModelClient:
             "Codex research workspace collection",
         )
         workspace = ensure_path_confined(private_root, workspace)
-        if workspace.name != "scratch" or workspace.parent.parent != private_root:
+        if workspace.parent != private_root:
             raise ValueError(
-                "Codex bound workspace must be one assignment's private scratch directory"
+                "Codex bound workspace must be one assignment's private root"
             )
         if len(writable_paths) != 1:
             raise ValueError("Codex bound workspace requires one explicit writable path")
@@ -1128,18 +1123,19 @@ class CodexCliModelClient:
                     confinement_root=run_root,
                 )
                 bound_worker_workspace = self._bound_writable_paths is not None
-                integrity_root = (
-                    self._workspace_root if bound_worker_workspace else self._confinement_root
-                )
+                # A bound research worker's Codex process is already confined by its
+                # ``workspace-write`` sandbox to the canonical private scratch directory,
+                # which is also its only writable root: a before/after diff there could
+                # only re-hash the worker's own files, and a wider diff would misattribute
+                # concurrent runs' legitimate writes to this call. Integrity snapshots
+                # therefore run only for workspace-write stages whose writable scope is
+                # narrower than the confinement root.
                 before = (
-                    (
-                        _private_workspace_snapshot(integrity_root)
-                        if bound_worker_workspace
-                        else _workspace_snapshot(integrity_root, run_root)
-                    )
-                    if policy.sandbox == "workspace-write"
+                    _workspace_snapshot(self._confinement_root, run_root)
+                    if policy.sandbox == "workspace-write" and not bound_worker_workspace
                     else None
                 )
+                integrity_warnings: list[str] = []
                 command = CommandRequest(
                     argv=argv,
                     cwd=self._workspace_root,
@@ -1148,12 +1144,11 @@ class CodexCliModelClient:
                     max_output_bytes=self._max_output_bytes,
                 )
                 result = await self._run_command(command, artifacts, run_root)
+                # Persist the raw event stream and stderr before any post-call check can
+                # raise, so an integrity failure never loses the diagnostic trace.
+                self._persist_partial_result(result, artifacts, run_root)
                 after = (
-                    (
-                        _private_workspace_snapshot(integrity_root)
-                        if bound_worker_workspace
-                        else _workspace_snapshot(integrity_root, run_root)
-                    )
+                    _workspace_snapshot(self._confinement_root, run_root)
                     if before is not None
                     else None
                 )
@@ -1161,45 +1156,61 @@ class CodexCliModelClient:
                     unauthorized = _unauthorized_changes(
                         before,
                         after,
-                        workspace=integrity_root,
-                        allowed_roots=(
-                            policy.allowed_write_paths
-                            if bound_worker_workspace
-                            else (run_root, *policy.allowed_write_paths)
-                        ),
+                        workspace=self._confinement_root,
+                        allowed_roots=(run_root, *policy.allowed_write_paths),
                     )
                     if unauthorized:
-                        foreign_run_ids = _foreign_run_ids(
-                            unauthorized,
-                            workspace=integrity_root,
-                            run_root=run_root,
+                        user_tree_changes, state_tree_changes = (
+                            _partition_state_tree_changes(
+                                unauthorized,
+                                workspace=self._confinement_root,
+                                run_root=run_root,
+                            )
                         )
-                        if foreign_run_ids:
+                        if user_tree_changes:
                             raise _AttemptException(
                                 _AttemptFailure(
                                     CodexFailureClassification(
-                                        CodexErrorKind.INTERNAL_ISOLATION_BUG,
+                                        CodexErrorKind.UNAUTHORIZED_FILE_CHANGE,
                                         False,
-                                        "Do not restore files: MATEK detected an internal "
-                                        "cross-run snapshot-isolation failure. Preserve both "
-                                        "runs and report this diagnostic.",
+                                        "Inspect the changed-file list and restore unauthorized "
+                                        "files before resuming.",
                                     ),
-                                    "Integrity snapshot included path(s) owned by run(s) "
-                                    + ", ".join(foreign_run_ids)
-                                    + f" while checking run {run_root.name}.",
+                                    "Codex changed unauthorized path(s): "
+                                    + ", ".join(user_tree_changes[:12]),
                                 )
                             )
-                        raise _AttemptException(
-                            _AttemptFailure(
-                                CodexFailureClassification(
-                                    CodexErrorKind.UNAUTHORIZED_FILE_CHANGE,
-                                    False,
-                                    "Inspect the changed-file list and restore unauthorized files "
-                                    "before resuming.",
-                                ),
-                                "Codex changed unauthorized path(s): "
-                                + ", ".join(unauthorized[:12]),
+                        # Changes confined to the shared .matek state tree cannot be
+                        # attributed to this call: a concurrent run legitimately writes
+                        # its own run root, worker workspaces, locks, and knowledge
+                        # graphs while this call is between snapshots. Record them as a
+                        # durable warning instead of stopping either run, and never
+                        # advise restoring another run's files.
+                        foreign_run_ids = _foreign_run_ids(
+                            state_tree_changes,
+                            workspace=self._confinement_root,
+                            run_root=run_root,
+                        )
+                        integrity_warnings.append(
+                            "MATEK state outside this run changed during the call"
+                            + (
+                                " (concurrent run(s): " + ", ".join(foreign_run_ids) + ")"
+                                if foreign_run_ids
+                                else ""
                             )
+                            + ": "
+                            + ", ".join(state_tree_changes[:12])
+                        )
+                        atomic_write_json(
+                            artifacts.call_root / "integrity.json",
+                            {
+                                "schema_version": 1,
+                                "disposition": "warning",
+                                "run_id": run_root.name,
+                                "foreign_run_ids": list(foreign_run_ids),
+                                "state_tree_changes": state_tree_changes,
+                            },
+                            confinement_root=run_root,
                         )
 
                 summary = self._validate_result(result, artifacts, run_root)
@@ -1244,6 +1255,7 @@ class CodexCliModelClient:
                     "schema_sha256": schema_sha256,
                     "session_id": summary.session_id,
                     "item_counts": dict(summary.item_counts),
+                    "integrity_warnings": list(integrity_warnings),
                     "artifacts": {
                         "call_root": str(artifacts.call_root),
                         "schema": str(artifacts.schema_path),
@@ -2005,7 +2017,13 @@ def _workspace_snapshot(
     workspace: Path,
     run_root: Path,
 ) -> dict[Path, tuple[str, int]]:
-    """Snapshot a general workspace while excluding application-owned run traces."""
+    """Snapshot a general workspace while excluding application-owned run traces.
+
+    The current run's own root is excluded because MATEK itself writes traces,
+    journals, and sibling worker workspaces there while the call is in flight.
+    Everything else — including other runs' roots — is walked by the caller's
+    choice of ``workspace`` and classified afterwards.
+    """
 
     resolved_workspace = workspace.resolve(strict=True)
     resolved_run_root = run_root.resolve(strict=True)
@@ -2016,19 +2034,6 @@ def _workspace_snapshot(
         return "exclude"
 
     return _snapshot_tree(resolved_workspace, disposition=disposition)
-
-
-def _private_workspace_snapshot(workspace: Path) -> dict[Path, tuple[str, int]]:
-    """Snapshot exactly one private worker workspace.
-
-    This deliberately has no run-root argument or exclusion/reinclusion logic.  A bound
-    research worker may write only its canonical ``scratch`` directory, so starting the walk
-    at that directory is the complete integrity domain.  In particular, a sibling run cannot
-    be observed or attributed while this snapshot is taken.
-    """
-
-    resolved_workspace = workspace.resolve(strict=True)
-    return _snapshot_tree(resolved_workspace, disposition=lambda _path: "include")
 
 
 def _snapshot_tree(
@@ -2102,16 +2107,49 @@ def _unauthorized_changes(
     return unauthorized
 
 
+def _partition_state_tree_changes(
+    changed_paths: Sequence[str],
+    *,
+    workspace: Path,
+    run_root: Path,
+) -> tuple[list[str], list[str]]:
+    """Split changed paths into user-project files and shared MATEK state.
+
+    The shared state tree (``.matek/``) holds every run's private root, worker
+    workspaces, locks, and knowledge graphs.  A before/after snapshot cannot
+    attribute those changes to the current call while runs execute concurrently,
+    so callers must treat them as warnings rather than unauthorized writes.
+    Returns ``(user_tree_changes, state_tree_changes)``.
+    """
+
+    lexical_workspace = Path(os.path.abspath(workspace))
+    lexical_run_root = Path(os.path.abspath(run_root))
+    state_root = (
+        lexical_run_root.parent.parent
+        if lexical_run_root.parent.name == "runs"
+        else lexical_run_root.parent
+    )
+    user_tree: list[str] = []
+    state_tree: list[str] = []
+    for changed in changed_paths:
+        candidate = Path(os.path.abspath(lexical_workspace / changed))
+        if candidate == state_root or candidate.is_relative_to(state_root):
+            state_tree.append(changed)
+        else:
+            user_tree.append(changed)
+    return user_tree, state_tree
+
+
 def _foreign_run_ids(
     changed_paths: Sequence[str],
     *,
     workspace: Path,
     run_root: Path,
 ) -> tuple[str, ...]:
-    """Return sibling run IDs that reached an integrity comparison unexpectedly.
+    """Return sibling run IDs found among shared state-tree changes.
 
-    Bound-worker snapshots cannot produce these paths. This defensive check protects the
-    recovery instruction if a future change accidentally broadens an integrity root.
+    These identify concurrent runs in warning text; they are never a reason to
+    stop the current run or to advise restoring another run's files.
     """
 
     lexical_workspace = Path(os.path.abspath(workspace))
@@ -2334,7 +2372,6 @@ __all__ = [
     "CodexCliModelClient",
     "CodexErrorKind",
     "CodexFailureClassification",
-    "CodexInternalIsolationError",
     "CodexJsonlSummary",
     "CodexModelUnavailableError",
     "CodexNetworkOrSearchUnavailableError",

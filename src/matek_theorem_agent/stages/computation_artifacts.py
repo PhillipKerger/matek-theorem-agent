@@ -334,6 +334,14 @@ class ComputationArtifactStore:
         self.quotas = quotas or ComputationArtifactQuotas()
 
     def workspace_path(self, assignment_id: str) -> Path:
+        """Return the assignment's declared evidence area (``scratch/``).
+
+        The assignment's parent directory is the private Codex ``-C`` root and writable
+        domain so that Codex's own control directories (``.agents``, ``.codex``, ``.git``)
+        are worker-owned state; this path remains the directory whose declared files are
+        collected as computation evidence.
+        """
+
         identifier = _validate_assignment_id(assignment_id)
         return self.run_root / "research" / "workspaces" / identifier / "scratch"
 
@@ -342,6 +350,7 @@ class ComputationArtifactStore:
         _ensure_internal_directory(self.run_root, workspace, mode=0o700)
         try:
             os.chmod(workspace, 0o700)
+            os.chmod(workspace.parent, 0o700)
         except OSError as exc:
             raise _ArtifactFailure(
                 ComputationArtifactIssueCode.REPLAY_WORKSPACE_INVALID,

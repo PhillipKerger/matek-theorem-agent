@@ -2587,7 +2587,9 @@ class CandidateComputationResearchClient(SuccessfulResearchClient):
         writable_paths: tuple[Path, ...],
     ) -> CandidateComputationResearchClient:
         assert len(writable_paths) == 1
-        self.workspaces[workspace_root.parent.name] = writable_paths[0]
+        # The bound workspace is the assignment root; declared computation evidence lives in
+        # its scratch/ child.
+        self.workspaces[workspace_root.name] = writable_paths[0] / "scratch"
         return self
 
     @staticmethod

@@ -728,8 +728,11 @@ distinguish research rejection, accepted proof, manuscript draft quality, public
 statement-only or partial Lean work, approved-axiom verification, and axiom-free
 `LEAN_VERIFIED`. Example reports are available in [`examples/reports`](examples/reports).
 Recoverable provider, schema, evidence, or resource issues are reported separately from the
-strongest scientific state. Only security, state corruption, unsafe paths, unauthorized writes,
-and immutable-artifact integrity failures hard-stop a run.
+strongest scientific state. Only security, state corruption, unsafe paths, unauthorized writes
+to the user project outside `.matek`, and immutable-artifact integrity failures hard-stop a run.
+Changes confined to the shared `.matek` state tree that cannot be attributed to one call — such
+as a concurrent run's workspace or knowledge graph — are warnings and never advise restoring
+files.
 
 ## Citation and AI-usage disclosure
 

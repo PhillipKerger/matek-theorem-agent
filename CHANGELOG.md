@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Fixed the post-call Codex integrity guard stopping runs for changes it cannot attribute. A
+  bound research worker is no longer re-hashed after its call: Codex's `workspace-write` sandbox
+  already confines that process to its private assignment root, and a before/after diff could
+  only misattribute other activity (a concurrent run, or Codex's own control directories) to a
+  worker that returned a valid report. For other `workspace-write` stages, changes inside the
+  shared `.matek` state tree — including sibling run roots, worker workspaces, locks, and
+  knowledge graphs — are now recorded as durable warnings (`integrity.json` plus
+  `request_metadata["integrity_warnings"]`) instead of a non-retriable stop; only a write into
+  the user project outside `.matek` still fails closed. Recovery text no longer advises
+  restoring files owned by another run, and `events.jsonl`/`stderr.log` are persisted before any
+  integrity failure can discard them.
+- Rebased the research-worker workspace on the assignment root
+  (`research/workspaces/<assignment-id>/`) instead of only its `scratch/` child. Codex writes
+  its `.agents`, `.codex`, and `.git` control directories at its `-C` root, so the bound
+  writable domain is now the whole assignment directory; `scratch/` remains the declared area
+  whose files are collected as computation evidence. This removes the sandbox-vs-guard mismatch
+  that hard-stopped even standalone runs for Codex's own runtime directories.
+
 ## 0.7.0 — 2026-08-06
 
 - Isolated every research worker's Codex sandbox and integrity snapshot to the same canonical

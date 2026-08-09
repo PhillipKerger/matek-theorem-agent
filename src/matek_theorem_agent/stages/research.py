@@ -7621,13 +7621,17 @@ async def run_adaptive_research(
     ) -> tuple[ResearchWorkerReport, str]:
         assignment = record.assignment
         scratch = computation_store.prepare_workspace(assignment.id)
+        # The assignment root is the Codex -C root and writable domain so Codex's own
+        # control directories (.agents/.codex/.git) are worker-owned; scratch/ is the
+        # declared evidence area whose files are collected.
+        workspace = scratch.parent
         selected_worker_client = worker_client
         workspace_factory = getattr(worker_client, "for_workspace", None)
         if callable(workspace_factory):
             try:
                 selected_worker_client = workspace_factory(
-                    scratch,
-                    writable_paths=(scratch,),
+                    workspace,
+                    writable_paths=(workspace,),
                 )
             except TypeError:
                 # API and deterministic test adapters have no filesystem tool authority.

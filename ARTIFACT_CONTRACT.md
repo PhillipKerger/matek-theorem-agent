@@ -388,7 +388,9 @@ rather than silently dropping evidence.
 or resource issues, their trace paths, and exact recovery obligations. Each issue is delivered to
 the coordinator by a corresponding immutable event. Integrity failures are not quarantined: state
 corruption, immutable-artifact mismatch, unsafe paths, security failures, and unauthorized writes
-remain hard stops.
+into the user project outside the shared `.matek` state tree remain hard stops. Changes confined
+to `.matek` that cannot be attributed to one call — a concurrent run's root, worker workspace,
+lock, or knowledge graph — are recorded as warnings, never as a stop or a restore instruction.
 
 Each completed candidate audit is written beneath its attempt directory and bound into the
 canonical scheduler checkpoint immediately. An unavailable audit leaves the attempt in
