@@ -22,6 +22,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import ModelSettings
+from ..graph_ids import validate_any_node_id
 from ..openai_client import ModelClient, ModelRequest, ModelResult, model_request_cache_key
 from ..redaction import redact_text
 from ..resources import read_resource_text
@@ -201,10 +202,12 @@ class CounterexampleGraphSupport(_AuditModel):
     @field_validator("problem_id", "root_counterexample_node_id")
     @classmethod
     def graph_ids_are_valid(cls, value: str) -> str:
-        normalized = value.strip().upper()
-        if not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", normalized):
-            raise ValueError("counterexample graph support has an invalid node ID")
-        return normalized
+        try:
+            return validate_any_node_id(value)
+        except ValueError as exc:
+            raise ValueError(
+                "counterexample graph support has an invalid node ID"
+            ) from exc
 
     @field_validator("source_revision")
     @classmethod
@@ -220,27 +223,33 @@ class CounterexampleGraphSupport(_AuditModel):
         normalized: dict[str, list[str]] = {}
         for local_key, node_ids in sorted(value.items()):
             key = _safe_id(local_key)
-            ids = sorted({node_id.strip().upper() for node_id in node_ids})
-            if not ids or any(
-                not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", node_id) for node_id in ids
-            ):
-                raise ValueError("counterexample result graph bindings require stable node IDs")
+            try:
+                ids = sorted({validate_any_node_id(node_id) for node_id in node_ids})
+            except ValueError as exc:
+                raise ValueError(
+                    "counterexample result graph bindings require stable node IDs"
+                ) from exc
+            if not ids:
+                raise ValueError(
+                    "counterexample result graph bindings require stable node IDs"
+                )
             normalized[key] = ids
         return normalized
 
     @field_validator("dependency_node_ids")
     @classmethod
     def dependency_ids_are_canonical(cls, values: list[str]) -> list[str]:
-        normalized = sorted({value.strip().upper() for value in values})
-        if any(not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", node_id) for node_id in normalized):
-            raise ValueError("counterexample graph dependency IDs are invalid")
-        return normalized
+        try:
+            return sorted({validate_any_node_id(value) for value in values})
+        except ValueError as exc:
+            raise ValueError("counterexample graph dependency IDs are invalid") from exc
 
     @field_validator("node_content_sha256")
     @classmethod
     def bound_node_hashes_are_valid(cls, value: dict[str, str]) -> dict[str, str]:
         return {
-            node_id.strip().upper(): _sha256(digest) for node_id, digest in sorted(value.items())
+            validate_any_node_id(node_id): _sha256(digest)
+            for node_id, digest in sorted(value.items())
         }
 
 
@@ -278,10 +287,10 @@ class CounterexampleSupportBundle(_AuditModel):
     @field_validator("dependency_node_ids")
     @classmethod
     def support_dependency_ids_are_canonical(cls, values: list[str]) -> list[str]:
-        normalized = sorted({value.strip().upper() for value in values})
-        if any(not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", node_id) for node_id in normalized):
-            raise ValueError("counterexample support dependency IDs are invalid")
-        return normalized
+        try:
+            return sorted({validate_any_node_id(value) for value in values})
+        except ValueError as exc:
+            raise ValueError("counterexample support dependency IDs are invalid") from exc
 
     @field_validator("artifact_declaration_sha256s")
     @classmethod
@@ -362,10 +371,10 @@ class ExactCounterexampleNomination(_AuditModel):
     def optional_target_id_is_normalized(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = value.strip().upper()
-        if not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", normalized):
-            raise ValueError("main target node ID is invalid")
-        return normalized
+        try:
+            return validate_any_node_id(value)
+        except ValueError as exc:
+            raise ValueError("main target node ID is invalid") from exc
 
     @model_validator(mode="after")
     def exact_contract_is_unchanged(self) -> ExactCounterexampleNomination:

@@ -344,9 +344,11 @@ def test_gap_free_result_creates_versioned_derivation_with_real_premise_edge() -
         nodes=[*existing_nodes(), premise],
     )
     derivation = next(node for node in plan.nodes if node.node_type is NodeType.DERIVATION)
+    claim = next(node for node in plan.nodes if node.node_type is NodeType.CLAIM)
 
+    assert claim.matek_id.startswith("CLAIM: ")
     assert any(
-        edge.relation is RelationType.PROVES and edge.target_id.startswith("CLM-")
+        edge.relation is RelationType.PROVES and edge.target_id == claim.matek_id
         for edge in derivation.relations
     )
     assert any(
@@ -999,3 +1001,158 @@ def test_automatic_exact_gap_is_the_canonical_main_open_cut() -> None:
     )
 
     assert smallest_known_open_cut(ledger).obligation_ids == [obligation.matek_id]
+
+
+CENTROID_STATEMENT = (
+    "For every convex body C, vol(H cap C) >= v/e when bd H contains the centroid."
+)
+
+
+def _result_with_one_liner(
+    *,
+    local_key: str,
+    statement: str,
+    one_liner: str,
+    scope: ScientificScope = ScientificScope.BRANCH,
+) -> ScientificResult:
+    return ScientificResult(
+        local_key=local_key,
+        kind=ScientificResultKind.LEMMA,
+        exact_statement=statement,
+        scope=scope,
+        one_liner=one_liner,
+        proof_or_certificate="A complete, checkable proof.",
+        disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+    )
+
+
+def test_agent_one_liner_becomes_the_descriptive_node_ids() -> None:
+    plan = admit(
+        [
+            _result_with_one_liner(
+                local_key="centroid-lemma",
+                statement=CENTROID_STATEMENT,
+                one_liner="Halfspaces through the centroid keep at least a 1/e volume fraction",
+            )
+        ]
+    )
+    claim = next(node for node in plan.nodes if node.node_type is NodeType.CLAIM)
+    derivation = next(node for node in plan.nodes if node.node_type is NodeType.DERIVATION)
+    attempt = next(node for node in plan.nodes if node.node_type is NodeType.PROOF_ATTEMPT)
+
+    assert claim.matek_id == (
+        "CLAIM: Halfspaces through the centroid keep at least a 1/e volume fraction"
+    )
+    assert claim.title == "Halfspaces through the centroid keep at least a 1/e volume fraction"
+    assert derivation.matek_id.startswith("DERIVATION: Halfspaces through the centroid")
+    assert attempt.matek_id.startswith("PROOF ATTEMPT: Halfspaces through the centroid")
+    assert claim.matek_id in {
+        edge.target_id for edge in derivation.relations if edge.relation is RelationType.PROVES
+    }
+
+
+def test_identical_statement_with_new_one_liner_coalesces_onto_existing_claim() -> None:
+    statement = CENTROID_STATEMENT
+    first = admit(
+        [
+            _result_with_one_liner(
+                local_key="lemma-a",
+                statement=statement,
+                one_liner="Centroid halfspaces keep a 1/e fraction",
+            )
+        ]
+    )
+    claim_id = next(
+        node.matek_id for node in first.nodes if node.node_type is NodeType.CLAIM
+    )
+    second = admit(
+        [
+            _result_with_one_liner(
+                local_key="lemma-b",
+                statement=statement,
+                one_liner="A totally different description of the same statement",
+            )
+        ],
+        nodes=[*existing_nodes(), *first.nodes],
+    )
+    claims = [node for node in second.nodes if node.node_type is NodeType.CLAIM]
+    assert [claim.matek_id for claim in claims] == [claim_id]
+    assert claims[0].matek_id.startswith("CLAIM: Centroid halfspaces")
+
+
+def test_distinct_statements_with_the_same_one_liner_get_numeric_suffixes() -> None:
+    plan = admit(
+        [
+            _result_with_one_liner(
+                local_key="lemma-a",
+                statement="For every n, P(n).",
+                one_liner="The same one-liner",
+            ),
+            _result_with_one_liner(
+                local_key="lemma-b",
+                statement="For every n, Q(n).",
+                one_liner="The same one-liner",
+            ),
+        ]
+    )
+    claim_ids = sorted(
+        node.matek_id for node in plan.nodes if node.node_type is NodeType.CLAIM
+    )
+    assert claim_ids == ["CLAIM: The same one-liner", "CLAIM: The same one-liner (2)"]
+
+
+def test_missing_one_liner_falls_back_to_the_exact_statement() -> None:
+    plan = admit(
+        [
+            ScientificResult(
+                local_key="plain-lemma",
+                kind=ScientificResultKind.LEMMA,
+                exact_statement="For every n, the placeholder property holds.",
+                scope=ScientificScope.BRANCH,
+                proof_or_certificate="A complete, checkable proof.",
+                disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+            )
+        ]
+    )
+    claim = next(node for node in plan.nodes if node.node_type is NodeType.CLAIM)
+    assert claim.matek_id == "CLAIM: For every n, the placeholder property holds."
+
+
+def test_obligation_one_liner_names_the_open_obligation() -> None:
+    plan = admit(
+        [result(local_key="parent-lemma", scope=ScientificScope.BRANCH)],
+        obligations=[
+            ScientificObligationDeclaration(
+                local_key="close-gap",
+                exact_statement="Prove the induction step for arbitrary n.",
+                one_liner="Close the induction step for arbitrary n",
+                conclusion="The induction step holds for arbitrary n.",
+                parent_result_keys=["parent-lemma"],
+            )
+        ],
+    )
+    obligation = next(node for node in plan.nodes if node.node_type is NodeType.OBLIGATION)
+    assert obligation.matek_id == "OBLIGATION: Close the induction step for arbitrary n"
+    assert obligation.title == "Close the induction step for arbitrary n"
+
+
+def test_obligation_retry_coalesces_by_admission_binding_not_id() -> None:
+    obligations = [
+        ScientificObligationDeclaration(
+            local_key="close-gap",
+            exact_statement="Prove the induction step for arbitrary n.",
+            one_liner="Close the induction step",
+            conclusion="The induction step holds.",
+            parent_result_keys=["parent-lemma"],
+        )
+    ]
+    first = admit(
+        [result(local_key="parent-lemma", scope=ScientificScope.BRANCH)],
+        obligations=obligations,
+    )
+    retry = admit(
+        [result(local_key="parent-lemma", scope=ScientificScope.BRANCH)],
+        nodes=[*existing_nodes(), *first.nodes],
+        obligations=obligations,
+    )
+    assert retry.nodes == []

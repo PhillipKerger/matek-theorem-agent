@@ -235,6 +235,11 @@ aliases, candidate node IDs, context, and `preserve_separate_source_nodes` decis
 `source_identity_ambiguity` issue is provenance-only and does not turn worker admission or research
 scheduling into a failure. Historical mixed-DOI notes are retained, normalized, and marked by
 `matek graph doctor --repair` with a before/after audit log so existing evidence is never deleted.
+The same doctor rule set renames legacy hash node IDs (for example, `CLM-9F2AB...`) on
+agent-authored mathematical nodes to descriptive one-liner IDs (`CLAIM: ...`, `APPROACH: ...`),
+rewriting all referencing edges, metadata, and note bodies transactionally and recording each old
+ID as `matek_legacy_node_id`; the immutable main target claim and operational nodes keep their
+stable hash IDs.
 
 A legacy-migration plan is a user-selected external artifact, conventionally
 `.matek/migration-reports/<graph-name>.json`, and must not be placed beneath

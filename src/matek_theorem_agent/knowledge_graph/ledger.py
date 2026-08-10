@@ -17,12 +17,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..graph_ids import validate_any_node_id
 from ..scientific import ScientificScope, normalize_exact_statement
 from ..workspace import atomic_write_json
 from .markdown import exact_statement
 from .models import EpistemicStatus, GraphNode, RelationType
 
-_LEDGER_ID = re.compile(r"\A[A-Z]{3}-[A-Z0-9]{8,64}\Z")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
@@ -59,10 +59,12 @@ class ObligationStatus(StrEnum):
 
 
 def _stable_id(value: str) -> str:
-    normalized = value.strip().upper()
-    if not _LEDGER_ID.fullmatch(normalized):
-        raise ValueError("ledger IDs must use PREFIX- followed by 8-64 letters or digits")
-    return normalized
+    try:
+        return validate_any_node_id(value)
+    except ValueError as exc:
+        raise ValueError(
+            "ledger IDs must be legacy PREFIX- hash IDs or descriptive 'WORD: ...' IDs"
+        ) from exc
 
 
 def _sha256(value: str) -> str:

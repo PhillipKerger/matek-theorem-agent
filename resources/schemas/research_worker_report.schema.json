@@ -149,6 +149,17 @@
           "title": "Notation Definition Version",
           "type": "string"
         },
+        "one_liner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "One Liner"
+        },
         "parent_result_keys": {
           "items": {
             "type": "string"
@@ -176,6 +187,7 @@
         "schema_version",
         "local_key",
         "exact_statement",
+        "one_liner",
         "quantifiers",
         "hypotheses",
         "conclusion",
@@ -238,6 +250,17 @@
           "title": "Local Key",
           "type": "string"
         },
+        "one_liner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "One Liner"
+        },
         "proof_or_certificate": {
           "title": "Proof Or Certificate",
           "type": "string"
@@ -264,6 +287,7 @@
         "kind",
         "exact_statement",
         "scope",
+        "one_liner",
         "assumptions",
         "proof_or_certificate",
         "exact_gap",

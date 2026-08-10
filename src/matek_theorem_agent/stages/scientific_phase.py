@@ -13,9 +13,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..graph_ids import validate_any_node_id
 from .common import StageValidationError, atomic_write_json, read_regular_text
 
-_STABLE_ID = re.compile(r"\A[A-Z]{3}-[A-Z0-9]{8,64}\Z")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
@@ -72,9 +72,12 @@ class PhaseTransitionReason(StrEnum):
 
 
 def _stable_ids(values: list[str]) -> list[str]:
-    normalized = [value.strip().upper() for value in values]
-    if any(not _STABLE_ID.fullmatch(value) for value in normalized):
-        raise ValueError("scientific frontier references must be stable graph IDs")
+    try:
+        normalized = [validate_any_node_id(value) for value in values]
+    except ValueError as exc:
+        raise ValueError(
+            "scientific frontier references must be stable graph IDs"
+        ) from exc
     return list(dict.fromkeys(normalized))
 
 

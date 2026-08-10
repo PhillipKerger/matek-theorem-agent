@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..graph_ids import LEGACY_NODE_ID, validate_any_node_id
+
 
 class _GraphModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -114,6 +116,21 @@ NODE_ID_PREFIXES: dict[NodeType, str] = {
     NodeType.HUMAN_NOTE: "HUM",
 }
 
+#: Full-word ID prefixes for agent-authored mathematical content.  These node
+#: types are minted with descriptive one-liner IDs (``CLAIM: ...``) instead of
+#: opaque hashes so agents can reference graph artifacts by meaningful names.
+NODE_ID_WORDS: dict[NodeType, str] = {
+    NodeType.CLAIM: "CLAIM",
+    NodeType.DEFINITION: "DEFINITION",
+    NodeType.APPROACH: "APPROACH",
+    NodeType.PROOF: "PROOF",
+    NodeType.PROOF_ATTEMPT: "PROOF ATTEMPT",
+    NodeType.DERIVATION: "DERIVATION",
+    NodeType.OBLIGATION: "OBLIGATION",
+    NodeType.COUNTEREXAMPLE: "COUNTEREXAMPLE",
+    NodeType.EXPERIMENT: "EXPERIMENT",
+}
+
 NODE_TYPE_DIRECTORIES: dict[NodeType, str] = {
     NodeType.PROBLEM: "Problems",
     NodeType.DEFINITION: "Definitions",
@@ -134,15 +151,24 @@ NODE_TYPE_DIRECTORIES: dict[NodeType, str] = {
     NodeType.HUMAN_NOTE: "Human Notes",
 }
 
-_NODE_ID = re.compile(r"\A[A-Z]{3}-[A-Z0-9]{8,64}\Z")
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 def validate_node_id(value: str) -> str:
-    normalized = value.strip().upper()
-    if not _NODE_ID.fullmatch(normalized):
-        raise ValueError("node ID must use PREFIX- followed by 8-64 uppercase letters or digits")
-    return normalized
+    return validate_any_node_id(value)
+
+
+def node_id_matches_type(value: str, node_type: NodeType) -> bool:
+    """Return whether one valid node ID belongs to ``node_type``.
+
+    Both legacy hash IDs (``CLM-...``) and descriptive one-liner IDs
+    (``CLAIM: ...``) are recognized.
+    """
+
+    if value.startswith(NODE_ID_PREFIXES[node_type] + "-"):
+        return bool(LEGACY_NODE_ID.fullmatch(value))
+    word = NODE_ID_WORDS.get(node_type)
+    return word is not None and value.startswith(word + ": ")
 
 
 class GraphEdge(_GraphModel):
@@ -211,9 +237,11 @@ class GraphNode(_GraphModel):
 
     @model_validator(mode="after")
     def type_specific_fields_are_consistent(self) -> GraphNode:
-        expected_prefix = NODE_ID_PREFIXES[self.node_type] + "-"
-        if not self.matek_id.startswith(expected_prefix):
-            raise ValueError(f"{self.node_type.value} node ID must start with {expected_prefix!r}")
+        if not node_id_matches_type(self.matek_id, self.node_type):
+            raise ValueError(
+                f"{self.node_type.value} node ID does not match its node type: "
+                f"{self.matek_id!r}"
+            )
         if self.node_type is NodeType.CLAIM and self.claim_type is None:
             raise ValueError("claim nodes require claim_type")
         if self.node_type is not NodeType.CLAIM and self.claim_type is not None:
@@ -253,9 +281,7 @@ class GraphNodeCreate(_GraphModel):
             raise ValueError("created claim nodes require claim_type")
         if self.node_type is not NodeType.CLAIM and self.claim_type is not None:
             raise ValueError("claim_type is permitted only on claim nodes")
-        if self.matek_id is not None and not self.matek_id.startswith(
-            NODE_ID_PREFIXES[self.node_type] + "-"
-        ):
+        if self.matek_id is not None and not node_id_matches_type(self.matek_id, self.node_type):
             raise ValueError("proposed node ID prefix does not match node_type")
         return self
 
@@ -371,8 +397,12 @@ class GraphValidationReport(_GraphModel):
 
 
 class GraphHygieneAction(_GraphModel):
-    rule: Literal["primary_identifier_in_identifiers", "multiple_doi_versions"]
-    failure_class: Literal["metadata_invariant"] = "metadata_invariant"
+    rule: Literal[
+        "primary_identifier_in_identifiers",
+        "multiple_doi_versions",
+        "legacy_hash_id_rename",
+    ]
+    failure_class: Literal["metadata_invariant", "legacy_identifier"] = "metadata_invariant"
     node_id: str
     before: dict[str, object]
     after: dict[str, object]
@@ -531,6 +561,7 @@ class GraphState(_GraphModel):
 
 __all__ = [
     "NODE_ID_PREFIXES",
+    "NODE_ID_WORDS",
     "NODE_TYPE_DIRECTORIES",
     "ClaimType",
     "EpistemicStatus",
@@ -557,5 +588,6 @@ __all__ = [
     "NodeType",
     "RelationType",
     "WorkflowStatus",
+    "node_id_matches_type",
     "validate_node_id",
 ]

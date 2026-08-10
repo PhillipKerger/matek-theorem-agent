@@ -17,6 +17,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .graph_ids import normalize_id_description, validate_any_node_id
+
 
 class _ScientificModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -52,7 +54,6 @@ class BranchOutcome(StrEnum):
 
 
 _LOCAL_KEY = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_NODE_ID = re.compile(r"\A[A-Z]{3}-[A-Z0-9]{8,64}\Z")
 _SAFE_RELATIVE_COMPONENT = re.compile(r"\A(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+\Z")
 _PROPOSITION_PREFIX = re.compile(
     r"\A\s*(?:theorem|lemma|proposition|corollary|claim|conjecture|"
@@ -94,9 +95,12 @@ def _normalize_relative_artifact_path(value: str) -> str:
 
 
 def _normalize_node_ids(values: list[str]) -> list[str]:
-    normalized = [item.strip().upper() for item in values]
-    if any(not _NODE_ID.fullmatch(item) for item in normalized):
-        raise ValueError("scientific dependencies and targets must be stable node IDs")
+    try:
+        normalized = [validate_any_node_id(item) for item in values]
+    except ValueError as exc:
+        raise ValueError(
+            "scientific dependencies and targets must be stable node IDs"
+        ) from exc
     return list(dict.fromkeys(normalized))
 
 
@@ -184,6 +188,7 @@ class ScientificResult(_ScientificModel):
     kind: ScientificResultKind
     exact_statement: str
     scope: ScientificScope
+    one_liner: str | None = None
     assumptions: list[str] = Field(default_factory=list)
     proof_or_certificate: str
     exact_gap: str | None = None
@@ -196,6 +201,14 @@ class ScientificResult(_ScientificModel):
     @classmethod
     def local_key_is_portable(cls, value: str) -> str:
         return _normalize_local_key(value)
+
+    @field_validator("one_liner")
+    @classmethod
+    def one_liner_is_normalized(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_id_description(value)
+        return normalized or None
 
     @field_validator("exact_statement", "proof_or_certificate")
     @classmethod
@@ -348,6 +361,7 @@ class ScientificObligationDeclaration(_ScientificModel):
     schema_version: Literal[1] = 1
     local_key: str
     exact_statement: str
+    one_liner: str | None = None
     quantifiers: list[str] = Field(default_factory=list)
     hypotheses: list[str] = Field(default_factory=list)
     conclusion: str
@@ -362,6 +376,14 @@ class ScientificObligationDeclaration(_ScientificModel):
     @classmethod
     def local_key_is_portable(cls, value: str) -> str:
         return _normalize_local_key(value)
+
+    @field_validator("one_liner")
+    @classmethod
+    def one_liner_is_normalized(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_id_description(value)
+        return normalized or None
 
     @field_validator("exact_statement", "conclusion", "notation_definition_version")
     @classmethod

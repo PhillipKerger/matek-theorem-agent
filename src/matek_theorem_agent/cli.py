@@ -823,12 +823,15 @@ def graph_doctor(
     repair: bool = typer.Option(
         False,
         "--repair",
-        help="Transactionally repair whitelisted generated metadata defects.",
+        help=(
+            "Transactionally repair whitelisted generated metadata defects and rename "
+            "legacy hash node IDs to descriptive one-liner IDs."
+        ),
     ),
     problem_id: str | None = typer.Option(None, "--problem-id"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Inspect repairable generated graph metadata without model calls."""
+    """Inspect repairable generated graph metadata and legacy node IDs without model calls."""
 
     try:
         report = _project_graph(knowledge_graph).doctor(

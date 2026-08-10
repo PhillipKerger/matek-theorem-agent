@@ -24,6 +24,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import ModelSettings
+from ..graph_ids import validate_any_node_id
 from ..knowledge_graph.ledger import logical_version as claim_logical_version
 from ..knowledge_graph.ledger import obligation_logical_version
 from ..openai_client import (
@@ -74,6 +75,22 @@ def _safe_id(value: str) -> str:
     if not _SAFE_ID.fullmatch(normalized):
         raise ValueError("lemma-audit IDs must use 1-128 portable characters")
     return normalized
+
+
+def _graph_id(value: str) -> str:
+    try:
+        return validate_any_node_id(value)
+    except ValueError as exc:
+        raise ValueError("lemma-audit graph references must be stable node IDs") from exc
+
+
+def _artifact_id(value: str) -> str:
+    """Artifact references name graph nodes or run-local artifact labels."""
+
+    try:
+        return validate_any_node_id(value)
+    except ValueError:
+        return _safe_id(value)
 
 
 def _sha256(value: str) -> str:
@@ -150,10 +167,15 @@ class LemmaProofStep(_AuditModel):
     def proof_text_is_not_blank(cls, value: str) -> str:
         return _not_blank(value)
 
-    @field_validator("depends_on", "source_artifact_ids")
+    @field_validator("depends_on")
     @classmethod
-    def references_are_unique(cls, value: list[str]) -> list[str]:
+    def step_references_are_unique(cls, value: list[str]) -> list[str]:
         return [_safe_id(item) for item in _unique_strings(value)]
+
+    @field_validator("source_artifact_ids")
+    @classmethod
+    def artifact_references_are_unique(cls, value: list[str]) -> list[str]:
+        return [_artifact_id(item) for item in _unique_strings(value)]
 
 
 class LemmaSourceArtifact(_AuditModel):
@@ -166,7 +188,7 @@ class LemmaSourceArtifact(_AuditModel):
     @field_validator("artifact_id")
     @classmethod
     def artifact_id_is_safe(cls, value: str) -> str:
-        return _safe_id(value)
+        return _artifact_id(value)
 
     @field_validator("media_type")
     @classmethod
@@ -203,7 +225,7 @@ class LemmaDependencyReference(_AuditModel):
     @field_validator("dependency_id")
     @classmethod
     def dependency_id_is_safe(cls, value: str) -> str:
-        return _safe_id(value)
+        return _graph_id(value)
 
     @field_validator("exact_statement")
     @classmethod
@@ -242,7 +264,7 @@ class LemmaTargetObligationReference(_AuditModel):
     @field_validator("obligation_id")
     @classmethod
     def obligation_identity_is_safe(cls, value: str) -> str:
-        return _safe_id(value)
+        return _graph_id(value)
 
     @field_validator("exact_statement", "conclusion", "notation_definition_version")
     @classmethod
@@ -265,7 +287,7 @@ class LemmaTargetObligationReference(_AuditModel):
     @field_validator("dependency_claim_ids", "target_claim_ids")
     @classmethod
     def obligation_link_ids_are_safe(cls, value: list[str]) -> list[str]:
-        return [_safe_id(item) for item in _unique_strings(value)]
+        return [_graph_id(item) for item in _unique_strings(value)]
 
     @field_validator("logical_version", "content_sha256")
     @classmethod
@@ -319,7 +341,7 @@ class LemmaLeverage(_AuditModel):
     @field_validator("downstream_obligation_ids")
     @classmethod
     def obligation_ids_are_unique(cls, value: list[str]) -> list[str]:
-        return [_safe_id(item) for item in _unique_strings(value)]
+        return [_graph_id(item) for item in _unique_strings(value)]
 
     @field_validator("rationale")
     @classmethod
@@ -364,13 +386,16 @@ class LemmaNomination(_AuditModel):
 
     @field_validator(
         "nomination_id",
-        "statement_id",
-        "canonical_derivation_id",
         "conclusion_step_id",
     )
     @classmethod
     def identity_is_safe(cls, value: str) -> str:
         return _safe_id(value)
+
+    @field_validator("statement_id", "canonical_derivation_id")
+    @classmethod
+    def graph_identity_is_valid(cls, value: str) -> str:
+        return _graph_id(value)
 
     @field_validator(
         "exact_statement",
@@ -391,7 +416,7 @@ class LemmaNomination(_AuditModel):
     @field_validator("target_obligation_ids")
     @classmethod
     def target_ids_are_unique(cls, value: list[str]) -> list[str]:
-        return [_safe_id(item) for item in _unique_strings(value)]
+        return [_graph_id(item) for item in _unique_strings(value)]
 
     @field_validator(
         "origin_worker_id",
@@ -518,10 +543,15 @@ class LemmaAuditResponse(_AuditModel):
     def statement_digest_is_valid(cls, value: str) -> str:
         return _sha256(value)
 
-    @field_validator("proof_step_ids_checked", "source_artifact_ids_checked")
+    @field_validator("proof_step_ids_checked")
     @classmethod
-    def checked_ids_are_unique(cls, value: list[str]) -> list[str]:
+    def checked_step_ids_are_unique(cls, value: list[str]) -> list[str]:
         return [_safe_id(item) for item in _unique_strings(value)]
+
+    @field_validator("source_artifact_ids_checked")
+    @classmethod
+    def checked_artifact_ids_are_unique(cls, value: list[str]) -> list[str]:
+        return [_artifact_id(item) for item in _unique_strings(value)]
 
     @field_validator(
         "checks_performed",
@@ -671,7 +701,7 @@ class AcceptedIntermediateTheorem(_AuditModel):
     @field_validator("source_artifact_sha256")
     @classmethod
     def source_digests_are_valid(cls, value: dict[str, str]) -> dict[str, str]:
-        return {_safe_id(key): _sha256(digest) for key, digest in sorted(value.items())}
+        return {_artifact_id(key): _sha256(digest) for key, digest in sorted(value.items())}
 
 
 class LemmaAuditGate(_AuditModel):

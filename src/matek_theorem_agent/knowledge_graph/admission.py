@@ -10,6 +10,11 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..graph_ids import (
+    dedupe_descriptive_id,
+    descriptive_node_id,
+    normalize_id_description,
+)
 from ..scientific import (
     ScientificObligationDeclaration,
     ScientificResult,
@@ -24,6 +29,7 @@ from ..scientific import (
 from .ledger import logical_version
 from .markdown import exact_statement, new_generated_body
 from .models import (
+    NODE_ID_WORDS,
     ClaimType,
     EpistemicStatus,
     GraphEdge,
@@ -31,6 +37,7 @@ from .models import (
     NodeType,
     RelationType,
     WorkflowStatus,
+    node_id_matches_type,
     validate_node_id,
 )
 
@@ -66,6 +73,102 @@ def _canonical_json(value: object) -> str:
 def _deterministic_id(prefix: str, *parts: str) -> str:
     digest = hashlib.sha256("\0".join(parts).encode()).hexdigest().upper()[:20]
     return validate_node_id(f"{prefix}-{digest}")
+
+
+class _NodeIdAllocator:
+    """Deterministically mint descriptive node IDs for one admission batch.
+
+    Canonical claim and definition identity still coalesces identical statements:
+    existing nodes are indexed by their exact-statement fingerprint, scope, and
+    assumption contract, and re-admission resolves to the existing node whatever
+    its ID format.  Only genuinely new content receives a fresh descriptive ID,
+    with a numeric `` (n)`` suffix when two different statements share an
+    agent-written one-liner.
+    """
+
+    def __init__(
+        self,
+        existing_nodes: Sequence[GraphNode],
+        *,
+        problem_id: str,
+        main_target_id: str,
+    ) -> None:
+        self.problem_id = problem_id
+        self.main_target_id = main_target_id
+        self.taken: set[str] = {node.matek_id.casefold() for node in existing_nodes}
+        self.claim_index: dict[tuple[str, str, tuple[str, ...]], str] = {}
+        self.definition_index: dict[tuple[str, str], str] = {}
+        for node in existing_nodes:
+            if node.problem_id != problem_id or node.tombstone:
+                continue
+            statement = exact_statement(node.body)
+            if not statement:
+                continue
+            fingerprint = exact_statement_fingerprint(statement)
+            if node.node_type is NodeType.CLAIM:
+                scope = (
+                    ScientificScope.MAIN.value
+                    if node.matek_id == main_target_id
+                    else str(node.metadata.get("matek_scientific_scope") or "branch")
+                )
+                assumptions = tuple(_metadata_string_list(node, "matek_normalized_assumptions"))
+                self.claim_index.setdefault((scope, fingerprint, assumptions), node.matek_id)
+            elif node.node_type is NodeType.DEFINITION:
+                scope = str(node.metadata.get("matek_scientific_scope") or "branch")
+                self.definition_index.setdefault((scope, fingerprint), node.matek_id)
+
+    def allocate(self, node_type: NodeType, description: str) -> str:
+        word = NODE_ID_WORDS[node_type]
+        candidate = descriptive_node_id(word, description)
+        allocated = dedupe_descriptive_id(candidate, self.taken)
+        self.taken.add(allocated.casefold())
+        return allocated
+
+    def claim_id(
+        self,
+        *,
+        main_target_id: str,
+        main_target_statement: str,
+        result: ScientificResult,
+    ) -> str:
+        """Return the canonical claim node ID for one result, coalescing by content."""
+
+        assumption_contract = _normalized_assumption_contract(result)
+        if (
+            not assumption_contract
+            and result.scope is ScientificScope.MAIN
+            and normalize_exact_statement(result.exact_statement)
+            == normalize_exact_statement(main_target_statement)
+        ):
+            return main_target_id
+        fingerprint = exact_statement_fingerprint(result.exact_statement)
+        key = (result.scope.value, fingerprint, tuple(assumption_contract))
+        existing = self.claim_index.get(key)
+        if existing is not None:
+            return existing
+        description = result.one_liner or result.exact_statement
+        allocated = self.allocate(NodeType.CLAIM, description)
+        self.claim_index[key] = allocated
+        return allocated
+
+    def definition_id(self, *, result: ScientificResult) -> str:
+        """Return the canonical definition node ID for one result, coalescing by content."""
+
+        fingerprint = exact_statement_fingerprint(result.exact_statement)
+        key = (result.scope.value, fingerprint)
+        existing = self.definition_index.get(key)
+        if existing is not None:
+            return existing
+        description = result.one_liner or result.exact_statement
+        allocated = self.allocate(NodeType.DEFINITION, description)
+        self.definition_index[key] = allocated
+        return allocated
+
+
+def _result_one_liner(result: ScientificResult) -> str:
+    """Return the agent-written one-liner or fall back to the exact statement."""
+
+    return result.one_liner or normalize_id_description(result.exact_statement)
 
 
 def admission_identity(
@@ -214,13 +317,7 @@ def canonical_admitted_definition_scope(node: GraphNode) -> ScientificScope | No
         or bool(node.metadata.get("matek_dependency_result_keys"))
     ):
         return None
-    expected_id = _deterministic_id(
-        "DEF",
-        node.problem_id,
-        scope.value,
-        exact_statement_fingerprint(statement),
-    )
-    if node.matek_id != expected_id:
+    if not node_id_matches_type(node.matek_id, NodeType.DEFINITION):
         return None
     identity = node.metadata.get("matek_admission_identity")
     payload = node.metadata.get("matek_admission_payload_sha256")
@@ -391,30 +488,16 @@ def _verified_replay_artifacts_by_result(
 
 def _scope_claim_id(
     *,
-    problem_id: str,
+    allocator: _NodeIdAllocator,
     main_target_id: str,
     main_target_statement: str,
     result: ScientificResult,
 ) -> str:
-    assumption_contract = _normalized_assumption_contract(result)
-    if (
-        not assumption_contract
-        and result.scope is ScientificScope.MAIN
-        and normalize_exact_statement(result.exact_statement)
-        == normalize_exact_statement(main_target_statement)
-    ):
-        return main_target_id
-    fingerprint = exact_statement_fingerprint(result.exact_statement)
-    if assumption_contract:
-        return _deterministic_id(
-            "CLM",
-            problem_id,
-            result.scope.value,
-            fingerprint,
-            "assumptions",
-            "\0".join(assumption_contract),
-        )
-    return _deterministic_id("CLM", problem_id, result.scope.value, fingerprint)
+    return allocator.claim_id(
+        main_target_id=main_target_id,
+        main_target_statement=main_target_statement,
+        result=result,
+    )
 
 
 def _normalized_assumption_contract(result: ScientificResult) -> list[str]:
@@ -425,7 +508,7 @@ def _normalized_assumption_contract(result: ScientificResult) -> list[str]:
 
 def _same_report_dependency_target_id(
     *,
-    problem_id: str,
+    allocator: _NodeIdAllocator,
     main_target_id: str,
     main_target_statement: str,
     result: ScientificResult,
@@ -449,18 +532,13 @@ def _same_report_dependency_target_id(
             or result.dependency_result_keys
         ):
             return None
-        return _deterministic_id(
-            "DEF",
-            problem_id,
-            result.scope.value,
-            exact_statement_fingerprint(result.exact_statement),
-        )
+        return allocator.definition_id(result=result)
     if result.kind is ScientificResultKind.COUNTEREXAMPLE:
         return None
     if result.kind is ScientificResultKind.COMPUTATION and not replayed.get(result.local_key):
         return None
     return _scope_claim_id(
-        problem_id=problem_id,
+        allocator=allocator,
         main_target_id=main_target_id,
         main_target_statement=main_target_statement,
         result=result,
@@ -545,6 +623,7 @@ def _common_node(
 def _explicit_obligation_node(
     declaration: ScientificObligationDeclaration,
     *,
+    allocator: _NodeIdAllocator,
     problem_id: str,
     run_id: str,
     assignment_id: str,
@@ -554,13 +633,9 @@ def _explicit_obligation_node(
     target_claim_ids: Sequence[str],
     dependency_nodes: Mapping[str, GraphNode],
 ) -> GraphNode:
-    obligation_id = _deterministic_id(
-        "OBL",
-        problem_id,
-        run_id,
-        assignment_id,
-        declaration.local_key,
-        str(declaration.schema_version),
+    obligation_id = allocator.allocate(
+        NodeType.OBLIGATION,
+        declaration.one_liner or declaration.conclusion,
     )
     dependency_versions = [
         f"{node_id}@{_logical_node_version(dependency_nodes[node_id])}"
@@ -590,13 +665,19 @@ def _explicit_obligation_node(
         )
         for target_id in target_claim_ids
     )
+    parent_types = {
+        parent_id: dependency_nodes[parent_id].node_type
+        for parent_id in parent_ids
+        if parent_id in dependency_nodes
+    }
+    obligation_title = declaration.one_liner or f"Open obligation: {declaration.local_key}"
     return _common_node(
         node_id=obligation_id,
         node_type=NodeType.OBLIGATION,
         problem_id=problem_id,
-        title=f"Open obligation: {declaration.local_key}",
+        title=obligation_title,
         body=new_generated_body(
-            f"Open obligation: {declaration.local_key}",
+            obligation_title,
             "## Exact statement\n\n"
             + declaration.exact_statement
             + "\n\n## Quantifiers\n\n"
@@ -621,10 +702,14 @@ def _explicit_obligation_node(
             "matek_assignment_id": assignment_id,
             "matek_obligation_local_key": declaration.local_key,
             "matek_parent_derivation_ids": [
-                parent_id for parent_id in parent_ids if parent_id.startswith("DRV-")
+                parent_id
+                for parent_id in parent_ids
+                if parent_types.get(parent_id) is NodeType.DERIVATION
             ],
             "matek_parent_proof_attempt_ids": [
-                parent_id for parent_id in parent_ids if parent_id.startswith("PAT-")
+                parent_id
+                for parent_id in parent_ids
+                if parent_types.get(parent_id) is NodeType.PROOF_ATTEMPT
             ],
             "matek_parent_node_ids": list(parent_ids),
             "matek_dependency_claim_ids": declaration.dependency_node_ids,
@@ -680,6 +765,9 @@ def build_scientific_admission(
         assignment_id=assignment_id,
         results=results,
     )
+    allocator = _NodeIdAllocator(
+        existing_nodes, problem_id=problem_id, main_target_id=main_target_id
+    )
     known_ids = set(by_id)
     declared_result_keys = [result.local_key for result in results]
     if len(declared_result_keys) != len(set(declared_result_keys)):
@@ -727,7 +815,7 @@ def build_scientific_admission(
         for result in results
         for target_id in [
             _same_report_dependency_target_id(
-                problem_id=problem_id,
+                allocator=allocator,
                 main_target_id=main_target_id,
                 main_target_statement=main_target_statement,
                 result=result,
@@ -890,8 +978,8 @@ def build_scientific_admission(
         canonical_admitted = False
 
         if result.kind is ScientificResultKind.COUNTEREXAMPLE:
-            counterexample_id = _deterministic_id(
-                "CEX", problem_id, run_id, assignment_id, result.local_key, "1"
+            counterexample_id = allocator.allocate(
+                NodeType.COUNTEREXAMPLE, _result_one_liner(result)
             )
             requested_targets = result.target_node_ids or [approach_id]
             safe_targets: list[str] = []
@@ -962,9 +1050,7 @@ def build_scientific_admission(
             created_ids.append(node.matek_id)
             result_parent_ids[result.local_key] = [node.matek_id]
         elif result.kind is ScientificResultKind.COMPUTATION and not replayed.get(result.local_key):
-            experiment_id = _deterministic_id(
-                "EXP", problem_id, run_id, assignment_id, result.local_key, "unreplayed"
-            )
+            experiment_id = allocator.allocate(NodeType.EXPERIMENT, _result_one_liner(result))
             experiment = _common_node(
                 node_id=experiment_id,
                 node_type=NodeType.EXPERIMENT,
@@ -1001,7 +1087,10 @@ def build_scientific_admission(
                 workflow_status=WorkflowStatus.BLOCKED,
                 tags=["matek/computation", "matek/replay-required"],
             )
-            obligation_id = _deterministic_id("OBL", experiment_id, "independent-replay")
+            obligation_id = allocator.allocate(
+                NodeType.OBLIGATION,
+                f"Independently replay and verify computation: {_result_one_liner(result)}",
+            )
             obligation = _common_node(
                 node_id=obligation_id,
                 node_type=NodeType.OBLIGATION,
@@ -1060,12 +1149,7 @@ def build_scientific_admission(
                 f"Computation {result.local_key} remains outside the ledger until replay passes."
             )
         elif result.kind is ScientificResultKind.DEFINITION:
-            definition_id = _deterministic_id(
-                "DEF",
-                problem_id,
-                result.scope.value,
-                exact_statement_fingerprint(result.exact_statement),
-            )
+            definition_id = allocator.definition_id(result=result)
             existing_definition = planned.get(definition_id) or by_id.get(definition_id)
             if existing_definition is not None:
                 existing_contract = canonical_definition_dependency_contract(existing_definition)
@@ -1087,9 +1171,9 @@ def build_scientific_admission(
                 node_id=definition_id,
                 node_type=NodeType.DEFINITION,
                 problem_id=problem_id,
-                title=f"Definition: {result.local_key}",
+                title=result.one_liner or f"Definition: {result.local_key}",
                 body=new_generated_body(
-                    f"Definition: {result.local_key}",
+                    result.one_liner or f"Definition: {result.local_key}",
                     "## Exact statement\n\n"
                     + result.exact_statement
                     + "\n\n## Definition evidence\n\n"
@@ -1157,7 +1241,7 @@ def build_scientific_admission(
             result_parent_ids[result.local_key] = [definition_id]
         else:
             claim_id = _scope_claim_id(
-                problem_id=problem_id,
+                allocator=allocator,
                 main_target_id=main_target_id,
                 main_target_statement=exact_statement(target.body),
                 result=result,
@@ -1205,13 +1289,14 @@ def build_scientific_admission(
                     and (RelationType.RELATED_TO, target_id) not in known_relations
                 )
             else:
+                claim_title = result.one_liner or f"Scientific result: {result.local_key}"
                 claim = _common_node(
                     node_id=claim_id,
                     node_type=NodeType.CLAIM,
                     problem_id=problem_id,
-                    title=f"Scientific result: {result.local_key}",
+                    title=claim_title,
                     body=new_generated_body(
-                        f"Scientific result: {result.local_key}",
+                        claim_title,
                         "## Exact statement\n\n"
                         + result.exact_statement
                         + "\n\n## Assumptions\n\n"
@@ -1276,8 +1361,8 @@ def build_scientific_admission(
                 planned[claim_id] = claim
                 created_ids.append(claim_id)
 
-            attempt_id = _deterministic_id(
-                "PAT", problem_id, run_id, assignment_id, result.local_key, "1"
+            attempt_id = allocator.allocate(
+                NodeType.PROOF_ATTEMPT, _result_one_liner(result)
             )
             attempt_relations = [
                 GraphEdge(
@@ -1369,8 +1454,8 @@ def build_scientific_admission(
                 and not result.assumptions
                 and result.disposition is ScientificResultDisposition.PROPOSED_COMPLETE
             ):
-                derivation_id = _deterministic_id(
-                    "DRV", problem_id, run_id, assignment_id, result.local_key, "1"
+                derivation_id = allocator.allocate(
+                    NodeType.DERIVATION, _result_one_liner(result)
                 )
                 derivation_relations = [
                     GraphEdge(
@@ -1457,15 +1542,14 @@ def build_scientific_admission(
                 result_parent_ids[result.local_key] = [attempt_id, derivation_id]
                 canonical_admitted = True
             else:
-                obligation_id = _deterministic_id(
-                    "OBL",
-                    attempt_id,
-                    "unbound-assumptions"
+                gap_description = (
+                    f"Bind and discharge the assumptions of {_result_one_liner(result)}"
                     if result.assumptions
-                    else "exact-gap"
+                    else f"Close the exact gap in {_result_one_liner(result)}"
                     if result.exact_gap is not None
-                    else "incomplete-result",
+                    else f"Complete the partial result for {_result_one_liner(result)}"
                 )
+                obligation_id = allocator.allocate(NodeType.OBLIGATION, gap_description)
                 target_claim_ids = list(
                     dict.fromkeys(
                         [
@@ -1603,32 +1687,45 @@ def build_scientific_admission(
         }
         if not explicit_target_claim_ids and declaration.scope is ScientificScope.MAIN:
             explicit_target_claim_ids.add(main_target_id)
-        obligation = _explicit_obligation_node(
-            declaration,
-            problem_id=problem_id,
-            run_id=run_id,
-            assignment_id=assignment_id,
-            now=now,
-            source_artifact=source_artifact,
-            parent_ids=parent_ids,
-            target_claim_ids=sorted(explicit_target_claim_ids),
-            dependency_nodes=combined_nodes,
-        )
-        existing_obligation = by_id.get(obligation.matek_id)
-        if existing_obligation is not None:
+        # Obligations coalesce across retries by their immutable admission binding,
+        # not by a recomputed ID: descriptive node IDs are agent-chosen labels.
+        declaration_identity = _obligation_admission_identity(run_id, assignment_id, declaration)
+        bound_existing = [
+            node
+            for node in combined_nodes.values()
+            if node.node_type is NodeType.OBLIGATION
+            and node.metadata.get("matek_obligation_admission_identity")
+            == declaration_identity
+        ]
+        if len(bound_existing) > 1:
+            raise ScientificAdmissionError(
+                f"obligation admission identity collision for {declaration.local_key!r}"
+            )
+        if bound_existing:
+            existing_obligation = bound_existing[0]
             if (
-                existing_obligation.node_type is not NodeType.OBLIGATION
-                or existing_obligation.metadata.get("matek_obligation_admission_identity")
-                != obligation.metadata["matek_obligation_admission_identity"]
-                or existing_obligation.metadata.get("matek_obligation_admission_payload_sha256")
-                != obligation.metadata["matek_obligation_admission_payload_sha256"]
+                existing_obligation.metadata.get("matek_obligation_admission_payload_sha256")
+                != _obligation_payload_sha256(declaration)
             ):
                 raise ScientificAdmissionError(
                     f"obligation admission identity collision for {declaration.local_key!r}"
                 )
             obligation = existing_obligation
         else:
+            obligation = _explicit_obligation_node(
+                declaration,
+                allocator=allocator,
+                problem_id=problem_id,
+                run_id=run_id,
+                assignment_id=assignment_id,
+                now=now,
+                source_artifact=source_artifact,
+                parent_ids=parent_ids,
+                target_claim_ids=sorted(explicit_target_claim_ids),
+                dependency_nodes=combined_nodes,
+            )
             planned[obligation.matek_id] = obligation
+            combined_nodes[obligation.matek_id] = obligation
         for key in declaration.parent_result_keys:
             for record in records:
                 if record.local_key == key:
@@ -1636,7 +1733,12 @@ def build_scientific_admission(
                         dict.fromkeys([*record.blocking_obligation_ids, obligation.matek_id])
                     )
                     record.canonical_ledger_admitted = False
-                    derivation_ids = [item for item in record.node_ids if item.startswith("DRV-")]
+                    derivation_ids = [
+                        item
+                        for item in record.node_ids
+                        if combined_nodes.get(item) is not None
+                        and combined_nodes[item].node_type is NodeType.DERIVATION
+                    ]
                     for derivation_id in derivation_ids:
                         parent_derivation = planned.get(derivation_id)
                         if parent_derivation is not None:

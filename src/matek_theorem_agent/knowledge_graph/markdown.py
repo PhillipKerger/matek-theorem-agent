@@ -18,6 +18,7 @@ from typing import cast
 
 from pydantic import ValidationError
 
+from ..graph_ids import is_descriptive_node_id
 from .models import (
     ClaimType,
     EpistemicStatus,
@@ -32,8 +33,9 @@ GENERATED_START = "<!-- MATEK:GENERATED:START -->"
 GENERATED_END = "<!-- MATEK:GENERATED:END -->"
 
 _KEY = re.compile(r"\A[A-Za-z_][A-Za-z0-9_-]*\Z")
-_WIKILINK = re.compile(r"\A\[\[([^]|]+)(?:\|[^]]+)?\]\]\Z")
+_WIKILINK = re.compile(r"\A\[\[([^]|]+?)(?:\|([^]]+))?\]\]\Z")
 _NODE_ID_IN_LINK = re.compile(r"\b([A-Z]{3}-[A-Z0-9]{8,64})\b")
+_WHITESPACE_RUN = re.compile(r"\s+")
 _SECTION = re.compile(r"(?m)^##\s+(.+?)\s*$")
 
 
@@ -141,8 +143,22 @@ def format_flat_frontmatter(properties: Mapping[str, object]) -> str:
 
 def node_id_from_wikilink(value: str) -> str:
     match = _WIKILINK.fullmatch(value.strip())
-    target = match.group(1) if match is not None else value.strip()
+    if match is not None:
+        target = match.group(1).strip()
+        label = (match.group(2) or "").strip()
+    else:
+        target = value.strip()
+        label = ""
+    # Descriptive IDs ("CLAIM: ...") travel in the link label (path-based links use
+    # a slugged directory that cannot recover the ID) or as the whole raw target.
+    for candidate_text in (label, target):
+        candidate = _WHITESPACE_RUN.sub(" ", candidate_text).strip()
+        if is_descriptive_node_id(candidate):
+            return candidate
+    # Legacy hash IDs may still appear inside a longer path-like target.
     node_match = _NODE_ID_IN_LINK.search(target)
+    if node_match is None and label:
+        node_match = _NODE_ID_IN_LINK.search(label)
     if node_match is None:
         raise GraphMarkdownError(f"relation target is not a MATEK node link: {value!r}")
     return node_match.group(1)
@@ -309,6 +325,13 @@ def _ordered_properties(
     by_relation: dict[RelationType, list[str]] = {}
     for edge in sorted(node.relations, key=lambda item: (item.relation.value, item.target_id)):
         target = relation_targets.get(edge.target_id) if relation_targets is not None else None
+        if target is not None and is_descriptive_node_id(target.matek_id):
+            # A descriptive ID doubles as the human- and agent-readable link label;
+            # the slugged path alone cannot recover it.
+            by_relation.setdefault(edge.relation, []).append(
+                wikilink_for(target, title=target.matek_id)
+            )
+            continue
         by_relation.setdefault(edge.relation, []).append(
             wikilink_for(target if target is not None else edge.target_id)
         )

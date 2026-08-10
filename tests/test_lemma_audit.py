@@ -182,17 +182,17 @@ def valid_nomination() -> LemmaNomination:
     )
     return LemmaNomination(
         nomination_id="lemma-zero-identity",
-        statement_id="CLM-ZERO-IDENTITY",
-        canonical_derivation_id="DRV-ZERO-IDENTITY",
+        statement_id="CLAIM: For every natural number n, n + 0 = n",
+        canonical_derivation_id="DERIVATION: For every natural number n, n + 0 = n",
         result_kind=IntermediateResultKind.RESTRICTED_THEOREM,
         scope=LemmaScope.BRANCH,
         exact_statement="For every natural number n, n + 0 = n.",
         hypotheses=["n is a natural number."],
         main_target_statement="Prove the target recurrence for every natural number.",
-        target_obligation_ids=["OBL-MAIN-RECURRENCE"],
+        target_obligation_ids=["OBLIGATION: Prove the target recurrence for every natural number"],
         target_obligation_contracts=[
             LemmaTargetObligationReference(
-                obligation_id="OBL-MAIN-RECURRENCE",
+                obligation_id="OBLIGATION: Prove the target recurrence for every natural number",
                 exact_statement=obligation_statement,
                 conclusion=obligation_statement,
                 scope=ScientificScope.BRANCH,
@@ -226,7 +226,7 @@ def valid_nomination() -> LemmaNomination:
         current_graph_revision="00000012-deadbeefdeadbeef",
         dependencies=[
             LemmaDependencyReference(
-                dependency_id="DEF-NAT-ADDITION",
+                dependency_id="DEFINITION: Natural-number addition with zero recursion",
                 exact_statement=dependency_statement,
                 statement_version=3,
                 content_sha256=dependency_digest,
@@ -244,7 +244,9 @@ def valid_nomination() -> LemmaNomination:
             )
         ],
         leverage=LemmaLeverage(
-            downstream_obligation_ids=["OBL-MAIN-RECURRENCE"],
+            downstream_obligation_ids=[
+                "OBLIGATION: Prove the target recurrence for every natural number"
+            ],
             estimated_open_cut_reduction=1,
             unlocked_branch_count=2,
             rationale="Discharges the boundary case used by two active derivations.",

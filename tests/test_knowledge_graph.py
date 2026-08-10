@@ -3349,3 +3349,113 @@ def test_graph_cli_requires_selection_when_multiple_graphs_exist(
     )
     assert missing.exit_code == 2
     assert "does not exist" in missing.output
+
+
+def test_graph_doctor_renames_legacy_hash_ids_to_descriptive_one_liners(
+    tmp_path: Path,
+) -> None:
+    graph, _problem, problem_id, _ = initialized_graph(tmp_path)
+    main_target_id = graph.main_claim_id(problem_id)
+    tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id="run-one",
+        decision_id=7,
+        assignments=[
+            {
+                "id": "worker-legacy",
+                "approach_family": "symmetrization",
+                "task": "Prove the centroid bound.",
+                "expected_output": "An exact lemma and proof.",
+                "target_node_ids": [main_target_id],
+            }
+        ],
+    )
+    merged = graph.merge_patch(
+        GraphPatch(
+            base_graph_revision=graph.load_state().revision,
+            run_id="run-one",
+            task_id=tasks["worker-legacy"],
+            agent_role="research-auditor",
+            create_nodes=[
+                GraphNodeCreate(
+                    matek_id="CLM-LEGACYCLAIM001",
+                    node_type=NodeType.CLAIM,
+                    claim_type=ClaimType.LEMMA,
+                    title="Any halfspace through the centroid keeps at least 1/e of the volume",
+                    body=(
+                        "## Exact statement\n\nFor a convex body C of volume v with centroid c, "
+                        "any halfspace H whose boundary contains c satisfies vol(H cap C) >= v/e."
+                    ),
+                ),
+                GraphNodeCreate(
+                    matek_id="APR-LEGACYAPR00001",
+                    node_type=NodeType.APPROACH,
+                    title="Symmetrization approach",
+                    body=(
+                        "## Exact route attempted\n\nUse Blaschke-Santalo symmetrization "
+                        "to reduce to the ball."
+                    ),
+                ),
+            ],
+            add_edges=[
+                GraphEdge(
+                    source_id="CLM-LEGACYCLAIM001",
+                    relation=RelationType.RELATED_TO,
+                    target_id="APR-LEGACYAPR00001",
+                )
+            ],
+        ),
+        problem_id=problem_id,
+        operation_id="legacy-nodes",
+    )
+    assert merged.committed
+
+    planned = graph.doctor(problem_id=problem_id)
+    assert [action.applied for action in planned.actions] == [False, False]
+    planned_ids = {
+        action.before["matek_id"]: action.after["matek_id"] for action in planned.actions
+    }
+    assert planned_ids == {
+        "APR-LEGACYAPR00001": "APPROACH: Symmetrization approach",
+        "CLM-LEGACYCLAIM001": (
+            "CLAIM: Any halfspace through the centroid keeps at least 1/e of the volume"
+        ),
+    }
+    assert graph.load_state().revision == planned.previous_revision
+
+    repaired = graph.doctor(repair=True, problem_id=problem_id, run_id="run-doctor")
+    assert all(action.applied for action in repaired.actions)
+    assert repaired.repair_log is not None
+    repair_log = json.loads((graph.graph_root / repaired.repair_log).read_text(encoding="utf-8"))
+    assert [action["rule"] for action in repair_log["actions"]] == [
+        "legacy_hash_id_rename",
+        "legacy_hash_id_rename",
+    ]
+
+    nodes = {node.matek_id: node for node in graph.load_nodes(include_human_notes=False)}
+    new_claim_id = planned_ids["CLM-LEGACYCLAIM001"]
+    new_approach_id = planned_ids["APR-LEGACYAPR00001"]
+    assert "CLM-LEGACYCLAIM001" not in nodes
+    assert "APR-LEGACYAPR00001" not in nodes
+    claim = nodes[new_claim_id]
+    approach = nodes[new_approach_id]
+    assert claim.metadata["matek_legacy_node_id"] == "CLM-LEGACYCLAIM001"
+    assert approach.metadata["matek_legacy_node_id"] == "APR-LEGACYAPR00001"
+    # References to renamed IDs are rewritten across the graph.
+    assert [
+        (edge.relation, edge.target_id) for edge in claim.relations
+    ] == [(RelationType.RELATED_TO, new_approach_id)]
+    # The immutable main target keeps its stable anchor ID.
+    assert main_target_id in nodes
+    # The rename is idempotent: a second inspection plans nothing.
+    assert graph.doctor(problem_id=problem_id).actions == []
+    assert graph.validate().valid
+    # The canonical ledger still projects after the rename.
+    state = graph.load_state()
+    ledger = project_markdown_ledger(
+        list(nodes.values()),
+        graph_revision=state.revision,
+        problem_id=problem_id,
+        target_claim_id=main_target_id,
+    )
+    assert main_target_id in ledger.claims

@@ -305,6 +305,21 @@ result creates only a proposed derivation. The service serializes commits with a
 writes a recovery intent, atomically replaces changed notes and state, saves a revision snapshot,
 then rebuilds navigation, proof-ledger, and SQLite views.
 
+Graph nodes carry two ID formats. Agent-authored mathematical content — claims, definitions,
+approaches, proofs, proof attempts, derivations, obligations, counterexamples, and experiments —
+is minted with descriptive one-liner IDs such as `CLAIM: Halfspaces through the centroid keep at
+least a 1/e volume fraction`, built from the reporting agent's `one_liner` (falling back to the
+exact statement). Identical statements still coalesce onto one canonical claim because claim and
+definition identity is keyed by the exact-statement fingerprint, scope, and assumption contract,
+not by the label; a distinct statement reusing a one-liner receives a numeric ` (n)` suffix.
+Operational nodes (problems, runs, tasks, audits, artifacts, sources, formalizations, human notes)
+keep deterministic `XXX-########` hash IDs, as does the immutable main target claim so its anchor
+never moves. The vault stores descriptive IDs in frontmatter and wikilink labels; note directories
+use a portable slug with a short digest of the full ID. `matek graph doctor --repair` renames
+legacy hash IDs on mathematical nodes to descriptive IDs, rewriting every edge, metadata field,
+and note body reference in one recoverable transaction while preserving the old ID as
+`matek_legacy_node_id` metadata.
+
 Candidate packaging re-establishes this mapping from persisted state. Every replay-backed
 computation in a triggering report must lie in an exact-main result's transitive local-result
 closure; the frozen graph-support slice includes that computation's claim, proof attempt,

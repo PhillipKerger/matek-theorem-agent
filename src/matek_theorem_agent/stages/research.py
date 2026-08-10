@@ -34,6 +34,7 @@ from ..coordinator_context import (
 )
 from ..execution.base import ExecutionBackend
 from ..failures import classify_failure, recovery_obligations
+from ..graph_ids import validate_any_node_id
 from ..knowledge_graph import (
     EpistemicStatus,
     GraphMergeResult,
@@ -208,10 +209,12 @@ class TargetObligationVersion(BaseModel):
     @field_validator("obligation_id")
     @classmethod
     def obligation_id_is_stable(cls, value: str) -> str:
-        normalized = value.strip().upper()
-        if not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", normalized):
-            raise ValueError("target obligation versions require stable graph IDs")
-        return normalized
+        try:
+            return validate_any_node_id(value)
+        except ValueError as exc:
+            raise ValueError(
+                "target obligation versions require stable graph IDs"
+            ) from exc
 
     @field_validator("logical_version")
     @classmethod
@@ -258,9 +261,12 @@ class ResearchAssignment(BaseModel):
     @field_validator("target_obligation_ids", "audited_premise_ids")
     @classmethod
     def scientific_ids_are_unique(cls, value: list[str]) -> list[str]:
-        normalized = [item.strip().upper() for item in value]
-        if any(not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", item) for item in normalized):
-            raise ValueError("scientific frontier references must be stable graph IDs")
+        try:
+            normalized = [validate_any_node_id(item) for item in value]
+        except ValueError as exc:
+            raise ValueError(
+                "scientific frontier references must be stable graph IDs"
+            ) from exc
         return list(dict.fromkeys(normalized))
 
     @field_validator("mechanism_delta")
@@ -395,9 +401,12 @@ class IntermediateLemmaAuditRecord(BaseModel):
     @field_validator("target_obligation_ids")
     @classmethod
     def target_ids_are_stable_and_unique(cls, value: list[str]) -> list[str]:
-        normalized = [item.strip().upper() for item in value]
-        if any(not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", item) for item in normalized):
-            raise ValueError("intermediate lemma audit targets must be stable graph IDs")
+        try:
+            normalized = [validate_any_node_id(item) for item in value]
+        except ValueError as exc:
+            raise ValueError(
+                "intermediate lemma audit targets must be stable graph IDs"
+            ) from exc
         if len(normalized) != len(set(normalized)):
             raise ValueError("intermediate lemma audit targets must be unique")
         return normalized
@@ -407,10 +416,13 @@ class IntermediateLemmaAuditRecord(BaseModel):
     def target_versions_are_stable(cls, value: dict[str, str]) -> dict[str, str]:
         normalized: dict[str, str] = {}
         for raw_id, raw_version in value.items():
-            target_id = raw_id.strip().upper()
+            try:
+                target_id = validate_any_node_id(raw_id)
+            except ValueError as exc:
+                raise ValueError(
+                    "intermediate lemma audit version keys must be stable graph IDs"
+                ) from exc
             version = raw_version.strip().casefold()
-            if not re.fullmatch(r"[A-Z]{3}-[A-Z0-9]{8,64}", target_id):
-                raise ValueError("intermediate lemma audit version keys must be stable graph IDs")
             if not re.fullmatch(r"[0-9a-f]{64}", version):
                 raise ValueError("intermediate lemma audit versions must be SHA-256 digests")
             normalized[target_id] = version
@@ -727,9 +739,6 @@ class ArchivedResearchWorkerReportV1(BaseModel):
     graph_patch: object | None = None
 
 
-_STABLE_SCIENTIFIC_NODE_ID = re.compile(r"\A[A-Z]{3}-[A-Z0-9]{8,64}\Z")
-
-
 class ResearchWorkerReport(BaseModel):
     """Provider-visible v2 report containing mathematics rather than persistence mutations."""
 
@@ -1039,10 +1048,9 @@ def adapt_research_worker_report_v1(
         normalized = item.strip()
         if not normalized:
             continue
-        upper = normalized.upper()
-        if _STABLE_SCIENTIFIC_NODE_ID.fullmatch(upper):
-            stable_dependencies.append(upper)
-        else:
+        try:
+            stable_dependencies.append(validate_any_node_id(normalized))
+        except ValueError:
             unresolved_dependencies.append(normalized)
     stable_dependencies = list(dict.fromkeys(stable_dependencies))
     unresolved_dependencies = list(dict.fromkeys(unresolved_dependencies))

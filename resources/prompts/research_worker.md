@@ -20,6 +20,12 @@ Return one schema-v2 `ResearchWorkerReport`:
   `results`. Give it a portable `local_key`, exact scoped statement, all assumptions, proof or
   certificate, any exact gap, same-report `dependency_result_keys`, relevant pre-existing graph
   dependency/target IDs, and a truthful disposition. Same-report dependencies must be acyclic.
+- Give every result and every obligation a short `one_liner`: a single-sentence plain description
+  of the mathematical content (for example, "Halfspaces through the centroid keep at least a 1/e
+  volume fraction"). MATEK uses the one-liner to build the artifact's stable descriptive graph ID
+  (for example, `CLAIM: Halfspaces through the centroid keep at least a 1/e volume fraction`), so
+  make it specific, self-contained, and distinct from other artifacts in this report. Do not
+  include newline characters in a one-liner.
 - Put every open mathematical requirement in `unresolved_obligations`, including its exact
   statement, quantifiers, hypotheses, conclusion, parents, scope, and dependencies.
 - Put sources in `source_ledger` and private-workspace computation declarations in
@@ -42,7 +48,10 @@ Synthesis may use only listed audited premises. Computation supports an unbounde
 a complete reduction and a declared dependency path. Imported theorems must be stated precisely
 with sources and exact hypothesis matching.
 
-The knowledge-graph context is read-only. Use its stable IDs where relevant, but do not return
+The knowledge-graph context is read-only. Graph artifacts carry descriptive IDs that name their
+content directly (for example, `CLAIM: Every boundary object has property P` or `APPROACH:
+Blaschke-Santalo symmetrization`); older graphs may still contain compact hash IDs such as
+`CLM-9F2AB...`. Reference artifacts by copying their IDs exactly as shown, but do not return
 graph mutations, revisions, hashes, persistence identities, relation directions, or status
 promotions; MATEK constructs and validates those itself.
 

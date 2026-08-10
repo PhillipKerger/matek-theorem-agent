@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import unicodedata
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +30,12 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
+from ..graph_ids import (
+    dedupe_descriptive_id,
+    descriptive_node_id,
+    is_legacy_node_id,
+    validate_any_node_id,
+)
 from ..scientific import (
     ScientificObligationDeclaration,
     ScientificResult,
@@ -106,6 +112,7 @@ from .migration import (
 )
 from .models import (
     NODE_ID_PREFIXES,
+    NODE_ID_WORDS,
     NODE_TYPE_DIRECTORIES,
     ClaimType,
     EpistemicStatus,
@@ -1196,6 +1203,206 @@ _SOURCE_HYGIENE_RULES: dict[
     "primary_identifier_in_identifiers": _source_primary_identifier_repair,
 }
 
+_GENERIC_NODE_TITLE = re.compile(
+    r"\A(?:scientific result|result from|proof attempt|definition|counterexample|"
+    r"open obligation|gap in|approach branch|replay computation|unreplayed computation|"
+    r"candidate proof|lemma audit obligation|legacy proof attempt|fresh audit|"
+    r"reviewed legacy derivation)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_main_target_node(node: GraphNode) -> bool:
+    """Return whether a node is a problem's immutable main target claim."""
+
+    return (
+        node.node_type is NodeType.CLAIM
+        and (
+            "matek/main-target" in node.tags
+            or node.matek_id
+            == _deterministic_id(NodeType.CLAIM, node.problem_id, "main-target")
+        )
+    )
+
+
+def _legacy_rename_description(node: GraphNode) -> str | None:
+    """Derive a one-line ID description for a legacy hash-ID node without a model.
+
+    The node title leads unless it is itself a hash ID or a generic generated
+    label; then the first line of the exact statement (or recorded obligation
+    conclusion) supplies the description.
+    """
+
+    title = node.title.strip()
+    if title and not is_legacy_node_id(title) and _GENERIC_NODE_TITLE.match(title) is None:
+        return title
+    statement = exact_statement(node.body)
+    if statement:
+        first_line = statement.splitlines()[0].strip()
+        if first_line:
+            return first_line
+    conclusion = node.metadata.get("matek_conclusion")
+    if isinstance(conclusion, str) and conclusion.strip():
+        return conclusion.strip().splitlines()[0]
+    return title or None
+
+
+@dataclass
+class _LegacyIdRenamePlan:
+    nodes: list[GraphNode]
+    actions: list[GraphHygieneAction]
+    warnings: list[str]
+    renamed_old_ids: list[str]
+    removed_paths: list[str]
+    changed_node_ids: list[str]
+
+
+def _plan_legacy_id_renames(
+    nodes: Sequence[GraphNode],
+    *,
+    problem_id: str | None,
+    run_id: str,
+    timestamp: datetime,
+) -> _LegacyIdRenamePlan:
+    """Plan a deterministic rename of legacy hash IDs to descriptive one-liner IDs.
+
+    Only agent-authored mathematical node types are renamed; operational types and
+    the immutable main target keep their stable hash IDs.  Every reference to a
+    renamed ID — edges, metadata fields, evidence and dependency lists, and note
+    bodies — is rewritten in the same plan so the graph stays referentially whole.
+    The old ID is preserved on each renamed node as ``matek_legacy_node_id``.
+    """
+
+    candidates = [
+        node
+        for node in nodes
+        if node.node_type in NODE_ID_WORDS
+        and is_legacy_node_id(node.matek_id)
+        and not node.tombstone
+        and not _is_main_target_node(node)
+        and (problem_id is None or node.problem_id == problem_id)
+    ]
+    empty = _LegacyIdRenamePlan(
+        nodes=list(nodes),
+        actions=[],
+        warnings=[],
+        renamed_old_ids=[],
+        removed_paths=[],
+        changed_node_ids=[],
+    )
+    if not candidates:
+        return empty
+
+    taken = {node.matek_id.casefold() for node in nodes}
+    mapping: dict[str, str] = {}
+    warnings: list[str] = []
+    actions: list[GraphHygieneAction] = []
+    for node in sorted(candidates, key=lambda item: item.matek_id):
+        description = _legacy_rename_description(node)
+        if description is None:
+            warnings.append(
+                f"Node {node.matek_id} has no usable title or statement; left unchanged."
+            )
+            continue
+        base = descriptive_node_id(NODE_ID_WORDS[node.node_type], description)
+        new_id = dedupe_descriptive_id(base, taken)
+        taken.add(new_id.casefold())
+        mapping[node.matek_id] = new_id
+        actions.append(
+            GraphHygieneAction(
+                rule="legacy_hash_id_rename",
+                failure_class="legacy_identifier",
+                node_id=new_id,
+                before={"matek_id": node.matek_id, "node_type": node.node_type.value},
+                after={"matek_id": new_id, "description": description},
+                timestamp=timestamp,
+            )
+        )
+    if not mapping:
+        empty.warnings = warnings
+        return empty
+
+    pattern = re.compile(
+        r"\b(?P<old>"
+        + "|".join(re.escape(old) for old in sorted(mapping, key=len, reverse=True))
+        + r")\b"
+    )
+
+    def rewrite(text: str) -> str:
+        return pattern.sub(lambda match: mapping[match.group("old")], text)
+
+    def rewrite_value(value: object) -> object:
+        if isinstance(value, str):
+            return rewrite(value)
+        if isinstance(value, list):
+            return [rewrite(item) for item in value if isinstance(item, str)]
+        return value
+
+    changed: list[str] = []
+    removed_paths: list[str] = []
+    planned_nodes: list[GraphNode] = []
+    for node in nodes:
+        renamed_id = mapping.get(node.matek_id)
+        rewritten_relations = [
+            GraphEdge(
+                source_id=mapping.get(edge.source_id, edge.source_id),
+                relation=edge.relation,
+                target_id=mapping.get(edge.target_id, edge.target_id),
+            )
+            for edge in node.relations
+        ]
+        rewritten_metadata = {
+            key: cast(str | int | bool | list[str] | None, rewrite_value(value))
+            for key, value in node.metadata.items()
+        }
+        rewritten_body = rewrite(node.body)
+        rewritten_lists = {
+            field: [rewrite(item) for item in getattr(node, field)]
+            for field in (
+                "evidence",
+                "source_artifacts",
+                "dependency_versions",
+                "invalidation_reasons",
+                "manuscript_mappings",
+            )
+        }
+        references_changed = (
+            rewritten_relations != node.relations
+            or rewritten_metadata != node.metadata
+            or rewritten_body != node.body
+            or any(rewritten_lists[field] != getattr(node, field) for field in rewritten_lists)
+        )
+        if renamed_id is None and not references_changed:
+            planned_nodes.append(node)
+            continue
+        updated = node.model_copy(deep=True)
+        if renamed_id is not None:
+            updated.matek_id = renamed_id
+            updated.metadata["matek_legacy_node_id"] = node.matek_id
+            updated.last_modified_run = run_id
+            updated.updated_at = timestamp
+            if node.path is not None:
+                removed_paths.append(node.path)
+            updated.path = None
+            updated.content_hash = None
+        updated.relations = rewritten_relations
+        updated.metadata.update(rewritten_metadata)
+        updated.body = rewritten_body
+        for field, values in rewritten_lists.items():
+            setattr(updated, field, values)
+        # Re-validate the rewritten node before it can enter a transaction.
+        planned_nodes.append(GraphNode.model_validate(updated.model_dump(mode="json")))
+        changed.append(updated.matek_id)
+
+    return _LegacyIdRenamePlan(
+        nodes=planned_nodes,
+        actions=actions,
+        warnings=warnings,
+        renamed_old_ids=sorted(mapping),
+        removed_paths=removed_paths,
+        changed_node_ids=changed,
+    )
+
 
 def _deterministic_id(node_type: NodeType, *parts: str) -> str:
     digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest().upper()[:20]
@@ -1204,6 +1411,19 @@ def _deterministic_id(node_type: NodeType, *parts: str) -> str:
 
 def _new_id(node_type: NodeType) -> str:
     return f"{NODE_ID_PREFIXES[node_type]}-{secrets.token_hex(10).upper()}"
+
+
+def _descriptive_id(
+    node_type: NodeType,
+    description: str,
+    taken: Collection[str],
+) -> str:
+    """Mint one descriptive one-liner node ID, deduped against ``taken`` IDs."""
+
+    word = NODE_ID_WORDS[node_type]
+    candidate = descriptive_node_id(word, description)
+    taken_casefolds = {node_id.casefold() for node_id in taken}
+    return dedupe_descriptive_id(candidate, taken_casefolds)
 
 
 def _slug(value: str) -> str:
@@ -2225,13 +2445,32 @@ class KnowledgeGraph:
         return self._canonical_node_path(node)
 
     @staticmethod
-    def _canonical_node_path(node: GraphNode) -> str:
-        directory = NODE_TYPE_DIRECTORIES[node.node_type]
-        return f"{directory}/{node.matek_id}/{_note_filename(node.title)}.md"
+    def _node_directory_name(node: GraphNode) -> str:
+        """Return the portable vault directory component for one node.
 
-    @staticmethod
-    def _uses_title_path(node: GraphNode, relative: str) -> bool:
-        expected_parent = Path(NODE_TYPE_DIRECTORIES[node.node_type]) / node.matek_id
+        Legacy hash IDs are already path-safe.  Descriptive one-liner IDs contain
+        spaces and a colon, which Obsidian and some filesystems reject, so their
+        directory is an ASCII slug with a short digest of the full ID appended:
+        slugs truncate, and distinct one-liners must never share a directory.  The
+        full ID stays in frontmatter and wikilink labels.
+        """
+
+        if is_legacy_node_id(node.matek_id):
+            return node.matek_id
+        slug = _slug(node.matek_id)[:48].rstrip("-") or "node"
+        digest = hashlib.sha256(node.matek_id.casefold().encode("utf-8")).hexdigest()[:8]
+        return f"{slug}-{digest}"
+
+    @classmethod
+    def _canonical_node_path(cls, node: GraphNode) -> str:
+        directory = NODE_TYPE_DIRECTORIES[node.node_type]
+        return f"{directory}/{cls._node_directory_name(node)}/{_note_filename(node.title)}.md"
+
+    @classmethod
+    def _uses_title_path(cls, node: GraphNode, relative: str) -> bool:
+        expected_parent = Path(NODE_TYPE_DIRECTORIES[node.node_type]) / cls._node_directory_name(
+            node
+        )
         return Path(relative).parent == expected_parent
 
     def _migrate_legacy_paths_unlocked(
@@ -2671,7 +2910,13 @@ class KnowledgeGraph:
         problem_id: str | None = None,
         run_id: str = "SYSTEM",
     ) -> GraphHygieneReport:
-        """Inspect or transactionally repair whitelisted generated source metadata."""
+        """Inspect or transactionally repair whitelisted generated graph defects.
+
+        Repairs source identity metadata and renames legacy hash IDs
+        (``CLM-...``) on agent-authored mathematical nodes to descriptive
+        one-liner IDs, rewriting every edge, metadata field, and note body that
+        references them.  No model calls are made.
+        """
 
         with self._locked():
             self._recover_pending_unlocked()
@@ -2681,16 +2926,23 @@ class KnowledgeGraph:
                 node.matek_id == problem_id and node.node_type is NodeType.PROBLEM for node in nodes
             ):
                 raise GraphValidationError(f"problem node does not exist: {problem_id}")
+            timestamp = self._now()
+            rename_plan = _plan_legacy_id_renames(
+                nodes,
+                problem_id=problem_id,
+                run_id=run_id,
+                timestamp=timestamp,
+            )
+            working_nodes = rename_plan.nodes
             selected = [
                 node
-                for node in nodes
+                for node in working_nodes
                 if node.node_type is NodeType.SOURCE
                 and not node.tombstone
                 and (problem_id is None or node.problem_id == problem_id)
             ]
-            timestamp = self._now()
             repaired_nodes: dict[str, GraphNode] = {}
-            actions: list[GraphHygieneAction] = []
+            actions: list[GraphHygieneAction] = [*rename_plan.actions]
             for node in sorted(selected, key=lambda item: item.matek_id):
                 for rule in _SOURCE_HYGIENE_RULES.values():
                     planned = rule(node, run_id, timestamp)
@@ -2700,7 +2952,10 @@ class KnowledgeGraph:
                     repaired_nodes[node.matek_id] = repaired_node
                     actions.append(action)
                     break
-            warnings = [action.warning for action in actions if action.warning is not None]
+            warnings = [
+                *rename_plan.warnings,
+                *(action.warning for action in actions if action.warning is not None),
+            ]
             if not repair or not actions:
                 return GraphHygieneReport(
                     graph_name=self.graph_name,
@@ -2713,8 +2968,14 @@ class KnowledgeGraph:
                     warnings=warnings,
                 )
 
-            by_id = {node.matek_id: node for node in nodes}
+            by_id = {node.matek_id: node for node in working_nodes}
             by_id.update(repaired_nodes)
+            pruned_state = state.model_copy(deep=True)
+            for old_id in rename_plan.renamed_old_ids:
+                pruned_state.node_paths.pop(old_id, None)
+                pruned_state.node_hashes.pop(old_id, None)
+                pruned_state.machine_hashes.pop(old_id, None)
+                pruned_state.statement_hashes.pop(old_id, None)
             applied_actions = [action.model_copy(update={"applied": True}) for action in actions]
             action_payloads = [action.model_dump(mode="json") for action in applied_actions]
             repair_sha256 = hashlib.sha256(
@@ -2722,9 +2983,14 @@ class KnowledgeGraph:
             ).hexdigest()
             operation_id = f"graph-hygiene:{repair_sha256[:20]}"
             repair_log = f"repairs/{operation_id.replace(':', '-')}.json"
+            failure_classes = {action.failure_class for action in applied_actions}
             log_payload = {
                 "schema_version": 1,
-                "failure_class": "metadata_invariant",
+                "failure_class": (
+                    failure_classes.pop()
+                    if len(failure_classes) == 1
+                    else "mixed"
+                ),
                 "graph_name": self.graph_name,
                 "problem_id": problem_id,
                 "run_id": run_id,
@@ -2732,14 +2998,18 @@ class KnowledgeGraph:
                 "actions": action_payloads,
             }
             result = self._commit_nodes_unlocked(
-                state=state,
+                state=pruned_state,
                 all_nodes=list(by_id.values()),
-                changed_node_ids=sorted(repaired_nodes),
+                changed_node_ids=sorted({*rename_plan.changed_node_ids, *repaired_nodes}),
                 run_id=run_id,
                 author="matek-graph-hygiene",
-                reason="Repair whitelisted generated source identity metadata.",
+                reason=(
+                    "Repair whitelisted generated source identity metadata and rename legacy "
+                    "hash node IDs to descriptive one-liner IDs."
+                ),
                 operation_id=operation_id,
                 source_artifacts=[repair_log],
+                removed_paths=rename_plan.removed_paths,
                 additional_writes={
                     repair_log: json.dumps(
                         log_payload,
@@ -4688,9 +4958,16 @@ class KnowledgeGraph:
                         "the counterexample as candidate evidence for independent review"
                     )
                     continue
-                node_id = item.matek_id or _new_id(item.node_type)
+                created_node_id = item.matek_id
+                if created_node_id is None:
+                    if item.node_type in NODE_ID_WORDS:
+                        created_node_id = _descriptive_id(
+                            item.node_type, item.title, set(by_id)
+                        )
+                    else:
+                        created_node_id = _new_id(item.node_type)
                 node = GraphNode(
-                    matek_id=node_id,
+                    matek_id=created_node_id,
                     node_type=item.node_type,
                     problem_id=problem_id,
                     title=item.title,
@@ -4707,9 +4984,9 @@ class KnowledgeGraph:
                     evidence=list(dict.fromkeys([*item.evidence, *patch.evidence])),
                     source_artifacts=item.source_artifacts,
                 )
-                by_id[node_id] = node
-                changed.append(node_id)
-                created_ids.append(node_id)
+                by_id[created_node_id] = node
+                changed.append(created_node_id)
+                created_ids.append(created_node_id)
             if conflicts:
                 return GraphMergeResult(
                     operation_id=operation_id,
@@ -5549,7 +5826,14 @@ class KnowledgeGraph:
     ) -> list[str]:
         """Bind one assignment to explicit live nodes without a silent fallback."""
 
-        normalized = [item.strip().upper() for item in target_node_ids if item.strip()]
+        normalized: list[str] = []
+        for item in target_node_ids:
+            if not item.strip():
+                continue
+            try:
+                normalized.append(validate_any_node_id(item))
+            except ValueError:
+                normalized.append(item.strip())
         if not normalized:
             raise GraphValidationError(
                 f"research assignment {assignment_id!r} must name at least one graph target"
@@ -5881,7 +6165,7 @@ class KnowledgeGraph:
             }.get(status, "partial_progress")
             # A family is a search taxonomy, not a branch identity. Distinct
             # assignments in the same family must retain distinct outcomes.
-            approach_id = _deterministic_id(NodeType.APPROACH, problem_id, run_id, assignment_id)
+            approach_id = _descriptive_id(NodeType.APPROACH, family, set(by_id))
             approach_workflow = {
                 "blocked": WorkflowStatus.BLOCKED,
                 "refuted": WorkflowStatus.ABANDONED,
@@ -6415,8 +6699,10 @@ class KnowledgeGraph:
             proposed_nodes: list[GraphNode] = [approach]
             result_claim_ids: list[str] = []
             for index, result_text in enumerate(formal_results, start=1):
-                claim_id = _deterministic_id(
-                    NodeType.CLAIM, problem_id, run_id, assignment_id, str(index)
+                claim_id = _descriptive_id(
+                    NodeType.CLAIM,
+                    result_text,
+                    {*by_id, *(node.matek_id for node in proposed_nodes)},
                 )
                 result_claim_ids.append(claim_id)
                 proposed_nodes.append(
@@ -6464,8 +6750,15 @@ class KnowledgeGraph:
                 )
             proof_content = str(report.get("proof_content") or "").strip()
             if proof_content and (formal_results or status == "candidate_complete"):
-                proof_id = _deterministic_id(NodeType.PROOF, problem_id, run_id, assignment_id)
                 proof_targets = result_claim_ids or [self.main_claim_id(problem_id)]
+                proof_description = (
+                    formal_results[0] if formal_results else f"Candidate proof from {assignment_id}"
+                )
+                proof_id = _descriptive_id(
+                    NodeType.PROOF,
+                    proof_description,
+                    {*by_id, *(node.matek_id for node in proposed_nodes)},
+                )
                 proposed_nodes.append(
                     GraphNode(
                         matek_id=proof_id,
@@ -6513,8 +6806,10 @@ class KnowledgeGraph:
                     )
                 )
             for index, counterexample in enumerate(counterexamples, start=1):
-                counterexample_id = _deterministic_id(
-                    NodeType.COUNTEREXAMPLE, problem_id, run_id, assignment_id, str(index)
+                counterexample_id = _descriptive_id(
+                    NodeType.COUNTEREXAMPLE,
+                    counterexample,
+                    {*by_id, *(node.matek_id for node in proposed_nodes)},
                 )
                 proposed_nodes.append(
                     GraphNode(
@@ -6815,8 +7110,10 @@ class KnowledgeGraph:
                             ]
                         )
                     )
-                proof_id = _deterministic_id(
-                    NodeType.PROOF, problem_id, run_id, "accepted-candidate"
+                proof_id = _descriptive_id(
+                    NodeType.PROOF,
+                    str(candidate_map.get("exact_theorem") or "Accepted candidate proof"),
+                    set(by_id),
                 )
                 accepted_proof = GraphNode(
                     matek_id=proof_id,
@@ -7017,7 +7314,7 @@ class KnowledgeGraph:
                 )
             nomination = persisted_nomination.model_dump(mode="json")
             gate = persisted_gate.model_dump(mode="json")
-            statement_id = str(nomination.get("statement_id") or "").strip().upper()
+            statement_id = str(nomination.get("statement_id") or "").strip()
             claim = by_id.get(statement_id)
             if claim is None or claim.node_type is not NodeType.CLAIM:
                 raise GraphValidationError(
@@ -7075,7 +7372,8 @@ class KnowledgeGraph:
             accepted_intermediate = gate.get("accepted_intermediate")
             if status == "audit_passed":
                 if not isinstance(accepted_intermediate, Mapping) or (
-                    str(accepted_intermediate.get("statement_id") or "").upper() != statement_id
+                    str(accepted_intermediate.get("statement_id") or "").strip()
+                    != statement_id
                     or bool(accepted_intermediate.get("terminal_main_target_satisfied"))
                     or bool(accepted_intermediate.get("manuscript_authorized"))
                 ):
@@ -7087,9 +7385,9 @@ class KnowledgeGraph:
                     "only a passing lemma audit may carry an accepted theorem"
                 )
             origin_assignment = str(nomination.get("origin_worker_id") or "").strip()
-            canonical_derivation_id = (
-                str(nomination.get("canonical_derivation_id") or "").strip().upper()
-            )
+            canonical_derivation_id = str(
+                nomination.get("canonical_derivation_id") or ""
+            ).strip()
             operation_id = f"lemma-audit:{run_id}:{audit_id_text}"
             prior_operation = state.processed_operations.get(operation_id)
             audit_node_id = _deterministic_id(
@@ -7579,11 +7877,10 @@ class KnowledgeGraph:
             else:
                 created_obligation_ids: list[str] = []
                 for index, obligation_text in enumerate(obligations, start=1):
-                    obligation_id = _deterministic_id(
+                    obligation_id = _descriptive_id(
                         NodeType.OBLIGATION,
-                        audit_node_id,
-                        str(index),
-                        sha256_text(obligation_text),
+                        obligation_text,
+                        {*by_id, *(node.matek_id for node in proposed)},
                     )
                     obligation_node = GraphNode(
                         matek_id=obligation_id,
@@ -7781,16 +8078,21 @@ class KnowledgeGraph:
                 raise GraphValidationError(
                     f"counterexample admission binding cannot be reconstructed: {exc}"
                 ) from exc
-            expected_counterexample_id = _deterministic_id(
-                NodeType.COUNTEREXAMPLE,
-                problem_id,
-                run_id,
-                assignment_id,
-                result_local_key,
-                "1",
+            # The admitted counterexample is found by its immutable report binding,
+            # not by a recomputed ID: descriptive node IDs are agent-chosen labels.
+            binding_candidates = [
+                node
+                for node in by_id.values()
+                if node.node_type is NodeType.COUNTEREXAMPLE
+                and node.problem_id == problem_id
+                and node.created_in_run == run_id
+                and node.metadata.get("matek_assignment_id") == assignment_id
+                and node.metadata.get("matek_result_local_key") == result_local_key
+            ]
+            counterexample = (
+                binding_candidates[0] if len(binding_candidates) == 1 else None
             )
-            counterexample = by_id.get(expected_counterexample_id)
-            if counterexample is None or counterexample.node_type is not NodeType.COUNTEREXAMPLE:
+            if counterexample is None:
                 raise GraphValidationError(
                     "counterexample audit does not resolve to its deterministic admitted candidate"
                 )

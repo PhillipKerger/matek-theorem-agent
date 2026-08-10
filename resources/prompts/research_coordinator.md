@@ -36,7 +36,10 @@ bypass MATEK audits. In flat mode, assume no delegation.
 Every new assignment needs a portable unique ID, a precise mathematical task, explicit inputs, an
 expected output, a stopping condition, and at least one valid live target node ID for the selected
 problem. Use the main claim for a genuinely new top-level route and the actual defining node for a
-continuation. Never invent an ID.
+continuation. Never invent an ID. Graph node IDs are descriptive: they read like `CLAIM: <one-line
+statement>` or `APPROACH: <one-line mechanism>`, so copy them verbatim from the supplied graph
+context rather than reconstructing or abbreviating them (older graphs may still contain compact
+hash IDs such as `CLM-9F2AB...`; those are copied verbatim too).
 
 Honor `scientific_phase_state`:
 
