@@ -134,6 +134,7 @@ from matek_theorem_agent.stages.research import (
     ResearchWorkerReport,
     ResearchWorkflowSettings,
     WorkerStatus,
+    _validate_coordinator_decision,
     adapt_research_worker_report_v1,
     run_adaptive_research,
 )
@@ -4281,6 +4282,102 @@ async def test_initial_coordinator_cannot_stop_instead_of_launching_funded_portf
             research_dir=tmp_path,
             workflow_settings=ResearchWorkflowSettings(minimum_initial_assignments=4),
         )
+
+
+def _decision_for_validation(**overrides: Any) -> ResearchCoordinatorDecision:
+    base: dict[str, Any] = {
+        "decision_id": 2,
+        "after_event_sequence": 5,
+        "assignments": [],
+        "rationale": "Coordinator rationale.",
+    }
+    base.update(overrides)
+    return ResearchCoordinatorDecision(**base)
+
+
+_VALIDATION_KWARGS: dict[str, Any] = {
+    "expected_decision": 2,
+    "expected_event_sequence": 5,
+    "minimum_assignments": 0,
+    "maximum_new_assignments": 4,
+    "initial": False,
+    "known_assignment_ids": {"worker-1", "worker-2"},
+    "completed_assignment_ids": {"worker-2"},
+}
+
+
+def test_incomplete_candidate_report_reference_is_sanitized_not_fatal() -> None:
+    """Incident A: packaging a not-yet-terminal report is sanitized, not fatal."""
+
+    warnings: list[str] = []
+    decision = _decision_for_validation(
+        candidate_packaging_recommended=True,
+        candidate_report_ids=["worker-2", "worker-report:RA-JTZ-00000020-E1-D1-KOS"],
+    )
+
+    result = _validate_coordinator_decision(
+        decision, reference_warnings=warnings, **_VALIDATION_KWARGS
+    )
+
+    # The terminal subset is preserved; the premature reference is dropped, not fatal.
+    assert result.candidate_report_ids == ["worker-2"]
+    assert result.candidate_packaging_recommended
+    assert any("RA-JTZ-00000020-E1-D1-KOS" in warning for warning in warnings)
+
+
+def test_all_incomplete_candidate_reports_drop_packaging_not_fatal() -> None:
+    """Incident A variant: when every referenced report is nonterminal, packaging drops."""
+
+    warnings: list[str] = []
+    decision = _decision_for_validation(
+        candidate_packaging_recommended=True,
+        candidate_report_ids=["worker-report:RA-JTZ-00000021-E1-D2-AUD-ADM"],
+    )
+
+    result = _validate_coordinator_decision(
+        decision, reference_warnings=warnings, **_VALIDATION_KWARGS
+    )
+
+    assert result.candidate_report_ids == []
+    assert not result.candidate_packaging_recommended
+    assert warnings
+
+
+def test_unknown_artifact_and_directive_references_are_sanitized_not_fatal() -> None:
+    """Incident B: unknown retire/redirect and retrieval IDs are dropped, not fatal."""
+
+    warnings: list[str] = []
+    decision = _decision_for_validation(
+        retire_assignment_ids=["worker-1", "ghost-x"],
+        redirect_assignment_ids=["ghost-y"],
+    )
+
+    result = _validate_coordinator_decision(
+        decision, reference_warnings=warnings, **_VALIDATION_KWARGS
+    )
+
+    # The valid directive survives; unknown IDs are removed without raising.
+    assert result.retire_assignment_ids == ["worker-1"]
+    assert result.redirect_assignment_ids == []
+    assert any("ghost-x" in warning for warning in warnings)
+
+
+def test_structural_violation_still_raises() -> None:
+    """A genuine structural violation (duplicate IDs) remains a hard failure."""
+
+    decision = _decision_for_validation(
+        assignments=[
+            ResearchAssignment(
+                id="dup", approach_family="a", task="t", expected_output="e"
+            ),
+            ResearchAssignment(
+                id="dup", approach_family="b", task="t", expected_output="e"
+            ),
+        ]
+    )
+
+    with pytest.raises(StageValidationError, match="duplicate assignment IDs"):
+        _validate_coordinator_decision(decision, **_VALIDATION_KWARGS)
 
 
 @pytest.mark.asyncio

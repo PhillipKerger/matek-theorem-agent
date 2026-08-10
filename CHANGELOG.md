@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.2 — 2026-08-09
+
+- Made coordinator reference validation recoverable. A coordinator that names an unknown
+  retire/redirect target, requests candidate packaging from an assignment that is not yet
+  terminal, or requests an unknown artifact/graph-node ID no longer stops a multi-hour research
+  run. MATEK now deterministically partitions those references: the valid remainder of the
+  decision is applied, the malformed or premature IDs are dropped, and a single append-only
+  `coordinator_invalid_references` event tells the next coordinator turn exactly which
+  references were not executed and are not evidence. Candidate packaging proceeds with the
+  terminal subset (or is dropped when nothing is terminal), and the affected assignments stay
+  queued/running. Structural and safety violations (duplicate or reused assignment IDs, mailbox
+  non-acknowledgement, budget/ceiling breaches, contradictory terminal directives) remain hard
+  failures. The coordinator spends its context on mathematical prioritization rather than on
+  repairing identifiers it was never able to validate.
+- An unauthorized-write integrity failure now also writes the machine-readable
+  `integrity.json` diagnostic (disposition, allowed policy roots, and the classified
+  user-tree/state-tree change lists) into the call's trace directory, alongside the
+  `events.jsonl` and `stderr.log` that are persisted before the guard can raise. The full
+  diagnostic record therefore survives every post-call integrity failure.
+
 ## 0.7.1 — 2026-08-08
 
 - Fixed the post-call Codex integrity guard stopping runs for changes it cannot attribute. A

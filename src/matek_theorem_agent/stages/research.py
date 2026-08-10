@@ -2233,7 +2233,18 @@ def _validate_coordinator_decision(
     initial: bool,
     known_assignment_ids: set[str],
     completed_assignment_ids: set[str],
+    reference_warnings: list[str] | None = None,
 ) -> ResearchCoordinatorDecision:
+    """Validate one coordinator decision, sanitizing malformed references in place.
+
+    Reference-level mistakes — naming an unknown retire/redirect target or packaging an
+    assignment that is not terminal — are normal LLM control-plane noise, not integrity
+    faults. They are partitioned and dropped here (recorded into ``reference_warnings``)
+    so the valid remainder of the decision still applies, instead of discarding a
+    multi-hour run. Structural and safety violations (duplicate/reused IDs, mailbox
+    non-acknowledgement, budget/ceiling breaches, contradictory terminal directives)
+    still raise ``StageValidationError``.
+    """
     if decision.decision_id != expected_decision:
         raise StageValidationError(
             f"Coordinator returned decision {decision.decision_id}; expected {expected_decision}."
@@ -2285,17 +2296,49 @@ def _validate_coordinator_decision(
     directive_ids = set(decision.retire_assignment_ids) | set(decision.redirect_assignment_ids)
     unknown_directives = sorted(directive_ids - known_assignment_ids)
     if unknown_directives:
-        raise StageValidationError(
-            "Coordinator attempted to retire or redirect unknown assignment ID(s): "
-            + ", ".join(unknown_directives)
+        # Naming an unknown retire/redirect target is control-plane noise: drop the invalid
+        # directive, keep the valid ones, and tell the coordinator through the mailbox.
+        if reference_warnings is not None:
+            reference_warnings.append(
+                "Ignored unknown retire/redirect assignment ID(s) (not evidence, not executed): "
+                + ", ".join(unknown_directives)
+            )
+        decision = decision.model_copy(
+            update={
+                "retire_assignment_ids": [
+                    item
+                    for item in decision.retire_assignment_ids
+                    if item in known_assignment_ids
+                ],
+                "redirect_assignment_ids": [
+                    item
+                    for item in decision.redirect_assignment_ids
+                    if item in known_assignment_ids
+                ],
+            }
         )
     unknown_candidate_reports = sorted(
         set(decision.candidate_report_ids) - completed_assignment_ids
     )
     if unknown_candidate_reports:
-        raise StageValidationError(
-            "Coordinator requested candidate packaging from incomplete assignment ID(s): "
-            + ", ".join(unknown_candidate_reports)
+        # A reference to an unfinished report must not end research. Exclude the nonterminal
+        # IDs, keep any terminal subset, and report their live states back to the coordinator.
+        terminal_subset = [
+            item for item in decision.candidate_report_ids if item in completed_assignment_ids
+        ]
+        if reference_warnings is not None:
+            reference_warnings.append(
+                "Unavailable report references (still active directions, not evidence; do not "
+                "package as completed evidence): "
+                + ", ".join(unknown_candidate_reports)
+            )
+        decision = decision.model_copy(
+            update={
+                "candidate_report_ids": terminal_subset,
+                "candidate_packaging_recommended": (
+                    decision.candidate_packaging_recommended and bool(terminal_subset)
+                ),
+            }
         )
     if decision.candidate_packaging_recommended and not decision.candidate_report_ids:
         raise StageValidationError("Candidate packaging requires at least one completed report ID.")
@@ -7324,6 +7367,7 @@ async def run_adaptive_research(
             settings=decision_model_settings,
             output_type=ResearchCoordinatorDecision,
         )
+        reference_warnings: list[str] = []
         decision = _validate_coordinator_decision(
             result.parsed,
             expected_decision=decision_id,
@@ -7333,6 +7377,7 @@ async def run_adaptive_research(
             initial=initial,
             known_assignment_ids={record.assignment.id for record in scheduler.assignments},
             completed_assignment_ids=completed_ids,
+            reference_warnings=reference_warnings,
         )
         decision, proposed_scientific_phase_state = normalize_scientific_assignments(decision)
         decision = defer_consequential_action_for_omitted_evidence(
@@ -7443,14 +7488,54 @@ async def run_adaptive_research(
         }
         unknown_artifacts = sorted(set(decision.requested_artifact_ids) - known_artifact_ids)
         if unknown_artifacts:
-            raise StageValidationError(
-                "Coordinator requested unknown artifact IDs: " + ", ".join(unknown_artifacts)
+            # An unknown retrieval handle is control-plane noise: drop it, keep the valid
+            # portion, and tell the coordinator which IDs do not exist.
+            reference_warnings.append(
+                "Unknown requested artifact ID(s) (do not exist; not executed, not evidence): "
+                + ", ".join(unknown_artifacts)
+            )
+            decision = decision.model_copy(
+                update={
+                    "requested_artifact_ids": [
+                        item
+                        for item in decision.requested_artifact_ids
+                        if item in known_artifact_ids
+                    ]
+                }
             )
         if knowledge_graph is None and decision.requested_graph_node_ids:
             raise StageValidationError("Coordinator requested graph nodes without an active graph.")
         if knowledge_graph is not None:
+            unknown_graph_nodes: list[str] = []
+            valid_graph_nodes: list[str] = []
             for node_id in decision.requested_graph_node_ids:
-                knowledge_graph.show(node_id)
+                try:
+                    knowledge_graph.show(node_id)
+                except GraphValidationError:
+                    unknown_graph_nodes.append(node_id)
+                else:
+                    valid_graph_nodes.append(node_id)
+            if unknown_graph_nodes:
+                reference_warnings.append(
+                    "Unknown requested graph-node ID(s) at the current graph revision (do not "
+                    "exist; not executed, not evidence). Choose only from the validated task "
+                    "index: " + ", ".join(sorted(set(unknown_graph_nodes)))
+                )
+                decision = decision.model_copy(
+                    update={"requested_graph_node_ids": valid_graph_nodes}
+                )
+        if reference_warnings:
+            # The warning event stays in the coordinator's unacknowledged mailbox, so its next
+            # activation sees exactly which references were not executed and are not evidence.
+            append_event(
+                "coordinator_invalid_references",
+                decision_id=decision.decision_id,
+                detail=[
+                    "MATEK deterministically discarded malformed or premature references from "
+                    "this decision; the valid remainder was applied. These are not evidence:",
+                    *reference_warnings,
+                ],
+            )
 
         # Freeze the exact provider decision before mutating canonical assignment state.
         # A crash may leave this immutable file orphaned, but replay can only produce the

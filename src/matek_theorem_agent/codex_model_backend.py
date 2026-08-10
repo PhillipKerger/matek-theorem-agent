@@ -1168,6 +1168,25 @@ class CodexCliModelClient:
                             )
                         )
                         if user_tree_changes:
+                            # Only a write into the user project outside the shared .matek
+                            # state tree can reach this hard stop: the worker's own run root
+                            # and every sibling run's state are already partitioned out as
+                            # unattributable warnings above.
+                            atomic_write_json(
+                                artifacts.call_root / "integrity.json",
+                                {
+                                    "schema_version": 1,
+                                    "disposition": "unauthorized",
+                                    "run_id": run_root.name,
+                                    "allowed_roots": [
+                                        str(root)
+                                        for root in (run_root, *policy.allowed_write_paths)
+                                    ],
+                                    "user_tree_changes": user_tree_changes,
+                                    "state_tree_changes": state_tree_changes,
+                                },
+                                confinement_root=run_root,
+                            )
                             raise _AttemptException(
                                 _AttemptFailure(
                                     CodexFailureClassification(

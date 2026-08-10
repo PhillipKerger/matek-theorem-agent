@@ -825,6 +825,16 @@ async def test_workspace_write_detects_unauthorized_change(tmp_path: Path) -> No
     assert len(backend.exec_requests) == 1
     assert "unauthorized.txt" in caught.value.detail
 
+    # The failure trace must retain the full diagnostic record even though the call failed
+    # the post-call integrity check.
+    call_root = caught.value.checkpoint_path
+    for name in ("request.json", "schema.json", "events.jsonl", "stderr.log"):
+        assert (call_root / name).is_file(), name
+    integrity = json.loads((call_root / "integrity.json").read_text(encoding="utf-8"))
+    assert integrity["disposition"] == "unauthorized"
+    assert integrity["user_tree_changes"] == ["unauthorized.txt"]
+    assert str(allowed) in integrity["allowed_roots"]
+
 
 @pytest.mark.asyncio
 async def test_research_worker_workspace_binding_uses_private_cwd_and_accepts_workspace(
