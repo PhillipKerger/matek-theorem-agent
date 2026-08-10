@@ -315,10 +315,8 @@ not by the label; a distinct statement reusing a one-liner receives a numeric ` 
 Operational nodes (problems, runs, tasks, audits, artifacts, sources, formalizations, human notes)
 keep deterministic `XXX-########` hash IDs, as does the immutable main target claim so its anchor
 never moves. The vault stores descriptive IDs in frontmatter and wikilink labels; note directories
-use a portable slug with a short digest of the full ID. `matek graph doctor --repair` renames
-legacy hash IDs on mathematical nodes to descriptive IDs, rewriting every edge, metadata field,
-and note body reference in one recoverable transaction while preserving the old ID as
-`matek_legacy_node_id` metadata.
+use a portable slug with a short digest of the full ID. There are no legacy hash-ID mathematical
+nodes in released graphs: `matek graph doctor` covers source identity metadata only.
 
 Candidate packaging re-establishes this mapping from persisted state. Every replay-backed
 computation in a triggering report must lie in an exact-main result's transitive local-result

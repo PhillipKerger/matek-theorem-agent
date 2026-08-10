@@ -11,6 +11,8 @@ from matek_theorem_agent.graph_ids import (
     is_legacy_node_id,
     normalize_id_description,
     strip_collision_suffix,
+    suggest_node_ids,
+    unknown_id_message,
     validate_any_node_id,
 )
 
@@ -72,3 +74,51 @@ def test_overlong_descriptive_ids_are_rejected() -> None:
     with pytest.raises(ValueError):
         validate_any_node_id(overlong)
     assert not is_descriptive_node_id(overlong)
+
+
+def test_suggest_node_ids_finds_lexically_close_descriptive_ids() -> None:
+    known = [
+        "CLAIM: Halfspaces through the centroid keep at least a 1/e volume fraction",
+        "APPROACH: Blaschke-Santalo symmetrization",
+        "OBLIGATION: Close the induction step for arbitrary n",
+    ]
+    suggestions = suggest_node_ids(
+        "CLAIM: Halfspaces thruogh the centroid keep at least a 1/e volume fraction",
+        known,
+    )
+    assert suggestions[0] == known[0]
+
+
+def test_suggest_node_ids_is_case_insensitive_and_deterministic() -> None:
+    known = ["CLAIM: Every boundary object has property P", "CLM-ATSPTGT1"]
+    first = suggest_node_ids("claim: every boundary object has property p.", known)
+    second = suggest_node_ids("claim: every boundary object has property p.", known)
+    assert first == second
+    assert first[0] == known[0]
+
+
+def test_suggest_node_ids_returns_nothing_for_unrelated_queries_or_empty_pools() -> None:
+    assert suggest_node_ids("zzz", []) == []
+    assert suggest_node_ids("CLAIM: Completely unrelated statement about topology", [
+        "CLAIM: Every boundary object has property P",
+    ]) == []
+
+
+def test_unknown_id_message_inlines_suggestions() -> None:
+    message = unknown_id_message(
+        "scientific report references unknown dependency node ID(s): ",
+        ["CLAIM: Halfspaces thruogh the centroid keep volume"],
+        ["CLAIM: Halfspaces through the centroid keep at least a 1/e volume fraction"],
+    )
+    assert message.startswith("scientific report references unknown dependency node ID(s): ")
+    assert "did you mean" in message
+    assert "CLAIM: Halfspaces through the centroid keep at least a 1/e volume fraction" in message
+
+
+def test_unknown_id_message_omits_suggestions_when_nothing_is_close() -> None:
+    message = unknown_id_message(
+        "unknown: ",
+        ["CLAIM: Something entirely different entirely"],
+        ["CLAIM: Every boundary object has property P"],
+    )
+    assert message == "unknown: CLAIM: Something entirely different entirely"

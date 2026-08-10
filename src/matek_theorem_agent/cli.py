@@ -43,6 +43,7 @@ from .doctor import CheckLevel, DoctorGroup, run_doctor_checks
 from .execution.base import ExecutionBackend
 from .execution.docker import DockerBackend
 from .execution.native import NativeBackend
+from .graph_ids import suggest_node_ids
 from .initialization import InitializationError, initialize_project
 from .intake import IntakeError, normalize_problem_text
 from .knowledge_graph import (
@@ -823,15 +824,12 @@ def graph_doctor(
     repair: bool = typer.Option(
         False,
         "--repair",
-        help=(
-            "Transactionally repair whitelisted generated metadata defects and rename "
-            "legacy hash node IDs to descriptive one-liner IDs."
-        ),
+        help="Transactionally repair whitelisted generated metadata defects.",
     ),
     problem_id: str | None = typer.Option(None, "--problem-id"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Inspect repairable generated graph metadata and legacy node IDs without model calls."""
+    """Inspect repairable generated graph metadata without model calls."""
 
     try:
         report = _project_graph(knowledge_graph).doctor(
@@ -853,6 +851,67 @@ def graph_frontier(
     try:
         frontier_value = _project_graph(knowledge_graph).frontier(problem_id)
         console.print(json.dumps(frontier_value.model_dump(mode="json"), indent=2, sort_keys=True))
+    except BaseException as exc:
+        _abort(exc)
+
+
+@graph_app.command("search")
+def graph_search(
+    query: str,
+    limit: int = typer.Option(10, "--limit", "-n", min=1, max=100),
+    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
+) -> None:
+    """Lexically search node IDs and titles; useful after an exact-ID lookup misses."""
+
+    try:
+        graph = _project_graph(knowledge_graph)
+        nodes = graph.load_nodes(include_human_notes=False)
+        by_id = {node.matek_id: node for node in nodes if not node.tombstone}
+        id_matches = suggest_node_ids(query, by_id, limit=limit)
+        title_matches = suggest_node_ids(
+            query,
+            [node.title for node in by_id.values()],
+            limit=limit,
+        )
+        title_to_ids: dict[str, list[str]] = {}
+        for node in by_id.values():
+            title_to_ids.setdefault(node.title, []).append(node.matek_id)
+        results: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for node_id in id_matches:
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            node = by_id[node_id]
+            results.append(
+                {
+                    "matek_id": node_id,
+                    "node_type": node.node_type.value,
+                    "title": node.title,
+                    "match": "id",
+                }
+            )
+        for title in title_matches:
+            for node_id in sorted(title_to_ids.get(title, [])):
+                if node_id in seen:
+                    continue
+                seen.add(node_id)
+                node = by_id[node_id]
+                results.append(
+                    {
+                        "matek_id": node_id,
+                        "node_type": node.node_type.value,
+                        "title": node.title,
+                        "match": "title",
+                    }
+                )
+        console.print(
+            json.dumps(
+                {"query": query, "results": results[:limit]},
+                indent=2,
+                sort_keys=True,
+            )
+        )
     except BaseException as exc:
         _abort(exc)
 

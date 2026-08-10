@@ -21,8 +21,9 @@ contains ``": "`` and a descriptive ID never matches the legacy hash shape.
 
 from __future__ import annotations
 
+import difflib
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 
 LEGACY_NODE_ID = re.compile(r"\A[A-Z]{3}-[A-Z0-9]{8,64}\Z")
 
@@ -153,3 +154,48 @@ def strip_collision_suffix(node_id: str) -> str:
     """Return the base descriptive ID without a trailing `` (n)`` collision suffix."""
 
     return _COLLISION_SUFFIX.sub("", node_id)
+
+
+def suggest_node_ids(
+    attempted: str,
+    candidates: Iterable[str],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """Return the closest known node IDs for one mistyped reference.
+
+    This is the deterministic, offline lexical fallback for exact-match lookup
+    misses: stdlib sequence similarity over the known IDs, case-insensitive, best
+    matches first.  It is advisory text for error messages only — admission and
+    gates still require exact IDs, and no suggestion is ever accepted implicitly.
+    """
+
+    pool = sorted(dict.fromkeys(item for item in candidates if item.strip()))
+    if not pool:
+        return []
+    query = attempted.casefold()
+    # A shared "CLAIM: " style prefix would otherwise inflate similarity between
+    # unrelated statements, so the description tail is scored on its own too.
+    query_tail = query.split(": ", 1)[-1]
+    scored = []
+    for candidate in pool:
+        folded = candidate.casefold()
+        overall = difflib.SequenceMatcher(None, query, folded).ratio()
+        tail = difflib.SequenceMatcher(None, query_tail, folded.split(": ", 1)[-1]).ratio()
+        scored.append((max(overall, tail), candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for score, candidate in scored[:limit] if score > 0.45]
+
+
+def unknown_id_message(prefix: str, unknown_ids: Iterable[str], known_ids: Iterable[str]) -> str:
+    """Render one unknown-ID error with per-ID 'did you mean' suggestions."""
+
+    known = list(known_ids)
+    parts: list[str] = []
+    for unknown in sorted(dict.fromkeys(unknown_ids)):
+        suggestions = suggest_node_ids(unknown, known)
+        if suggestions:
+            parts.append(f"{unknown} (did you mean: {'; '.join(suggestions)})")
+        else:
+            parts.append(unknown)
+    return prefix + ", ".join(parts)

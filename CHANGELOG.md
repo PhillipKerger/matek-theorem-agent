@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0 — 2026-08-10
+
+- Agent-authored mathematical graph nodes now carry descriptive one-liner IDs instead of opaque
+  hash IDs. Claims, definitions, approaches, proofs, proof attempts, derivations, obligations,
+  counterexamples, and experiments are minted as `CLAIM: <one-line description>`,
+  `APPROACH: <one-line mechanism>`, and so on, from the reporting agent's new `one_liner` field
+  (falling back to the exact statement). Canonical claim/definition identity still coalesces by
+  exact-statement fingerprint, scope, and assumption contract; a distinct statement reusing a
+  one-liner receives a numeric ` (n)` suffix. Operational nodes (problems, runs, tasks, audits,
+  artifacts, sources, formalizations, human notes) and the immutable main target claim keep their
+  stable hash IDs. Graph references are copied verbatim by agents and validated against both
+  formats; descriptive IDs live in frontmatter and wikilink labels, with portable slug-plus-digest
+  vault directories. Because no released graph predates this format, no ID-migration repair path
+  exists; `matek graph doctor` covers source identity metadata only.
+- Mistyped graph references now produce deterministic, offline "did you mean" suggestions. Exact
+  lookups remain exact — admission, audits, and gates never accept a suggestion implicitly — but
+  unknown dependency/target IDs in worker reports and coordinator assignments name up to three
+  lexically closest live node IDs in their error text, which flows into the worker's recorded
+  recovery obligations and the coordinator's rejection. `matek graph search <text>` provides the
+  same lexical search over node IDs and titles for humans.
+
 ## 0.7.2 — 2026-08-09
 
 - Made coordinator reference validation recoverable. A coordinator that names an unknown

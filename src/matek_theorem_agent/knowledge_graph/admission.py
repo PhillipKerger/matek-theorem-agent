@@ -14,6 +14,7 @@ from ..graph_ids import (
     dedupe_descriptive_id,
     descriptive_node_id,
     normalize_id_description,
+    unknown_id_message,
 )
 from ..scientific import (
     ScientificObligationDeclaration,
@@ -801,8 +802,11 @@ def build_scientific_admission(
     )
     if unknown_result_dependencies:
         raise ScientificAdmissionError(
-            "scientific report references unknown dependency node ID(s): "
-            + ", ".join(unknown_result_dependencies)
+            unknown_id_message(
+                "scientific report references unknown dependency node ID(s): ",
+                unknown_result_dependencies,
+                known_ids,
+            )
         )
     try:
         dependency_order = validate_result_dependency_dag(results)
@@ -898,8 +902,11 @@ def build_scientific_admission(
     )
     if unknown_dependencies:
         raise ScientificAdmissionError(
-            "scientific report references unknown dependency node ID(s): "
-            + ", ".join(unknown_dependencies)
+            unknown_id_message(
+                "scientific report references unknown dependency node ID(s): ",
+                unknown_dependencies,
+                known_ids,
+            )
         )
     unknown_targets = sorted(
         {
@@ -911,7 +918,11 @@ def build_scientific_admission(
     )
     if unknown_targets:
         raise ScientificAdmissionError(
-            "scientific report references unknown target node ID(s): " + ", ".join(unknown_targets)
+            unknown_id_message(
+                "scientific report references unknown target node ID(s): ",
+                unknown_targets,
+                known_ids,
+            )
         )
     planned: dict[str, GraphNode] = {}
     records: list[AdmittedResultRecord] = []

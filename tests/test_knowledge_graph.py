@@ -3351,20 +3351,18 @@ def test_graph_cli_requires_selection_when_multiple_graphs_exist(
     assert "does not exist" in missing.output
 
 
-def test_graph_doctor_renames_legacy_hash_ids_to_descriptive_one_liners(
-    tmp_path: Path,
-) -> None:
+def test_mistyped_assignment_target_gets_did_you_mean_suggestions(tmp_path: Path) -> None:
     graph, _problem, problem_id, _ = initialized_graph(tmp_path)
     main_target_id = graph.main_claim_id(problem_id)
     tasks, _, _ = graph.record_assignment_tasks(
         problem_id=problem_id,
         run_id="run-one",
-        decision_id=7,
+        decision_id=9,
         assignments=[
             {
-                "id": "worker-legacy",
-                "approach_family": "symmetrization",
-                "task": "Prove the centroid bound.",
+                "id": "worker-seed",
+                "approach_family": "induction",
+                "task": "Prove a useful intermediate lemma.",
                 "expected_output": "An exact lemma and proof.",
                 "target_node_ids": [main_target_id],
             }
@@ -3374,88 +3372,73 @@ def test_graph_doctor_renames_legacy_hash_ids_to_descriptive_one_liners(
         GraphPatch(
             base_graph_revision=graph.load_state().revision,
             run_id="run-one",
-            task_id=tasks["worker-legacy"],
+            task_id=tasks["worker-seed"],
             agent_role="research-auditor",
             create_nodes=[
                 GraphNodeCreate(
-                    matek_id="CLM-LEGACYCLAIM001",
                     node_type=NodeType.CLAIM,
                     claim_type=ClaimType.LEMMA,
-                    title="Any halfspace through the centroid keeps at least 1/e of the volume",
-                    body=(
-                        "## Exact statement\n\nFor a convex body C of volume v with centroid c, "
-                        "any halfspace H whose boundary contains c satisfies vol(H cap C) >= v/e."
-                    ),
-                ),
-                GraphNodeCreate(
-                    matek_id="APR-LEGACYAPR00001",
-                    node_type=NodeType.APPROACH,
-                    title="Symmetrization approach",
-                    body=(
-                        "## Exact route attempted\n\nUse Blaschke-Santalo symmetrization "
-                        "to reduce to the ball."
-                    ),
-                ),
-            ],
-            add_edges=[
-                GraphEdge(
-                    source_id="CLM-LEGACYCLAIM001",
-                    relation=RelationType.RELATED_TO,
-                    target_id="APR-LEGACYAPR00001",
+                    title="Every boundary object has property P",
+                    body="## Exact statement\n\nEvery boundary object has property P.",
                 )
             ],
         ),
         problem_id=problem_id,
-        operation_id="legacy-nodes",
+        operation_id="seed-descriptive-claim",
     )
     assert merged.committed
+    claim_id = next(iter(merged.created_node_ids))
+    assert claim_id == "CLAIM: Every boundary object has property P"
 
-    planned = graph.doctor(problem_id=problem_id)
-    assert [action.applied for action in planned.actions] == [False, False]
-    planned_ids = {
-        action.before["matek_id"]: action.after["matek_id"] for action in planned.actions
-    }
-    assert planned_ids == {
-        "APR-LEGACYAPR00001": "APPROACH: Symmetrization approach",
-        "CLM-LEGACYCLAIM001": (
-            "CLAIM: Any halfspace through the centroid keeps at least 1/e of the volume"
-        ),
-    }
-    assert graph.load_state().revision == planned.previous_revision
+    with pytest.raises(GraphValidationError) as excinfo:
+        graph.validate_assignment_targets(
+            problem_id=problem_id,
+            assignments=[
+                {
+                    "id": "worker-mistyped",
+                    "target_node_ids": ["CLAIM: Every boundry object has property P"],
+                }
+            ],
+        )
+    message = str(excinfo.value)
+    assert "unknown target CLAIM: Every boundry object has property P" in message
+    assert "did you mean: CLAIM: Every boundary object has property P" in message
 
-    repaired = graph.doctor(repair=True, problem_id=problem_id, run_id="run-doctor")
-    assert all(action.applied for action in repaired.actions)
-    assert repaired.repair_log is not None
-    repair_log = json.loads((graph.graph_root / repaired.repair_log).read_text(encoding="utf-8"))
-    assert [action["rule"] for action in repair_log["actions"]] == [
-        "legacy_hash_id_rename",
-        "legacy_hash_id_rename",
-    ]
 
-    nodes = {node.matek_id: node for node in graph.load_nodes(include_human_notes=False)}
-    new_claim_id = planned_ids["CLM-LEGACYCLAIM001"]
-    new_approach_id = planned_ids["APR-LEGACYAPR00001"]
-    assert "CLM-LEGACYCLAIM001" not in nodes
-    assert "APR-LEGACYAPR00001" not in nodes
-    claim = nodes[new_claim_id]
-    approach = nodes[new_approach_id]
-    assert claim.metadata["matek_legacy_node_id"] == "CLM-LEGACYCLAIM001"
-    assert approach.metadata["matek_legacy_node_id"] == "APR-LEGACYAPR00001"
-    # References to renamed IDs are rewritten across the graph.
-    assert [
-        (edge.relation, edge.target_id) for edge in claim.relations
-    ] == [(RelationType.RELATED_TO, new_approach_id)]
-    # The immutable main target keeps its stable anchor ID.
-    assert main_target_id in nodes
-    # The rename is idempotent: a second inspection plans nothing.
-    assert graph.doctor(problem_id=problem_id).actions == []
-    assert graph.validate().valid
-    # The canonical ledger still projects after the rename.
-    state = graph.load_state()
-    ledger = project_markdown_ledger(
-        list(nodes.values()),
-        graph_revision=state.revision,
-        problem_id=problem_id,
-        target_claim_id=main_target_id,
+def test_graph_search_cli_finds_nodes_lexically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "cli-search-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    monkeypatch.chdir(project)
+    problem = project / "problem.md"
+    problem.write_text("Prove the search fixture theorem.\n", encoding="utf-8")
+    graph = KnowledgeGraph(project, "problem")
+    problem_id, _ = graph.initialize_problem(
+        source_path=problem,
+        problem_text=problem.read_text(encoding="utf-8"),
+        run_id="run-one",
     )
-    assert main_target_id in ledger.claims
+    graph.record_compiled_problem(
+        problem_id=problem_id,
+        run_id="run-one",
+        compiled_problem={
+            "title": "Search fixture theorem",
+            "normalized_statement": "Every searchable object has the fixture property.",
+            "claim_contract": {"target": "the fixture property"},
+            "literature_status": "open_problem",
+            "source_ledger": [],
+        },
+    )
+
+    cli = CliRunner()
+    found = cli.invoke(app, ["graph", "search", "searchable fixture property"])
+    assert found.exit_code == 0, found.output
+    payload = json.loads(found.output)
+    assert payload["query"] == "searchable fixture property"
+    assert payload["results"]
+    assert any("Search fixture theorem" in str(item["title"]) for item in payload["results"])
+    empty = cli.invoke(app, ["graph", "search", "zzzzzzzzzzz"])
+    assert empty.exit_code == 0, empty.output
+    assert json.loads(empty.output)["results"] == []

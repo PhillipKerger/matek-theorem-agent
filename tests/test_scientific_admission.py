@@ -1156,3 +1156,22 @@ def test_obligation_retry_coalesces_by_admission_binding_not_id() -> None:
         obligations=obligations,
     )
     assert retry.nodes == []
+
+
+def test_mistyped_dependency_id_error_suggests_the_closest_known_node() -> None:
+    premise = graph_node("CLM-PREMISE1", NodeType.CLAIM, "Audited premise")
+    nodes = [*existing_nodes(), premise]
+    with pytest.raises(ScientificAdmissionError) as excinfo:
+        admit(
+            [
+                result(
+                    local_key="lemma-with-typo",
+                    scope=ScientificScope.BRANCH,
+                    dependencies=["CLM-PREM1SE1"],
+                )
+            ],
+            nodes=nodes,
+        )
+    message = str(excinfo.value)
+    assert "unknown dependency node ID(s)" in message
+    assert "did you mean: CLM-PREMISE1" in message

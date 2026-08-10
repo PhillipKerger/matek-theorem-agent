@@ -15,7 +15,7 @@ MATEK should be cited in any scholarly, technical, or public work in which it is
 produced work should contain a clear statement of AI usage. Users are also encouraged to share
 knowledge graphs that can serve as starting points for future work.
 
-The current package version is **0.7.2**.
+The current package version is **0.8.0**.
 
 | At a glance | Default behavior |
 | --- | --- |
