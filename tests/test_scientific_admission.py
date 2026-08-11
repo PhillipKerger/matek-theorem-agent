@@ -1003,9 +1003,7 @@ def test_automatic_exact_gap_is_the_canonical_main_open_cut() -> None:
     assert smallest_known_open_cut(ledger).obligation_ids == [obligation.matek_id]
 
 
-CENTROID_STATEMENT = (
-    "For every convex body C, vol(H cap C) >= v/e when bd H contains the centroid."
-)
+CENTROID_STATEMENT = "For every convex body C, vol(H cap C) >= v/e when bd H contains the centroid."
 
 
 def _result_with_one_liner(
@@ -1062,9 +1060,7 @@ def test_identical_statement_with_new_one_liner_coalesces_onto_existing_claim() 
             )
         ]
     )
-    claim_id = next(
-        node.matek_id for node in first.nodes if node.node_type is NodeType.CLAIM
-    )
+    claim_id = next(node.matek_id for node in first.nodes if node.node_type is NodeType.CLAIM)
     second = admit(
         [
             _result_with_one_liner(
@@ -1095,9 +1091,7 @@ def test_distinct_statements_with_the_same_one_liner_get_numeric_suffixes() -> N
             ),
         ]
     )
-    claim_ids = sorted(
-        node.matek_id for node in plan.nodes if node.node_type is NodeType.CLAIM
-    )
+    claim_ids = sorted(node.matek_id for node in plan.nodes if node.node_type is NodeType.CLAIM)
     assert claim_ids == ["CLAIM: The same one-liner", "CLAIM: The same one-liner (2)"]
 
 

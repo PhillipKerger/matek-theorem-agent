@@ -98,9 +98,7 @@ def _normalize_node_ids(values: list[str]) -> list[str]:
     try:
         normalized = [validate_any_node_id(item) for item in values]
     except ValueError as exc:
-        raise ValueError(
-            "scientific dependencies and targets must be stable node IDs"
-        ) from exc
+        raise ValueError("scientific dependencies and targets must be stable node IDs") from exc
     return list(dict.fromkeys(normalized))
 
 

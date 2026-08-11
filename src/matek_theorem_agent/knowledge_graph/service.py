@@ -4731,9 +4731,7 @@ class KnowledgeGraph:
                 created_node_id = item.matek_id
                 if created_node_id is None:
                     if item.node_type in NODE_ID_WORDS:
-                        created_node_id = _descriptive_id(
-                            item.node_type, item.title, set(by_id)
-                        )
+                        created_node_id = _descriptive_id(item.node_type, item.title, set(by_id))
                     else:
                         created_node_id = _new_id(item.node_type)
                 node = GraphNode(
@@ -5616,9 +5614,7 @@ class KnowledgeGraph:
         for node_id in normalized:
             node = nodes.get(node_id)
             if node is None:
-                issues.append(
-                    unknown_id_message("unknown target ", [node_id], nodes.keys())
-                )
+                issues.append(unknown_id_message("unknown target ", [node_id], nodes.keys()))
             elif node.problem_id != problem_id and node.matek_id != problem_id:
                 issues.append(f"target {node_id} belongs to another problem")
             elif node.tombstone:
@@ -7144,8 +7140,7 @@ class KnowledgeGraph:
             accepted_intermediate = gate.get("accepted_intermediate")
             if status == "audit_passed":
                 if not isinstance(accepted_intermediate, Mapping) or (
-                    str(accepted_intermediate.get("statement_id") or "").strip()
-                    != statement_id
+                    str(accepted_intermediate.get("statement_id") or "").strip() != statement_id
                     or bool(accepted_intermediate.get("terminal_main_target_satisfied"))
                     or bool(accepted_intermediate.get("manuscript_authorized"))
                 ):
@@ -7157,9 +7152,7 @@ class KnowledgeGraph:
                     "only a passing lemma audit may carry an accepted theorem"
                 )
             origin_assignment = str(nomination.get("origin_worker_id") or "").strip()
-            canonical_derivation_id = str(
-                nomination.get("canonical_derivation_id") or ""
-            ).strip()
+            canonical_derivation_id = str(nomination.get("canonical_derivation_id") or "").strip()
             operation_id = f"lemma-audit:{run_id}:{audit_id_text}"
             prior_operation = state.processed_operations.get(operation_id)
             audit_node_id = _deterministic_id(
@@ -7861,9 +7854,7 @@ class KnowledgeGraph:
                 and node.metadata.get("matek_assignment_id") == assignment_id
                 and node.metadata.get("matek_result_local_key") == result_local_key
             ]
-            counterexample = (
-                binding_candidates[0] if len(binding_candidates) == 1 else None
-            )
+            counterexample = binding_candidates[0] if len(binding_candidates) == 1 else None
             if counterexample is None:
                 raise GraphValidationError(
                     "counterexample audit does not resolve to its deterministic admitted candidate"

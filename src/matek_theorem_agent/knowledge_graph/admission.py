@@ -1372,9 +1372,7 @@ def build_scientific_admission(
                 planned[claim_id] = claim
                 created_ids.append(claim_id)
 
-            attempt_id = allocator.allocate(
-                NodeType.PROOF_ATTEMPT, _result_one_liner(result)
-            )
+            attempt_id = allocator.allocate(NodeType.PROOF_ATTEMPT, _result_one_liner(result))
             attempt_relations = [
                 GraphEdge(
                     source_id=attempt_id,
@@ -1465,9 +1463,7 @@ def build_scientific_admission(
                 and not result.assumptions
                 and result.disposition is ScientificResultDisposition.PROPOSED_COMPLETE
             ):
-                derivation_id = allocator.allocate(
-                    NodeType.DERIVATION, _result_one_liner(result)
-                )
+                derivation_id = allocator.allocate(NodeType.DERIVATION, _result_one_liner(result))
                 derivation_relations = [
                     GraphEdge(
                         source_id=derivation_id,
@@ -1705,8 +1701,7 @@ def build_scientific_admission(
             node
             for node in combined_nodes.values()
             if node.node_type is NodeType.OBLIGATION
-            and node.metadata.get("matek_obligation_admission_identity")
-            == declaration_identity
+            and node.metadata.get("matek_obligation_admission_identity") == declaration_identity
         ]
         if len(bound_existing) > 1:
             raise ScientificAdmissionError(
@@ -1714,10 +1709,9 @@ def build_scientific_admission(
             )
         if bound_existing:
             existing_obligation = bound_existing[0]
-            if (
-                existing_obligation.metadata.get("matek_obligation_admission_payload_sha256")
-                != _obligation_payload_sha256(declaration)
-            ):
+            if existing_obligation.metadata.get(
+                "matek_obligation_admission_payload_sha256"
+            ) != _obligation_payload_sha256(declaration):
                 raise ScientificAdmissionError(
                     f"obligation admission identity collision for {declaration.local_key!r}"
                 )

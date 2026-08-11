@@ -205,9 +205,7 @@ class CounterexampleGraphSupport(_AuditModel):
         try:
             return validate_any_node_id(value)
         except ValueError as exc:
-            raise ValueError(
-                "counterexample graph support has an invalid node ID"
-            ) from exc
+            raise ValueError("counterexample graph support has an invalid node ID") from exc
 
     @field_validator("source_revision")
     @classmethod
@@ -230,9 +228,7 @@ class CounterexampleGraphSupport(_AuditModel):
                     "counterexample result graph bindings require stable node IDs"
                 ) from exc
             if not ids:
-                raise ValueError(
-                    "counterexample result graph bindings require stable node IDs"
-                )
+                raise ValueError("counterexample result graph bindings require stable node IDs")
             normalized[key] = ids
         return normalized
 

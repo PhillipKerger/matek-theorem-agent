@@ -1650,9 +1650,7 @@ def _research_scheduler_snapshot(state: RunState) -> tuple[dict[str, int], str, 
     if not isinstance(assignments, list):
         raise ConfigError("research coordinator assignment state is invalid")
     counts = {
-        status: sum(
-            isinstance(item, dict) and item.get("status") == status for item in assignments
-        )
+        status: sum(isinstance(item, dict) and item.get("status") == status for item in assignments)
         for status in ("queued", "running", "completed")
     }
     return counts, str(scheduler.get("phase", "unknown")), scheduler

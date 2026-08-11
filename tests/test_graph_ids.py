@@ -99,9 +99,15 @@ def test_suggest_node_ids_is_case_insensitive_and_deterministic() -> None:
 
 def test_suggest_node_ids_returns_nothing_for_unrelated_queries_or_empty_pools() -> None:
     assert suggest_node_ids("zzz", []) == []
-    assert suggest_node_ids("CLAIM: Completely unrelated statement about topology", [
-        "CLAIM: Every boundary object has property P",
-    ]) == []
+    assert (
+        suggest_node_ids(
+            "CLAIM: Completely unrelated statement about topology",
+            [
+                "CLAIM: Every boundary object has property P",
+            ],
+        )
+        == []
+    )
 
 
 def test_unknown_id_message_inlines_suggestions() -> None:

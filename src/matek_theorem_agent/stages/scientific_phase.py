@@ -75,9 +75,7 @@ def _stable_ids(values: list[str]) -> list[str]:
     try:
         normalized = [validate_any_node_id(value) for value in values]
     except ValueError as exc:
-        raise ValueError(
-            "scientific frontier references must be stable graph IDs"
-        ) from exc
+        raise ValueError("scientific frontier references must be stable graph IDs") from exc
     return list(dict.fromkeys(normalized))
 
 

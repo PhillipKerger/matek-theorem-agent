@@ -239,8 +239,7 @@ class GraphNode(_GraphModel):
     def type_specific_fields_are_consistent(self) -> GraphNode:
         if not node_id_matches_type(self.matek_id, self.node_type):
             raise ValueError(
-                f"{self.node_type.value} node ID does not match its node type: "
-                f"{self.matek_id!r}"
+                f"{self.node_type.value} node ID does not match its node type: {self.matek_id!r}"
             )
         if self.node_type is NodeType.CLAIM and self.claim_type is None:
             raise ValueError("claim nodes require claim_type")

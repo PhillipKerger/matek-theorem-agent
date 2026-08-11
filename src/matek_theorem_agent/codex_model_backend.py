@@ -887,9 +887,7 @@ class CodexCliModelClient:
             raise ValueError("writable workspace binding is restricted to the research-worker role")
         if self._run_root is None:
             raise ValueError("Codex bound workspace requires an active run root")
-        workspace = _existing_canonical_directory(
-            workspace_root, "Codex bound workspace root"
-        )
+        workspace = _existing_canonical_directory(workspace_root, "Codex bound workspace root")
         workspace = ensure_path_confined(self._confinement_root, workspace)
         private_root = _existing_directory(
             self._run_root / "research" / "workspaces",
@@ -897,14 +895,10 @@ class CodexCliModelClient:
         )
         workspace = ensure_path_confined(private_root, workspace)
         if workspace.parent != private_root:
-            raise ValueError(
-                "Codex bound workspace must be one assignment's private root"
-            )
+            raise ValueError("Codex bound workspace must be one assignment's private root")
         if len(writable_paths) != 1:
             raise ValueError("Codex bound workspace requires one explicit writable path")
-        writable = _existing_canonical_directory(
-            writable_paths[0], "Codex bound writable path"
-        )
+        writable = _existing_canonical_directory(writable_paths[0], "Codex bound writable path")
         if writable != workspace:
             raise ValueError("Codex bound writable path must equal its private workspace root")
         if not os.access(writable, os.W_OK):
@@ -1160,12 +1154,10 @@ class CodexCliModelClient:
                         allowed_roots=(run_root, *policy.allowed_write_paths),
                     )
                     if unauthorized:
-                        user_tree_changes, state_tree_changes = (
-                            _partition_state_tree_changes(
-                                unauthorized,
-                                workspace=self._confinement_root,
-                                run_root=run_root,
-                            )
+                        user_tree_changes, state_tree_changes = _partition_state_tree_changes(
+                            unauthorized,
+                            workspace=self._confinement_root,
+                            run_root=run_root,
                         )
                         if user_tree_changes:
                             # Only a write into the user project outside the shared .matek

@@ -4367,12 +4367,8 @@ def test_structural_violation_still_raises() -> None:
 
     decision = _decision_for_validation(
         assignments=[
-            ResearchAssignment(
-                id="dup", approach_family="a", task="t", expected_output="e"
-            ),
-            ResearchAssignment(
-                id="dup", approach_family="b", task="t", expected_output="e"
-            ),
+            ResearchAssignment(id="dup", approach_family="a", task="t", expected_output="e"),
+            ResearchAssignment(id="dup", approach_family="b", task="t", expected_output="e"),
         ]
     )
 

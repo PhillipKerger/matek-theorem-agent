@@ -212,9 +212,7 @@ class TargetObligationVersion(BaseModel):
         try:
             return validate_any_node_id(value)
         except ValueError as exc:
-            raise ValueError(
-                "target obligation versions require stable graph IDs"
-            ) from exc
+            raise ValueError("target obligation versions require stable graph IDs") from exc
 
     @field_validator("logical_version")
     @classmethod
@@ -264,9 +262,7 @@ class ResearchAssignment(BaseModel):
         try:
             normalized = [validate_any_node_id(item) for item in value]
         except ValueError as exc:
-            raise ValueError(
-                "scientific frontier references must be stable graph IDs"
-            ) from exc
+            raise ValueError("scientific frontier references must be stable graph IDs") from exc
         return list(dict.fromkeys(normalized))
 
     @field_validator("mechanism_delta")
@@ -404,9 +400,7 @@ class IntermediateLemmaAuditRecord(BaseModel):
         try:
             normalized = [validate_any_node_id(item) for item in value]
         except ValueError as exc:
-            raise ValueError(
-                "intermediate lemma audit targets must be stable graph IDs"
-            ) from exc
+            raise ValueError("intermediate lemma audit targets must be stable graph IDs") from exc
         if len(normalized) != len(set(normalized)):
             raise ValueError("intermediate lemma audit targets must be unique")
         return normalized
@@ -2314,9 +2308,7 @@ def _validate_coordinator_decision(
         decision = decision.model_copy(
             update={
                 "retire_assignment_ids": [
-                    item
-                    for item in decision.retire_assignment_ids
-                    if item in known_assignment_ids
+                    item for item in decision.retire_assignment_ids if item in known_assignment_ids
                 ],
                 "redirect_assignment_ids": [
                     item
@@ -2337,8 +2329,7 @@ def _validate_coordinator_decision(
         if reference_warnings is not None:
             reference_warnings.append(
                 "Unavailable report references (still active directions, not evidence; do not "
-                "package as completed evidence): "
-                + ", ".join(unknown_candidate_reports)
+                "package as completed evidence): " + ", ".join(unknown_candidate_reports)
             )
         decision = decision.model_copy(
             update={

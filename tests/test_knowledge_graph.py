@@ -3444,7 +3444,6 @@ def test_graph_search_cli_finds_nodes_lexically(
     assert json.loads(empty.output)["results"] == []
 
 
-
 def test_obligation_with_projection_demoted_parent_is_ambiguity_not_ledger_error(
     tmp_path: Path,
 ) -> None:
@@ -3505,9 +3504,7 @@ def test_obligation_with_projection_demoted_parent_is_ambiguity_not_ledger_error
         state = graph._load_state_unlocked()
         nodes = graph._load_nodes_unlocked(include_human_notes=True)
         obligation = next(node for node in nodes if node.node_type is NodeType.OBLIGATION)
-        gapped_attempt = next(
-            node for node in nodes if node.node_type is NodeType.PROOF_ATTEMPT
-        )
+        gapped_attempt = next(node for node in nodes if node.node_type is NodeType.PROOF_ATTEMPT)
         obligation.metadata["matek_parent_derivation_ids"] = [gapped_attempt.matek_id]
         graph._commit_nodes_unlocked(
             state=state,
