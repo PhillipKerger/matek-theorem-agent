@@ -1,5 +1,9 @@
 # CLI Specification
 
+> **P0 graph-state override:** Graph commands for new runs follow
+> [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md). Legacy graph migration, opaque node
+> identifiers, canonical ledgers, snapshots as authority, and tombstone-by-ID commands are removed.
+
 MATEK uses Typer for typed command parsing and Rich for readable output. All commands present
 Codex first as the recommended/default model backend and the direct API as advanced/optional.
 
@@ -336,50 +340,25 @@ even when the frozen run used Docker.
 Graph commands are local and model-free:
 
 - `matek graph list` lists initialized graph names and vault paths.
-- `matek graph init GRAPH_NAME` creates `.matek/knowledge/<graph-name>/`, its schema/state,
-  initial snapshot, navigation, canvases, and SQLite index. `matek init` does not create an
-  identity-free graph.
-- `matek graph validate` checks Markdown parsing, stable IDs, machine ownership, endpoint/type
-  constraints, dependency cycles, hashes, and index revision; invalid graphs exit 6.
-- `matek graph status` renders a typed machine-readable summary. `frontier [--problem-id ID]`
-  includes `main_target`, `live_derivations`, `strongest_audited_results`, `open_obligations`,
-  `smallest_known_open_cut`, and `open_cut_search_capped`.
-- `matek graph doctor [--repair] [--problem-id ID]` inspects generated source metadata without
-  model calls. `--repair` applies only whitelisted local invariants in one recoverable graph
-  transaction, records an append-only before/after artifact, and rebuilds derived projections.
-  It never changes the canonical target or mathematical proof dependencies.
+- `matek graph init GRAPH_NAME` creates the descriptive note directories, navigation, transaction
+  lock area, and disposable SQLite index. It never creates a ledger or graph-state file.
+- `matek graph validate` reparses Markdown and checks descriptive links, title uniqueness, and
+  structural frontmatter. A stale index is rebuilt and is not validation authority.
+- `matek graph status` and `frontier` summarize current Markdown notes by title and status.
+- `matek graph doctor` reports Markdown/index health without model calls.
 - `matek graph rebuild-index` recreates SQLite from authoritative Markdown.
 - `matek graph open` attempts Obsidian and otherwise succeeds gracefully while printing the
   vault path for manual opening.
 - `matek graph export [--format json|graphviz|mermaid] [--output PATH]` exports without Obsidian.
-- `matek graph diff REVISION_A REVISION_B` compares immutable snapshots.
-- `matek graph reconstruct REVISION [--output PATH]` integrity-checks and reconstructs one full
-  snapshot; legacy revisions preserve their exact stored bytes.
-- `matek graph verify-snapshots [REVISION]` verifies one revision or the complete snapshot history,
-  including manifest/parent roots, checkpoints, blob digests, graph records, and revision identity.
-- `matek graph migrate-legacy [--problem-id ID] [--target-claim-id ID]
-  [--audit-nomination-limit N] [--output PATH] [--dry-run] [-g NAME]` is the default read-only
-  planning form. It emits an integrity-protected report and refuses output beneath
-  `.matek/knowledge/`.
-- `matek graph migrate-legacy --apply-plan PLAN [--yes] [-g NAME]` applies the exact externally
-  reviewed plan. `PLAN` must be a nonsymlinked regular file outside `.matek/knowledge/`; `--output`
-  cannot be combined with this form. MATEK verifies integrity, graph identity, source revision,
-  archive digest/count, claim versions, and graph constraints, then asks for confirmation unless
-  `--yes` is present. A stale, wrong-graph, or tampered plan fails without mutation.
-- `show`, `dependencies`, `downstream`, `stale`, and `tasks` provide focused graph queries.
-- `tombstone NODE_ID --reason TEXT` preserves an obsolete identity and invalidates dependents;
-  managed notes must not be deleted directly.
+- `show`, `dependencies`, `downstream`, `stale`, `tasks`, and `search` use descriptive titles.
+- `rename OLD_TITLE NEW_TITLE` atomically renames the note and every inbound wiki link.
 
 Every query/maintenance command accepts `--knowledge-graph NAME` or `-g NAME`. It auto-selects
 only when exactly one initialized graph exists; with multiple graphs an explicit selection is
 required, and an unknown name is an error.
 
 The vault lives beneath `.matek/` so these commands do not imply consent to edit project source.
-Migration-plan output is user-selected, must remain outside every graph vault, and contains
-proposals rather than applied trust. Confirmed application is one recoverable/idempotent graph
-commit that preserves legacy nodes and all earlier snapshots as archive evidence. It creates only
-proposed typed derivations and queued verifier/falsifier audit tasks, makes no model call, and
-records the result at `ledgers/migrations/<plan-sha256>.application.json`.
+There is intentionally no migration/import command for the retired graph formats.
 
 ## Exit codes
 

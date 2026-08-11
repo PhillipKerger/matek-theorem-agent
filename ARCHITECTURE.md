@@ -1,5 +1,9 @@
 # Architecture
 
+> **P0 graph-state override:** [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md) is the
+> controlling architecture for research memory. Older ledger, opaque-ID, snapshot, migration, and
+> graph-state descriptions below are historical and are not part of new-run behavior.
+
 ## High-level data flow
 
 ```text
@@ -324,19 +328,11 @@ closure; the frozen graph-support slice includes that computation's claim, proof
 derivation, immutable manifest/replay nodes, resolved premise versions, and linked obligations.
 An unrelated successful replay cannot satisfy the candidate gate.
 
-The vault is a durable archive; archive membership is not trust. The integrity-protected,
-rebuildable `ledgers/<problem-id>/canonical-ledger.json` projection groups exact normalized claims,
-represents each derivation as joint AND-premises, treats multiple derivations for one conclusion as
-OR alternatives, and retains first-class versioned obligations. Gapped reports remain proof
-attempts plus obligations and cannot enter the derivation ledger. Trusted claims require an
-independent audit or Lean verification, and the frontier computes the smallest known open cut from
-the ledger. A bounded antichain search exposes `open_cut_search_capped` rather than overstating
-minimality. Obligation and derivation link integrity is screened during projection with one
-shared derivation-eligibility predicate: an obligation whose recorded parent derivation, dependency,
-or target claim was itself demoted or removed becomes an `unresolved_obligation_links` ambiguity,
-and a derivation naming a screened or non-reciprocal obligation becomes a
-`non_reciprocal_obligation_link` / `screened_obligation_link` ambiguity. Stale, gapped, or
-demoted archive linkage therefore records a blocked lane and never halts a run.
+The vault is a durable archive; archive membership is not trust. Trust is calculated directly from
+the current Markdown statements, statuses, provenance, and descriptive dependency links. Gapped
+reports remain partial-progress notes plus open obligations. Trusted claims still require an
+independent audit or Lean verification. A malformed proposed link is quarantined locally and never
+turns a recoverable scientific report into a stage-wide failure.
 
 Before research, `prompts/target_alignment.json` hash-binds the compiler's theorem and exact claim
 contract and records possible conflicts; it is not a mathematical proof. Clause keys control
@@ -400,41 +396,23 @@ scientific review.
 Each `.matek/knowledge/<graph-name>/` directory is an ordinary Obsidian-compatible vault and a
 separate portable source of truth. New runs normally derive `<graph-name>` from the source
 filename stem; `--knowledge-graph NAME` deliberately attaches related work to an already
-initialized graph. The chosen name is frozen in run state. Within each vault, `graph-state.json`
-stores its name, revision/hashes, ownership baselines, source-problem mappings, processed
-operation IDs, and change records; `target-registry.json` freezes source-hash target identity;
-`ledgers/` holds rebuildable proof projections; and `snapshots/` supports diffs and reconstruction.
-`graph-index.sqlite` is derived and may be deleted/rebuilt. A pending transaction file plus
-`locks/graph.lock` makes each graph's multi-note commits crash-recoverable and cross-process
-serialized. This placement preserves the default no-write-outside-`.matek/` boundary and prevents
-unrelated problems from sharing memory by default.
+initialized graph. The chosen name is frozen in run state. Within each vault, descriptive Markdown
+notes are the only durable research state. `graph-index.sqlite`, Home, and dashboards are derived
+and may be deleted/rebuilt. A per-graph lock and staged transaction manifest make multi-note commits
+crash-recoverable and cross-process serialized. This placement preserves the default
+no-write-outside-`.matek/` boundary and prevents unrelated problems from sharing memory by default.
 
 Before prompt compilation spends a model call, graph hygiene scans only source nodes for the
 active problem. The initial rule normalizes identifiers and repairs a redundant primary identifier
 that is absent from the identifier list. It commits through the ordinary graph transaction, so the
-Markdown note, snapshot, navigation, and SQLite index advance together, and writes an append-only
+Markdown note, navigation, and SQLite index advance together, and writes an append-only
 `repairs/` artifact containing the rule and before/after values. Missing stable identifiers
 downgrade the source to an unverified warning. Immutable targets, theorem statements, proof claims,
 and dependency semantics are not eligible for this resolver; target changes still require explicit
 migration.
 
-Snapshot schema v2 publishes a small manifest only after its immutable content-addressed node and
-edge blobs and optional checkpoint are durable. Each manifest binds its parent integrity root and
-a content root for the complete reconstructed blob set, plus the SHA-256 digest of the exact
-deterministic full-snapshot reconstruction. Full checkpoints bound delta replay; a checkpoint is
-mandatory at revision zero, every 64 revisions by default, and at the first v2 revision following
-a legacy schema-v1 snapshot. Schema-v1 files are never migrated or rewritten.
-
-`matek graph migrate-legacy` defaults to planning outside the commit path. It reads one stable
-archive revision and emits an integrity-protected report outside `.matek/knowledge/`, proposing
-proof-attempt reclassification, structured dependency extraction, review-only derivations,
-branch-local refutation quarantine, exact-statement aliases, and fresh lemma nominations. A later
-`--apply-plan` operation loads that exact external report, requires confirmation or `--yes`, and
-rechecks its digest, graph name, source revision, node count, archive digest, claim versions, and
-relation constraints under the graph lock. A valid plan commits atomically and idempotently,
-preserving old nodes and snapshots as archive evidence while creating proposed typed records and
-queued verifier/falsifier audit tasks. It makes no model call; ambiguities remain unapplied. The
-integrity-bound result is `ledgers/migrations/<plan-sha256>.application.json`.
+Retired graph formats have no import or migration path. A new semantic vault starts from Markdown
+and can recover only its own interrupted writer transactions.
 
 ### Command execution backends
 

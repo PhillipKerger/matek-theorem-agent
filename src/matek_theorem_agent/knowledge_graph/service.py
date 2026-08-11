@@ -19,6 +19,7 @@ import stat
 import subprocess
 import tempfile
 import unicodedata
+import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -71,22 +72,7 @@ from .admission import (
     matches_admission_binding,
     node_has_scientific_admission_binding,
 )
-from .ledger import (
-    CanonicalLedger,
-    DerivationStatus,
-    LedgerAmbiguity,
-    LedgerClaim,
-    LedgerError,
-    ObligationStatus,
-    logical_version,
-    project_markdown_ledger,
-    smallest_known_open_cut,
-    trusted_claim_ids,
-    write_canonical_ledger,
-)
-from .ledger import (
-    ClaimStatus as LedgerClaimStatus,
-)
+from .ledger import logical_version
 from .markdown import (
     GENERATED_END,
     GENERATED_START,
@@ -195,7 +181,7 @@ MAIN_RESULT_NEEDS_TAG = "MAIN_RESULT_NEEDS"
 _MAIN_RESULT_NEEDS_METADATA = "matek_main_result_needs"
 MANUSCRIPT_CONTEXT_MAXIMUM_NODES = 80
 FORMALIZATION_CONTEXT_MAXIMUM_NODES = 60
-_TRUSTED_CONTEXT_POLICY = "canonical-ledger-trusted-v1"
+_TRUSTED_CONTEXT_POLICY = "markdown-graph-trusted-v1"
 
 
 class KnowledgeGraphError(RuntimeError):
@@ -1320,6 +1306,85 @@ def _context_node_is_live(node: GraphNode) -> bool:
     )
 
 
+def _markdown_trusted_claim_ids(nodes: Sequence[GraphNode]) -> set[str]:
+    """Compute audited mathematical trust directly from parsed Markdown nodes."""
+
+    by_id = {node.matek_id: node for node in nodes}
+    trusted = {
+        node.matek_id
+        for node in nodes
+        if node.node_type in {NodeType.CLAIM, NodeType.DEFINITION}
+        and _context_node_is_live(node)
+        and (
+            node.epistemic_status in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            or (
+                node.node_type is NodeType.DEFINITION
+                and canonical_admitted_definition_scope(node) is not None
+            )
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for derivation in nodes:
+            if (
+                derivation.node_type not in {NodeType.PROOF, NodeType.DERIVATION}
+                or not _context_node_is_live(derivation)
+                or derivation.epistemic_status
+                not in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            ):
+                continue
+            conclusion = derivation.metadata.get("matek_conclusion_claim_id")
+            if not isinstance(conclusion, str):
+                proved = [
+                    edge.target_id
+                    for edge in derivation.relations
+                    if edge.relation is RelationType.PROVES
+                ]
+                conclusion = proved[0] if len(proved) == 1 else None
+            if not isinstance(conclusion, str) or conclusion not in by_id:
+                continue
+            dependencies = [
+                by_id.get(edge.target_id)
+                for edge in derivation.relations
+                if edge.relation is RelationType.DEPENDS_ON
+            ]
+            if any(dependency is None for dependency in dependencies):
+                continue
+            if any(
+                dependency.node_type in {NodeType.CLAIM, NodeType.DEFINITION}
+                and dependency.matek_id not in trusted
+                for dependency in dependencies
+                if dependency is not None
+            ):
+                continue
+            if any(
+                dependency.node_type is NodeType.OBLIGATION
+                and (
+                    not _context_node_is_live(dependency)
+                    or (
+                        dependency.workflow_status is not WorkflowStatus.COMPLETE
+                        and dependency.epistemic_status
+                        not in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+                    )
+                )
+                for dependency in dependencies
+                if dependency is not None
+            ):
+                continue
+            if conclusion not in trusted:
+                trusted.add(conclusion)
+                changed = True
+    return trusted
+
+
+def _metadata_string_list(node: GraphNode, key: str) -> list[str]:
+    value = node.metadata.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return list(value)
+
+
 def _verified_source_for_context(node: GraphNode) -> bool:
     if (
         node.node_type is not NodeType.SOURCE
@@ -1412,6 +1477,8 @@ class KnowledgeGraph:
         self.target_registry_path = ensure_path_confined(
             root, self.graph_root / "target-registry.json"
         )
+        # Retained only so an invocation of the removed legacy migration method fails
+        # deterministically before writing. New graph initialization never creates it.
         self.ledgers_root = ensure_path_confined(root, self.graph_root / "ledgers")
         requested_snapshots_root = self.graph_root / "snapshots"
         if requested_snapshots_root.is_symlink():
@@ -1464,7 +1531,6 @@ class KnowledgeGraph:
         self.collection_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.graph_root.mkdir(mode=0o700, exist_ok=True)
         self.snapshots_root.mkdir(mode=0o700, exist_ok=True)
-        self.ledgers_root.mkdir(mode=0o700, exist_ok=True)
         self.locks_root.mkdir(mode=0o700, exist_ok=True)
         for relative in GRAPH_DIRECTORIES:
             ensure_path_confined(self.vault_root, self.vault_root / relative).mkdir(
@@ -1510,9 +1576,7 @@ class KnowledgeGraph:
                 self._write_snapshot_unlocked(state, [])
             nodes = self._load_nodes_unlocked(include_human_notes=True)
             state, nodes = self._migrate_legacy_paths_unlocked(state, nodes)
-            self._canonical_ledgers_unlocked(state, nodes, persist=True)
-            self._write_navigation_unlocked(state, nodes)
-            self._rebuild_index_unlocked(state, nodes)
+            self._refresh_derived_views_unlocked(state, nodes)
             return state
 
     def _load_state_unlocked(self) -> GraphState:
@@ -1605,9 +1669,7 @@ class KnowledgeGraph:
         atomic_write_json(self.state_path, state_after, confinement_root=self.graph_root)
         nodes = self._load_nodes_unlocked(include_human_notes=True)
         self._write_snapshot_unlocked(state_after, nodes)
-        self._canonical_ledgers_unlocked(state_after, nodes, persist=True)
-        self._write_navigation_unlocked(state_after, nodes)
-        self._rebuild_index_unlocked(state_after, nodes)
+        self._refresh_derived_views_unlocked(state_after, nodes)
         self.pending_path.unlink(missing_ok=True)
 
     def _load_nodes_unlocked(self, *, include_human_notes: bool) -> list[GraphNode]:
@@ -2497,9 +2559,7 @@ class KnowledgeGraph:
         atomic_write_json(self.state_path, next_state, confinement_root=self.graph_root)
         committed_nodes = list(nodes.values())
         self._write_snapshot_unlocked(next_state, committed_nodes)
-        self._canonical_ledgers_unlocked(next_state, committed_nodes, persist=True)
-        self._write_navigation_unlocked(next_state, committed_nodes)
-        self._rebuild_index_unlocked(next_state, committed_nodes)
+        self._refresh_derived_views_unlocked(next_state, committed_nodes)
         self.pending_path.unlink(missing_ok=True)
         return result
 
@@ -2694,13 +2754,34 @@ class KnowledgeGraph:
             temporary.unlink(missing_ok=True)
         return self.index_path
 
+    def _refresh_derived_views_unlocked(
+        self, state: GraphState, nodes: Sequence[GraphNode]
+    ) -> None:
+        """Best-effort refresh caches without making them research authorities."""
+
+        try:
+            self._write_navigation_unlocked(state, nodes)
+        except (OSError, sqlite3.Error, GraphValidationError) as exc:
+            warnings.warn(
+                "derived graph navigation refresh failed; continuing from Markdown: " + str(exc),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        try:
+            self._rebuild_index_unlocked(state, nodes)
+        except (OSError, sqlite3.Error, GraphValidationError) as exc:
+            warnings.warn(
+                "derived graph index refresh failed; continuing from Markdown: " + str(exc),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     def rebuild_index(self) -> Path:
         with self._locked():
             self._recover_pending_unlocked()
             state = self._load_state_unlocked()
             nodes = self._load_nodes_unlocked(include_human_notes=True)
             state, nodes = self._migrate_legacy_paths_unlocked(state, nodes)
-            self._canonical_ledgers_unlocked(state, nodes, persist=True)
             self._write_navigation_unlocked(state, nodes)
             return self._rebuild_index_unlocked(state, nodes)
 
@@ -3085,102 +3166,6 @@ class KnowledgeGraph:
                 )
             return self._validate_unlocked(state, nodes)
 
-    def _canonical_ledgers_unlocked(
-        self,
-        state: GraphState,
-        nodes: Sequence[GraphNode],
-        *,
-        persist: bool,
-    ) -> dict[str, CanonicalLedger]:
-        """Project the proof ledger without guessing through ambiguous legacy evidence."""
-
-        ledgers: dict[str, CanonicalLedger] = {}
-        problem_ids = sorted(node.matek_id for node in nodes if node.node_type is NodeType.PROBLEM)
-        for problem_id in problem_ids:
-            target_id = self.main_claim_id(problem_id)
-            if not any(node.matek_id == target_id for node in nodes):
-                continue
-            try:
-                ledger = project_markdown_ledger(
-                    nodes,
-                    graph_revision=state.revision,
-                    problem_id=problem_id,
-                    target_claim_id=target_id,
-                )
-                migration_error: str | None = None
-            except (LedgerError, ValueError) as exc:
-                # Old pairwise/prose graphs remain a searchable archive.  Build a safe
-                # claims-only ledger and report the ambiguity instead of manufacturing
-                # mathematical support or preventing graph recovery.
-                claims: dict[str, LedgerClaim] = {}
-                for node in nodes:
-                    if (
-                        node.problem_id != problem_id
-                        or node.node_type is not NodeType.CLAIM
-                        or node.tombstone
-                    ):
-                        continue
-                    statement = exact_statement(node.body)
-                    if not statement:
-                        continue
-                    status = {
-                        EpistemicStatus.AUDIT_PASSED: LedgerClaimStatus.AUDIT_PASSED,
-                        EpistemicStatus.LEAN_VERIFIED: LedgerClaimStatus.LEAN_VERIFIED,
-                        EpistemicStatus.REFUTED: LedgerClaimStatus.REFUTED,
-                        EpistemicStatus.STALE: LedgerClaimStatus.STALE,
-                        EpistemicStatus.CANDIDATE: LedgerClaimStatus.PROPOSED,
-                        EpistemicStatus.PROVED_INFORMALLY: LedgerClaimStatus.PROPOSED,
-                    }.get(node.epistemic_status, LedgerClaimStatus.OPEN)
-                    claims[node.matek_id] = LedgerClaim(
-                        claim_id=node.matek_id,
-                        exact_statement=statement,
-                        logical_version=logical_version(statement),
-                        scope=(
-                            ScientificScope.MAIN
-                            if node.matek_id == target_id
-                            else ScientificScope.BRANCH
-                        ),
-                        status=status,
-                        source_node_id=node.matek_id,
-                    )
-                if target_id not in claims:
-                    raise GraphValidationError(
-                        f"main target {target_id} has no exact statement for ledger projection"
-                    ) from exc
-                migration_error = str(exc)
-                ledger = CanonicalLedger(
-                    graph_revision=state.revision,
-                    problem_id=problem_id,
-                    target_claim_id=target_id,
-                    claims=claims,
-                    ambiguities=[
-                        LedgerAmbiguity(
-                            source_node_id=target_id,
-                            code="legacy_projection_ambiguous",
-                            detail=migration_error,
-                        )
-                    ],
-                )
-            ledgers[problem_id] = ledger
-            if persist:
-                ledger_dir = ensure_path_confined(self.graph_root, self.ledgers_root / problem_id)
-                ledger_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-                write_canonical_ledger(ledger_dir / "canonical-ledger.json", ledger)
-                if migration_error is not None:
-                    atomic_write_json(
-                        ledger_dir / "migration-report.json",
-                        {
-                            "schema_version": 1,
-                            "graph_revision": state.revision,
-                            "problem_id": problem_id,
-                            "status": "ambiguous_legacy_evidence",
-                            "issues": [migration_error],
-                            "invented_support": False,
-                        },
-                        confinement_root=ledger_dir,
-                    )
-        return ledgers
-
     def _render_dashboard(self, title: str, nodes: Sequence[GraphNode], *, description: str) -> str:
         lines = [f"# {title}", "", GENERATED_START, description, ""]
         if nodes:
@@ -3194,12 +3179,6 @@ class KnowledgeGraph:
         by_problem: dict[str, list[GraphNode]] = defaultdict(list)
         for node in nodes:
             by_problem[node.problem_id].append(node)
-        ledgers = self._canonical_ledgers_unlocked(state, nodes, persist=False)
-        trusted_ledger_claim_ids: set[str] = set()
-        open_cut_ids: set[str] = set()
-        for ledger in ledgers.values():
-            trusted_ledger_claim_ids.update(trusted_claim_ids(ledger))
-            open_cut_ids.update(smallest_known_open_cut(ledger).obligation_ids)
         problems = sorted(
             (node for node in nodes if node.node_type is NodeType.PROBLEM),
             key=lambda item: item.title.casefold(),
@@ -3207,7 +3186,9 @@ class KnowledgeGraph:
         established = [
             node
             for node in nodes
-            if node.node_type is NodeType.CLAIM and node.matek_id in trusted_ledger_claim_ids
+            if node.node_type is NodeType.CLAIM
+            and node.epistemic_status
+            in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
         ]
         obligations = [
             node
@@ -3216,7 +3197,6 @@ class KnowledgeGraph:
                 node.node_type is NodeType.OBLIGATION
                 and node.workflow_status is not WorkflowStatus.COMPLETE
             )
-            or node.matek_id in open_cut_ids
         ]
         active_tasks = [
             node
@@ -3248,7 +3228,10 @@ class KnowledgeGraph:
         main_result_needs = accepted_main_result_needs or [
             node
             for node in nodes
-            if node.matek_id in open_cut_ids
+            if (
+                node.node_type is NodeType.OBLIGATION
+                and node.workflow_status is not WorkflowStatus.COMPLETE
+            )
             or (
                 node.node_type is NodeType.CLAIM
                 and node.matek_id == self.main_claim_id(node.problem_id)
@@ -3551,9 +3534,20 @@ class KnowledgeGraph:
     ) -> GraphFrontier:
         selected = [node for node in nodes if node.problem_id == problem_id]
         by_id = {node.matek_id: node for node in selected}
-        ledger = self._canonical_ledgers_unlocked(state, nodes, persist=False).get(problem_id)
-        trusted_ids = trusted_claim_ids(ledger) if ledger is not None else set()
-        cut = smallest_known_open_cut(ledger) if ledger is not None else None
+        trusted_ids = _markdown_trusted_claim_ids(selected)
+        open_obligation_nodes = [
+            node
+            for node in selected
+            if node.node_type is NodeType.OBLIGATION
+            and node.workflow_status is not WorkflowStatus.COMPLETE
+        ]
+        main_target = by_id.get(self.main_claim_id(problem_id))
+
+        def obligation_priority(node: GraphNode) -> tuple[int, str]:
+            raw_leverage = node.metadata.get("matek_estimated_leverage", 0)
+            leverage = raw_leverage if isinstance(raw_leverage, int) else 0
+            return (-leverage, node.title.casefold())
+
         proof_targets = {
             edge.target_id
             for node in selected
@@ -3611,11 +3605,7 @@ class KnowledgeGraph:
         return GraphFrontier(
             problem_id=problem_id,
             graph_revision=state.revision,
-            main_target=(
-                _node_summary(by_id[self.main_claim_id(problem_id)])
-                if self.main_claim_id(problem_id) in by_id
-                else None
-            ),
+            main_target=_node_summary(main_target) if main_target is not None else None,
             live_derivations=[
                 _node_summary(node)
                 for node in selected
@@ -3632,18 +3622,15 @@ class KnowledgeGraph:
                 for node in selected
                 if node.node_type is NodeType.CLAIM and node.matek_id in trusted_ids
             ],
-            open_obligations=[
-                _node_summary(node)
-                for node in selected
-                if node.node_type is NodeType.OBLIGATION
-                and node.workflow_status is not WorkflowStatus.COMPLETE
-            ],
+            open_obligations=[_node_summary(node) for node in open_obligation_nodes],
             smallest_known_open_cut=[
-                _node_summary(by_id[node_id])
-                for node_id in (cut.obligation_ids if cut is not None else [])
-                if node_id in by_id
+                _node_summary(node)
+                for node in (
+                    sorted(open_obligation_nodes, key=obligation_priority)[:3]
+                    or ([main_target] if main_target is not None else [])
+                )
             ],
-            open_cut_search_capped=cut.search_capped if cut is not None else False,
+            open_cut_search_capped=False,
             unresolved_claims=[_node_summary(node) for node in unresolved_claims],
             candidate_proofs_awaiting_audit=[_node_summary(node) for node in candidate_proofs],
             blocked_approaches=[
@@ -4028,10 +4015,6 @@ class KnowledgeGraph:
             claim = nodes.get(claim_id)
             if claim is None or claim.node_type is not NodeType.CLAIM:
                 return False
-            # Reuse the canonical ledger rather than treating every non-refuted premise as
-            # trusted.  The transient projection excludes the invalidated route and every
-            # already-invalidated node, then applies exact-version, AND-premise, obligation,
-            # and alternative-route rules deterministically.
             current_nodes = [
                 node
                 for node in nodes.values()
@@ -4039,26 +4022,49 @@ class KnowledgeGraph:
                 and not node.tombstone
                 and not node.invalidation_reasons
             ]
-            try:
-                ledger = project_markdown_ledger(
-                    current_nodes,
-                    graph_revision="staleness-projection",
-                    problem_id=claim.problem_id,
-                    target_claim_id=claim_id,
-                )
-            except (LedgerError, ValueError):
-                return False
-            trusted = trusted_claim_ids(ledger)
-            for derivation in ledger.derivations.values():
-                if derivation.conclusion_claim_id != claim_id:
+            by_id = {node.matek_id: node for node in current_nodes}
+            trusted = _markdown_trusted_claim_ids(current_nodes)
+            for derivation in current_nodes:
+                if derivation.node_type not in {NodeType.PROOF, NodeType.DERIVATION}:
                     continue
-                if derivation.status is not DerivationStatus.AUDIT_PASSED:
+                conclusion = derivation.metadata.get("matek_conclusion_claim_id")
+                if not isinstance(conclusion, str):
+                    proved = [
+                        edge.target_id
+                        for edge in derivation.relations
+                        if edge.relation is RelationType.PROVES
+                    ]
+                    conclusion = proved[0] if len(proved) == 1 else None
+                if conclusion != claim_id:
                     continue
-                if not set(derivation.premise_claim_ids).issubset(trusted):
+                if not _context_node_is_live(derivation) or derivation.epistemic_status not in {
+                    EpistemicStatus.AUDIT_PASSED,
+                    EpistemicStatus.LEAN_VERIFIED,
+                }:
+                    continue
+                dependencies = [
+                    by_id.get(edge.target_id)
+                    for edge in derivation.relations
+                    if edge.relation is RelationType.DEPENDS_ON
+                ]
+                if any(dependency is None for dependency in dependencies):
                     continue
                 if any(
-                    ledger.obligations[obligation_id].status is not ObligationStatus.RESOLVED
-                    for obligation_id in derivation.obligation_ids
+                    dependency.node_type in {NodeType.CLAIM, NodeType.DEFINITION}
+                    and dependency.matek_id not in trusted
+                    for dependency in dependencies
+                    if dependency is not None
+                ):
+                    continue
+                if any(
+                    dependency.node_type is NodeType.OBLIGATION
+                    and (
+                        dependency.workflow_status is not WorkflowStatus.COMPLETE
+                        and dependency.epistemic_status
+                        not in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+                    )
+                    for dependency in dependencies
+                    if dependency is not None
                 ):
                     continue
                 return True
@@ -7308,12 +7314,7 @@ class KnowledgeGraph:
             )
             if current_dependency_ids != sorted(nominated_dependencies):
                 raise GraphValidationError("nominated derivation premises changed after audit")
-            current_ledger = project_markdown_ledger(
-                [node for node in nodes if node.problem_id == problem_id],
-                graph_revision=state.revision,
-                problem_id=problem_id,
-                target_claim_id=self.main_claim_id(problem_id),
-            )
+            problem_nodes = [node for node in nodes if node.problem_id == problem_id]
             frozen_obligations = {
                 item.obligation_id: item
                 for item in persisted_nomination.target_obligation_contracts
@@ -7325,10 +7326,8 @@ class KnowledgeGraph:
             for obligation_id, frozen_obligation in frozen_obligations.items():
                 current_obligation_node = by_id.get(obligation_id)
                 if frozen_obligation.target_kind == "claim":
-                    current_claim = current_ledger.claims.get(obligation_id)
                     if (
-                        current_claim is None
-                        or current_obligation_node is None
+                        current_obligation_node is None
                         or current_obligation_node.node_type is not NodeType.CLAIM
                         or current_obligation_node.problem_id != problem_id
                         or current_obligation_node.tombstone
@@ -7339,9 +7338,10 @@ class KnowledgeGraph:
                             EpistemicStatus.INCONSISTENT,
                             EpistemicStatus.REFUTED,
                         }
-                        or current_claim.exact_statement != frozen_obligation.exact_statement
-                        or current_claim.scope is not frozen_obligation.scope
-                        or current_claim.logical_version != frozen_obligation.logical_version
+                        or normalize_exact_statement(exact_statement(current_obligation_node.body))
+                        != frozen_obligation.exact_statement
+                        or logical_version(exact_statement(current_obligation_node.body))
+                        != frozen_obligation.logical_version
                         or current_obligation_node.statement_version
                         != frozen_obligation.statement_version
                         or current_obligation_node.content_hash != frozen_obligation.content_sha256
@@ -7350,7 +7350,6 @@ class KnowledgeGraph:
                             f"target claim {obligation_id} changed after lemma audit"
                         )
                     continue
-                current_obligation = current_ledger.obligations.get(obligation_id)
                 resolved_by_this_gate = bool(
                     current_obligation_node is not None
                     and current_obligation_node.metadata.get("matek_resolved_by_derivation_id")
@@ -7359,22 +7358,30 @@ class KnowledgeGraph:
                     == audit_id_text
                 )
                 if (
-                    current_obligation is None
-                    or current_obligation_node is None
+                    current_obligation_node is None
                     or current_obligation_node.node_type is not NodeType.OBLIGATION
-                    or current_obligation.exact_statement != frozen_obligation.exact_statement
-                    or current_obligation.quantifiers != frozen_obligation.quantifiers
-                    or current_obligation.hypotheses != frozen_obligation.hypotheses
-                    or current_obligation.conclusion != frozen_obligation.conclusion
-                    or current_obligation.dependency_claim_ids
+                    or normalize_exact_statement(exact_statement(current_obligation_node.body))
+                    != frozen_obligation.exact_statement
+                    or _metadata_string_list(current_obligation_node, "matek_quantifiers")
+                    != frozen_obligation.quantifiers
+                    or _metadata_string_list(current_obligation_node, "matek_hypotheses")
+                    != frozen_obligation.hypotheses
+                    or normalize_exact_statement(
+                        str(current_obligation_node.metadata.get("matek_conclusion") or "")
+                    )
+                    != frozen_obligation.conclusion
+                    or _metadata_string_list(current_obligation_node, "matek_dependency_claim_ids")
                     != frozen_obligation.dependency_claim_ids
-                    or current_obligation.target_claim_ids != frozen_obligation.target_claim_ids
-                    or current_obligation.scope is not frozen_obligation.scope
-                    or current_obligation.notation_definition_version
+                    or _metadata_string_list(current_obligation_node, "matek_target_claim_ids")
+                    != frozen_obligation.target_claim_ids
+                    or str(current_obligation_node.metadata.get("matek_scope") or "branch")
+                    != frozen_obligation.scope.value
+                    or str(
+                        current_obligation_node.metadata.get("matek_notation_definition_version")
+                        or "1"
+                    )
                     != frozen_obligation.notation_definition_version
-                    or current_obligation.falsification_evidence
-                    != frozen_obligation.falsification_evidence
-                    or current_obligation.logical_version != frozen_obligation.logical_version
+                    or current_obligation_node.evidence != frozen_obligation.falsification_evidence
                     or current_obligation_node.statement_version
                     != frozen_obligation.statement_version
                     or (
@@ -7385,7 +7392,7 @@ class KnowledgeGraph:
                     raise GraphValidationError(
                         f"target obligation {obligation_id} changed after lemma audit"
                     )
-            current_trusted_claim_ids = trusted_claim_ids(current_ledger)
+            current_trusted_claim_ids = _markdown_trusted_claim_ids(problem_nodes)
             expected_dependency_versions: list[str] = []
             for dependency_id in current_dependency_ids:
                 dependency = by_id.get(dependency_id)
@@ -7421,12 +7428,12 @@ class KnowledgeGraph:
                 ):
                     raise GraphValidationError(
                         f"nominated definition dependency {dependency_id} lacks current "
-                        "canonical admission provenance"
+                        "audited Markdown provenance"
                     )
                 if dependency_id not in current_trusted_claim_ids:
                     raise GraphValidationError(
                         f"nominated dependency {dependency_id} is not trusted in the current "
-                        "canonical ledger"
+                        "Markdown graph"
                     )
                 expected_dependency_versions.append(
                     f"{dependency_id}@{logical_version(exact_statement(dependency.body))}"
@@ -7541,19 +7548,13 @@ class KnowledgeGraph:
             proposed: list[GraphNode] = [audit_node]
             if status == "audit_passed":
                 # The audit accepts this exact derivation, not every route to the
-                # conclusion. Claim trust is derived by the canonical AND/OR ledger
-                # only after all version-bound premises and obligations are trusted.
+                # conclusion. Trust is recomputed from current Markdown after binding
+                # all premises and obligations.
                 derivation.epistemic_status = EpistemicStatus.AUDIT_PASSED
                 derivation.workflow_status = WorkflowStatus.COMPLETE
                 derivation.last_modified_run = run_id
                 derivation.updated_at = now
-                post_audit_ledger = project_markdown_ledger(
-                    [node for node in nodes if node.problem_id == problem_id],
-                    graph_revision=state.revision,
-                    problem_id=problem_id,
-                    target_claim_id=self.main_claim_id(problem_id),
-                )
-                trusted_after_audit = trusted_claim_ids(post_audit_ledger)
+                trusted_after_audit = _markdown_trusted_claim_ids(problem_nodes)
                 resolvable_obligation_ids = (
                     persisted_nomination.target_obligation_ids
                     if statement_id in trusted_after_audit
@@ -8034,7 +8035,7 @@ class KnowledgeGraph:
         include_audits: bool,
         include_formalizations: bool,
     ) -> tuple[list[GraphNode], dict[str, object]]:
-        """Select a bounded downstream context from the canonical trust projection."""
+        """Select a bounded downstream context from current Markdown trust state."""
 
         if maximum_nodes < 1:
             raise ValueError("trusted context maximum_nodes must be positive")
@@ -8045,13 +8046,8 @@ class KnowledgeGraph:
             raise GraphValidationError(
                 f"cannot build trusted context without canonical main claim {target_id}"
             )
-        ledger = project_markdown_ledger(
-            problem_nodes,
-            graph_revision=state.revision,
-            problem_id=problem_id,
-            target_claim_id=target_id,
-        )
-        trusted_claim_node_ids = trusted_claim_ids(ledger)
+        del state
+        trusted_claim_node_ids = _markdown_trusted_claim_ids(problem_nodes)
         selected_by_id: dict[str, GraphNode] = {}
 
         for claim_id in sorted(trusted_claim_node_ids):
@@ -8067,28 +8063,47 @@ class KnowledgeGraph:
 
         trusted_route_node_ids: set[str] = set()
         trusted_proof_attempt_ids: set[str] = set()
+
+        def route_conclusion(node: GraphNode) -> str | None:
+            stored = node.metadata.get("matek_conclusion_claim_id")
+            if isinstance(stored, str):
+                return stored
+            proved = [
+                edge.target_id for edge in node.relations if edge.relation is RelationType.PROVES
+            ]
+            return proved[0] if len(proved) == 1 else None
+
         trusted_derivations = [
-            derivation
-            for derivation in ledger.derivations.values()
-            if derivation.status is DerivationStatus.AUDIT_PASSED
-            and derivation.conclusion_claim_id in trusted_claim_node_ids
-            and set(derivation.premise_claim_ids).issubset(trusted_claim_node_ids)
+            node
+            for node in problem_nodes
+            if node.node_type in {NodeType.PROOF, NodeType.DERIVATION}
+            and _context_node_is_live(node)
+            and node.epistemic_status
+            in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            and route_conclusion(node) in trusted_claim_node_ids
             and all(
-                ledger.obligations[obligation_id].status is ObligationStatus.RESOLVED
-                for obligation_id in derivation.obligation_ids
+                dependency.target_id in trusted_claim_node_ids
+                or (
+                    (target := by_id.get(dependency.target_id)) is not None
+                    and target.node_type is NodeType.OBLIGATION
+                    and (
+                        target.workflow_status is WorkflowStatus.COMPLETE
+                        or target.epistemic_status
+                        in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+                    )
+                )
+                for dependency in node.relations
+                if dependency.relation is RelationType.DEPENDS_ON
             )
         ]
-        for ledger_derivation in trusted_derivations:
-            derivation_node = by_id.get(ledger_derivation.derivation_id)
-            if (
-                derivation_node is not None
-                and derivation_node.node_type is NodeType.DERIVATION
-                and _context_node_is_live(derivation_node)
-            ):
-                selected_by_id[derivation_node.matek_id] = derivation_node
-                trusted_route_node_ids.add(derivation_node.matek_id)
+        for derivation_node in trusted_derivations:
+            selected_by_id[derivation_node.matek_id] = derivation_node
+            trusted_route_node_ids.add(derivation_node.matek_id)
+            if derivation_node.node_type is NodeType.PROOF:
+                continue
 
-            proof_node = by_id.get(ledger_derivation.proof_attempt_id)
+            proof_attempt_id = derivation_node.metadata.get("matek_proof_attempt_id")
+            proof_node = by_id.get(proof_attempt_id) if isinstance(proof_attempt_id, str) else None
             if proof_node is None or not _context_node_is_live(proof_node):
                 continue
             if proof_node.node_type is NodeType.PROOF:
@@ -8097,7 +8112,6 @@ class KnowledgeGraph:
                 continue
             if (
                 proof_node.node_type is not NodeType.PROOF_ATTEMPT
-                or derivation_node is None
                 or derivation_node.node_type is not NodeType.DERIVATION
             ):
                 continue
@@ -8170,9 +8184,10 @@ class KnowledgeGraph:
                     accepted_proof_id=accepted_proof_id,
                 )
             )
-        for ledger_derivation in trusted_derivations:
-            if ledger_derivation.derivation_id in main_support_ids:
-                main_support_ids.add(ledger_derivation.proof_attempt_id)
+        for derivation_node in trusted_derivations:
+            proof_attempt_id = derivation_node.metadata.get("matek_proof_attempt_id")
+            if derivation_node.matek_id in main_support_ids and isinstance(proof_attempt_id, str):
+                main_support_ids.add(proof_attempt_id)
         audit_support_ids = {
             node.matek_id
             for node in selected_by_id.values()
@@ -8220,12 +8235,11 @@ class KnowledgeGraph:
             "included_node_count": len(included),
             "omitted_node_count": omitted_count,
             "truncated": omitted_count > 0,
-            "canonical_ledger_ambiguity_count": len(ledger.ambiguities),
             "priority_order": [
                 "main_target",
                 "accepted_main_proof",
                 "accepted_main_proof_support",
-                "other_canonical_trusted_mathematics",
+                "other_markdown_trusted_mathematics",
                 "verified_evidence",
             ],
         }

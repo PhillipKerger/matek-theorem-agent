@@ -1,148 +1,55 @@
 {
   "$defs": {
-    "ResearchAssignment": {
+    "SemanticCoordinatorAssignment": {
       "additionalProperties": false,
+      "description": "A mathematical task; application code supplies scheduler identity.",
       "properties": {
         "approach_family": {
           "title": "Approach Family",
           "type": "string"
         },
-        "audited_premise_ids": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Audited Premise Ids",
-          "type": "array"
-        },
         "expected_output": {
           "title": "Expected Output",
           "type": "string"
         },
-        "id": {
-          "title": "Id",
-          "type": "string"
-        },
-        "inputs": {
+        "relates_to": {
           "items": {
             "type": "string"
           },
-          "title": "Inputs",
+          "title": "Relates To",
           "type": "array"
-        },
-        "mechanism_delta": {
-          "title": "Mechanism Delta",
-          "type": "string"
-        },
-        "scientific_phase": {
-          "$ref": "#/$defs/ScientificPhase"
-        },
-        "scientific_role": {
-          "$ref": "#/$defs/ScientificRole"
         },
         "stopping_condition": {
           "title": "Stopping Condition",
           "type": "string"
         },
-        "target_node_ids": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Target Node Ids",
-          "type": "array"
-        },
-        "target_obligation_ids": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Target Obligation Ids",
-          "type": "array"
-        },
-        "target_obligation_versions": {
-          "items": {
-            "$ref": "#/$defs/TargetObligationVersion"
-          },
-          "title": "Target Obligation Versions",
-          "type": "array"
-        },
         "task": {
           "title": "Task",
           "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
         }
       },
       "required": [
-        "id",
+        "title",
         "approach_family",
         "task",
         "expected_output",
-        "inputs",
-        "target_node_ids",
-        "stopping_condition",
-        "scientific_phase",
-        "scientific_role",
-        "target_obligation_ids",
-        "target_obligation_versions",
-        "mechanism_delta",
-        "audited_premise_ids"
+        "relates_to",
+        "stopping_condition"
       ],
-      "title": "ResearchAssignment",
-      "type": "object"
-    },
-    "ScientificPhase": {
-      "enum": [
-        "explore",
-        "consolidate",
-        "bottleneck",
-        "adversarial_audit",
-        "synthesize"
-      ],
-      "title": "ScientificPhase",
-      "type": "string"
-    },
-    "ScientificRole": {
-      "enum": [
-        "explorer",
-        "consolidator",
-        "independent_prover",
-        "hostile_falsifier",
-        "small_case_computation",
-        "transfer_auditor",
-        "synthesizer"
-      ],
-      "title": "ScientificRole",
-      "type": "string"
-    },
-    "TargetObligationVersion": {
-      "additionalProperties": false,
-      "description": "Portable typed binding from a graph target ID to its semantic contract digest.",
-      "properties": {
-        "logical_version": {
-          "title": "Logical Version",
-          "type": "string"
-        },
-        "obligation_id": {
-          "title": "Obligation Id",
-          "type": "string"
-        }
-      },
-      "required": [
-        "obligation_id",
-        "logical_version"
-      ],
-      "title": "TargetObligationVersion",
+      "title": "SemanticCoordinatorAssignment",
       "type": "object"
     }
   },
   "additionalProperties": false,
-  "description": "One event-indexed decision from the continuous logical coordinator.",
+  "description": "The model-visible coordinator response, containing no storage bookkeeping.",
   "properties": {
-    "after_event_sequence": {
-      "minimum": 0,
-      "title": "After Event Sequence",
-      "type": "integer"
-    },
     "assignments": {
       "items": {
-        "$ref": "#/$defs/ResearchAssignment"
+        "$ref": "#/$defs/SemanticCoordinatorAssignment"
       },
       "title": "Assignments",
       "type": "array"
@@ -151,84 +58,14 @@
       "title": "Candidate Packaging Recommended",
       "type": "boolean"
     },
-    "candidate_report_ids": {
+    "candidate_reports": {
       "items": {
         "type": "string"
       },
-      "title": "Candidate Report Ids",
+      "title": "Candidate Reports",
       "type": "array"
     },
-    "claims_requiring_counterexample_search": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Claims Requiring Counterexample Search",
-      "type": "array"
-    },
-    "decision_id": {
-      "minimum": 1,
-      "title": "Decision Id",
-      "type": "integer"
-    },
-    "lemmas_requiring_proof_completion": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Lemmas Requiring Proof Completion",
-      "type": "array"
-    },
-    "rationale": {
-      "title": "Rationale",
-      "type": "string"
-    },
-    "redirect_assignment_ids": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Redirect Assignment Ids",
-      "type": "array"
-    },
-    "requested_artifact_ids": {
-      "items": {
-        "type": "string"
-      },
-      "maxItems": 32,
-      "title": "Requested Artifact Ids",
-      "type": "array"
-    },
-    "requested_graph_node_ids": {
-      "items": {
-        "type": "string"
-      },
-      "maxItems": 32,
-      "title": "Requested Graph Node Ids",
-      "type": "array"
-    },
-    "resolved_contradiction_node_ids": {
-      "items": {
-        "type": "string"
-      },
-      "maxItems": 32,
-      "title": "Resolved Contradiction Node Ids",
-      "type": "array"
-    },
-    "retire_assignment_ids": {
-      "items": {
-        "type": "string"
-      },
-      "title": "Retire Assignment Ids",
-      "type": "array"
-    },
-    "stop_category": {
-      "enum": [
-        "scientific",
-        "refuted",
-        "budget"
-      ],
-      "title": "Stop Category",
-      "type": "string"
-    },
-    "stop_reason": {
+    "declared_scientific_stop": {
       "anyOf": [
         {
           "type": "string"
@@ -237,40 +74,37 @@
           "type": "null"
         }
       ],
-      "title": "Stop Reason"
+      "title": "Declared Scientific Stop"
     },
-    "stop_recommended": {
-      "title": "Stop Recommended",
-      "type": "boolean"
+    "rationale": {
+      "title": "Rationale",
+      "type": "string"
     },
-    "supporting_evidence_ids": {
+    "requested_graph_titles": {
       "items": {
         "type": "string"
       },
-      "maxItems": 64,
-      "title": "Supporting Evidence Ids",
+      "maxItems": 32,
+      "title": "Requested Graph Titles",
+      "type": "array"
+    },
+    "retire_assignments": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retire Assignments",
       "type": "array"
     }
   },
   "required": [
-    "decision_id",
-    "after_event_sequence",
     "assignments",
     "rationale",
-    "retire_assignment_ids",
-    "redirect_assignment_ids",
-    "claims_requiring_counterexample_search",
-    "lemmas_requiring_proof_completion",
+    "retire_assignments",
+    "candidate_reports",
+    "requested_graph_titles",
     "candidate_packaging_recommended",
-    "candidate_report_ids",
-    "stop_recommended",
-    "stop_reason",
-    "stop_category",
-    "requested_artifact_ids",
-    "requested_graph_node_ids",
-    "supporting_evidence_ids",
-    "resolved_contradiction_node_ids"
+    "declared_scientific_stop"
   ],
-  "title": "ResearchCoordinatorDecision",
+  "title": "SemanticCoordinatorDecision",
   "type": "object"
 }

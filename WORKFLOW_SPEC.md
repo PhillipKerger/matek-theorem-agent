@@ -1,5 +1,9 @@
 # Workflow Specification
 
+> **P0 graph-state override:** Research uses the graph-only semantic boundary in
+> [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md). Any later instruction asking a model
+> to handle an ID, graph revision, patch, ledger, persistence schema, or recovery task is obsolete.
+
 The CLI reports sparse `ASCENSION n` progress at the stage boundaries below. During adaptive
 research, `ASCENSION 2` starts or resumes the durable logical coordinator and `ASCENSION 3`
 announces management of its live worker pool. Candidate-audit packaging is reported separately.

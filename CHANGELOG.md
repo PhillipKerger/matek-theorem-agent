@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.0 — 2026-08-11
+
+- Replaced split graph/ledger research memory with a graph-only Markdown writer for new graphs.
+  Descriptive note titles and wiki links are the durable authority; SQLite is disposable and its
+  loss or corruption cannot block title resolution or admission.
+- Added semantic coordinator and worker contracts containing mathematical titles and findings
+  only. Packaged schemas and prompts contain no storage identifiers or patch fields.
+- Added deterministic title collision handling, hidden rename identity, atomic inbound-link
+  updates, local incident notes for quarantined dangling relations, and first-class partial
+  progress admission.
+- Removed legacy migration and snapshot-authority commands from the graph CLI surface. Existing
+  graph formats are intentionally restarted rather than migrated.
+
 ## 0.8.1 — 2026-08-10
 
 - Fixed the canonical ledger halting a multi-hour research run when an obligation outlived its

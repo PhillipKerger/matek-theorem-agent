@@ -1,5 +1,9 @@
 # Artifact Contract
 
+> **P0 graph-state override:** [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md)
+> supersedes the historical graph/ledger layout below. New graphs contain descriptive Markdown,
+> optional disposable derived views, incidents, and per-graph transaction scratch only.
+
 Every run must follow this layout:
 
 ```text
@@ -139,41 +143,19 @@ verification-certificate inventory:
 ```text
 .matek/
 └── knowledge/<graph-name>/
-    ├── {Problems,Definitions,Claims,Proofs,Proof Attempts,Derivations,Obligations,
-    │   Approaches,Counterexamples,Experiments,Sources,Tasks,Audits,Formalizations,
-    │   Runs,Artifacts,Human Notes,Dashboards}/
+    ├── {Problems,Definitions,Claims,Partial Progress,Approaches,Obligations,
+    │   Counterexamples,Experiments,Sources,Tasks,Incidents,Dashboards}/
     ├── Home.md
-    ├── graph-schema.json
-    ├── graph-state.json
-    ├── target-registry.json
-    ├── ledgers/<problem-id>/canonical-ledger.json
-    ├── ledgers/<problem-id>/migration-report.json # only for ambiguous legacy projection
-    ├── ledgers/migrations/<plan-sha256>.application.json
     ├── graph-index.sqlite
-    ├── graph-pending.json       # exists only across an interrupted commit
-    ├── snapshots/
-    │   ├── <revision>.json                     # immutable schema-v1 snapshots, if present
-    │   ├── manifests/<revision>.json           # schema-v2 delta + integrity manifest
-    │   ├── checkpoints/<revision>.json         # periodic full content-hash maps
-    │   └── blobs/{nodes,edges}/<sha256>.json   # immutable content-addressed records
-    └── locks/graph.lock
+    └── .transactions/
+        ├── writer.lock
+        └── admission-*/manifest.json # present only while recovering an interrupted commit
 ```
 
-Markdown notes with typed flat frontmatter are authoritative. `graph-state.json` binds their
-content, statement, and machine-owned-field hashes to a revision. SQLite, Home, dashboards, and
-canvases are derived and rebuildable. Each run report records the selected graph name, selection
-mode, problem ID, graph revision, vault path, index path, validation warnings, and graph status
-rather than certifying a mutable cross-run tree as a run-local artifact. The selection is frozen
-for resume.
-
-Legacy `snapshots/<revision>.json` files are read-only and reconstruct to their exact original
-bytes. New writes use schema v2, with a full checkpoint at revision zero, every 64 revisions by
-default, and at the first v2 revision after legacy history. A v2 integrity root covers the manifest,
-its parent binding, and a content root over every live node and edge blob hash; checkpoint files are
-themselves hash-bound. The manifest is published last so an interrupted commit cannot expose a
-partially written revision. Reconstructed v2 full snapshots use deterministic sorted JSON whose
-exact SHA-256 digest is bound into the manifest. Snapshot integrity proves byte/history
-reconstruction only; it does not promote any mathematical status.
+Markdown notes and their descriptive wiki links are the sole durable research authority. SQLite,
+Home, and dashboards are derived and rebuildable. The graph writer stages each admission beneath
+`.transactions/`, publishes note replacements atomically, and recovers a retained manifest after
+interruption. Run-local scheduler checkpoints are not a second graph authority.
 
 ## Integrity
 
@@ -197,60 +179,18 @@ same-contract wording change is recorded as a cosmetic paraphrase without replac
 confirmed `matek run PROBLEM_FILE --migrate-target REASON` may authorize contract drift; the
 authorization is durable across resume and the migration records invalidated evidence.
 
-The Markdown notes remain the authoritative complete archive. Each
-`ledgers/<problem-id>/canonical-ledger.json` is an integrity-protected, rebuildable trust projection
-with schema version, source graph revision, problem/target IDs, exact claims and logical versions,
-derivations and premise versions, typed obligations, ambiguities, and `integrity_sha256`.
-An obligation logical version hashes its normalized exact statement, conclusion, ordered
-quantifiers and hypotheses, dependency-claim IDs, target-claim IDs, scope, notation-definition
-version, and falsification evidence. A blind lemma packet freezes that complete self-validating
-contract together with the obligation's statement version and persisted-content SHA-256; a bare
-lemma statement cannot silently resolve a richer quantified, hypothesized, or falsified contract.
-Derivation premises are jointly required; alternative derivations are independent support paths.
-Gapped, partial, assumption-bearing, or ambiguous archive records do not become trusted ledger
-support. Application-admitted claims with a missing, malformed, or nonempty normalized assumption
-contract are projected as standalone stale/quarantined claims, and their derivations are excluded.
-Partial results remain proof attempts with an explicit completion obligation even when they report
-no other gap. Neither class can act as a same-report premise, candidate dependency, lemma-audit
-nomination/support, or exact-counterexample nomination/support. The persisted evidence is retained;
-the quarantine does not erase the research record. `audit_passed`/`lean_verified` are the only
-direct trusted claim statuses; an audited derivation propagates trust only from jointly trusted
-premises with resolved obligations. If safe projection
-of legacy prose is impossible, `ledgers/<problem-id>/migration-report.json` records the ambiguity and
-`invented_support = false`. Neither derived ledger file is part of a run certificate. The graph
-frontier computes the smallest known open cut from the ledger and records
-`open_cut_search_capped` when bounded search cannot certify minimality.
+The Markdown notes remain the authoritative complete archive. Mathematical trust is selected
+directly from current note statuses, statements, provenance, and descriptive dependency links.
+Gapped, partial, assumption-bearing, or ambiguous findings remain visible but do not become trusted
+support. `audit_passed` and `lean_verified` are the only direct trusted claim statuses; proof
+support propagates only through currently resolved descriptive dependencies.
 
-Canonical source notes retain `matek_source_id`, primary identifier, identifiers and arXiv
-revisions, source aliases, titles/authors, evidence links, verification provenance, explicit
-evidence claims, and verified state. Verified identity follows DOI/base-arXiv/MR/ISBN/URL
-precedence; unverified title/author records use provisional fingerprints and remain open. Only
-identical entity keys merge. Worker-result `CITES` relations require explicit result-source
-references; separately verified compiler sources may cite the frozen target.
-Equivalent case, `doi:` prefixes, and DOI resolver URLs normalize to one DOI. A ledger entry with
-multiple distinct DOI values materializes one source per DOI; an ambiguous alias or shared
-lower-precedence identifier maps conservatively to every retained candidate. The graph transaction
-writes `repairs/source-identity-decision-<sha256-prefix>.json` with the normalized DOI values,
-aliases, candidate node IDs, context, and `preserve_separate_source_nodes` decision. Its matching
-`source_identity_ambiguity` issue is provenance-only and does not turn worker admission or research
-scheduling into a failure. Historical mixed-DOI notes are retained, normalized, and marked by
-`matek graph doctor --repair` with a before/after audit log so existing evidence is never deleted.
-Agent-authored mathematical nodes carry descriptive one-liner IDs (`CLAIM: ...`, `APPROACH: ...`);
-the immutable main target claim and operational nodes keep their stable hash IDs. No released
-graph contains legacy hash-ID mathematical nodes, so no ID-renaming repair exists.
+Source notes use descriptive citation titles and retain checked identifiers and verification prose
+in their bodies. Only exact independently verified identifiers can support a manuscript citation.
+Ambiguous identities remain open notes rather than being merged by title similarity.
 
-A legacy-migration plan is a user-selected external artifact, conventionally
-`.matek/migration-reports/<graph-name>.json`, and must not be placed beneath
-`.matek/knowledge/`. It records `mode = "dry_run"`, graph/revision/problem/target identity, the
-complete problem-local archive digest/count, typed proposals and unresolved issues, plus
-`integrity_sha256`; planning changes no graph file. `--apply-plan` accepts only an integrity-valid,
-matching, current plan and requires confirmation or `--yes`. One recoverable/idempotent graph
-commit retains legacy nodes and earlier snapshots while creating proposed proof attempts/
-derivations, alias/quarantine metadata, and queued verifier/falsifier audit tasks. It makes no model
-call. The resulting `ledgers/migrations/<plan-sha256>.application.json` binds the operation and old/
-new revisions, changed/created IDs, queued audit task IDs, unapplied issues, timestamp, and its own
-integrity digest. This application record is distinct from the conditional problem-local
-`migration-report.json` emitted when ordinary ledger projection encounters ambiguous legacy prose.
+There is no legacy-migration artifact contract. Retired graphs are restarted as clean semantic
+vaults.
 
 Research worker, source-verification, coordinator-decision, candidate-attempt, and audit JSON
 artifacts are immutable evidence objects. Their hashes are recorded before a corresponding
@@ -321,9 +261,8 @@ frozen graph revision; graph commits remain idempotent by operation ID and scien
 normalized exact statement plus scope. Exact matches share a claim but retain separate proof
 attempts; semantic near-matches require audit or an explicit equivalence derivation.
 Definition IDs may likewise be shared only for an explicit branch-scoped notation declaration.
-Such declarations carry no `dependency_node_ids` or `dependency_result_keys`; every admitting
-report retains an immutable application-owned binding, and definitions with proof dependencies are
-excluded from the canonical ledger.
+Such declarations carry no proof dependencies; every admitting report retains immutable run-local
+evidence, and definitions with mathematical proof dependencies are excluded from trusted support.
 
 `research/coordinator/scientific-phase.json` is integrity-protected durable state for phase
 transitions, progress snapshots, assignment plans, and merge/redirect dispositions. The launched
@@ -378,8 +317,8 @@ is unchanged. If that support genuinely changes, the old record and artifacts re
 are marked superseded with a reason and event; MATEK creates a new audit ID, freezes the new support
 closure, and reruns the required roles instead of relabeling old evidence.
 
-Manuscript and formalization contexts use the same bounded trusted-context selector over the
-canonical ledger. It includes only live trusted claims, authenticated definitions, audit-passed
+Manuscript and formalization contexts use the same bounded selector over current Markdown. It
+includes only live trusted claims, authenticated definitions, audit-passed
 proof routes, independently verified sources where applicable, and deterministic verified
 formalizations where applicable. Accepted main-proof support is prioritized. Informal/open claims,
 unverified sources, unresolved or unauthenticated derivations, experiments, and archive-only

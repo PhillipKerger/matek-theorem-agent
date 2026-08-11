@@ -6,9 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
-from matek_theorem_agent.cli import app
 from matek_theorem_agent.knowledge_graph import GraphValidationError, KnowledgeGraph
 
 
@@ -161,34 +159,3 @@ def test_blob_corruption_blocks_reconstruction_and_graph_validation(tmp_path: Pa
     report = graph.validate()
     assert not report.valid
     assert any(issue.code == "snapshot_integrity" for issue in report.issues)
-
-
-def test_snapshot_reconstruct_and_verify_cli_commands(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    graph, revisions = _graph_with_revisions(tmp_path, run_count=1)
-    monkeypatch.chdir(graph.project_root)
-    runner = CliRunner()
-
-    verified = runner.invoke(
-        app,
-        ["graph", "verify-snapshots", revisions[-1], "--knowledge-graph", "problem"],
-    )
-    assert verified.exit_code == 0, verified.output
-    assert json.loads(verified.stdout)[0]["revision"] == revisions[-1]
-
-    output = graph.project_root / "snapshot.json"
-    reconstructed = runner.invoke(
-        app,
-        [
-            "graph",
-            "reconstruct",
-            revisions[-1],
-            "--knowledge-graph",
-            "problem",
-            "--output",
-            str(output),
-        ],
-    )
-    assert reconstructed.exit_code == 0, reconstructed.output
-    assert output.read_bytes() == graph.reconstruct_snapshot(revisions[-1])

@@ -23,10 +23,7 @@ from ..knowledge_graph.admission import (
     canonical_admitted_definition_scope,
     node_has_scientific_admission_binding,
 )
-from ..knowledge_graph.ledger import (
-    project_markdown_ledger,
-    trusted_claim_ids,
-)
+from ..knowledge_graph.ledger import logical_version, obligation_logical_version
 from ..knowledge_graph.markdown import exact_statement
 from ..knowledge_graph.models import (
     EpistemicStatus,
@@ -60,6 +57,13 @@ if TYPE_CHECKING:
     from .research import ResearchWorkerReport
 
 _SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _metadata_strings(node: GraphNode, key: str) -> list[str]:
+    value = node.metadata.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return list(value)
 
 
 class _NominationModel(BaseModel):
@@ -354,7 +358,7 @@ def _dependency_references(
                 return (
                     None,
                     LemmaNominationSkipCode.DEPENDENCY_UNTRUSTED,
-                    "A local definition dependency is not trusted in the current canonical ledger.",
+                    "A local definition dependency is not trusted in current Markdown state.",
                     [definition.matek_id],
                 )
             continue
@@ -765,19 +769,61 @@ def nominate_intermediate_lemmas(
     nominations: list[LemmaNomination] = []
     bindings: list[LemmaNominationBinding] = []
     skipped: list[LemmaNominationSkip] = []
-    canonical_ledger = (
-        project_markdown_ledger(
-            nodes,
-            graph_revision=frontier.graph_revision,
-            problem_id=frontier.problem_id,
-            target_claim_id=main_target_id,
+    trusted_dependency_ids = {
+        node.matek_id
+        for node in nodes
+        if node.node_type in {NodeType.CLAIM, NodeType.DEFINITION}
+        and not node.tombstone
+        and not node.invalidation_reasons
+        and (
+            (
+                node.node_type is NodeType.CLAIM
+                and node.epistemic_status
+                in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            )
+            or canonical_admitted_definition_scope(node) is not None
         )
-        if main_target_id is not None
-        else None
-    )
-    trusted_dependency_ids = (
-        trusted_claim_ids(canonical_ledger) if canonical_ledger is not None else set()
-    )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if (
+                node.node_type is not NodeType.DERIVATION
+                or node.tombstone
+                or node.invalidation_reasons
+                or node.workflow_status is not WorkflowStatus.COMPLETE
+                or node.epistemic_status
+                not in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            ):
+                continue
+            conclusion = node.metadata.get("matek_conclusion_claim_id")
+            if not isinstance(conclusion, str) or conclusion not in by_id:
+                continue
+            support_nodes = [
+                by_id.get(edge.target_id)
+                for edge in node.relations
+                if edge.relation is RelationType.DEPENDS_ON
+            ]
+            if any(dependency is None for dependency in support_nodes):
+                continue
+            if any(
+                dependency.node_type in {NodeType.CLAIM, NodeType.DEFINITION}
+                and dependency.matek_id not in trusted_dependency_ids
+                for dependency in support_nodes
+                if dependency is not None
+            ):
+                continue
+            if any(
+                dependency.node_type is NodeType.OBLIGATION
+                and dependency.workflow_status is not WorkflowStatus.COMPLETE
+                for dependency in support_nodes
+                if dependency is not None
+            ):
+                continue
+            if conclusion not in trusted_dependency_ids:
+                trusted_dependency_ids.add(conclusion)
+                changed = True
 
     for result in sorted(report.results, key=lambda item: item.local_key):
         early = _early_skip(report, result)
@@ -855,61 +901,94 @@ def nominate_intermediate_lemmas(
         target_contracts: list[LemmaTargetObligationReference] = []
         invalid_target_ids: list[str] = []
         for target_id in target_ids:
-            obligation = (
-                canonical_ledger.obligations.get(target_id)
-                if canonical_ledger is not None
-                else None
-            )
             obligation_node = by_id.get(target_id)
             if (
-                obligation is not None
-                and obligation_node is not None
-                and (
-                    obligation_node.node_type is NodeType.OBLIGATION
-                    and obligation_node.content_hash is not None
-                )
+                obligation_node is not None
+                and obligation_node.node_type is NodeType.OBLIGATION
+                and obligation_node.content_hash is not None
             ):
+                quantifiers = _metadata_strings(obligation_node, "matek_quantifiers")
+                hypotheses = _metadata_strings(obligation_node, "matek_hypotheses")
+                dependency_claim_ids = _metadata_strings(
+                    obligation_node, "matek_dependency_claim_ids"
+                )
+                target_claim_ids = _metadata_strings(obligation_node, "matek_target_claim_ids")
+                exact_obligation = normalize_exact_statement(exact_statement(obligation_node.body))
+                conclusion = normalize_exact_statement(
+                    str(obligation_node.metadata.get("matek_conclusion") or exact_obligation)
+                )
+                notation = str(
+                    obligation_node.metadata.get("matek_notation_definition_version") or "1"
+                )
+                try:
+                    obligation_scope = ScientificScope(
+                        str(obligation_node.metadata.get("matek_scope") or "branch")
+                    )
+                except ValueError:
+                    invalid_target_ids.append(target_id)
+                    continue
                 target_contracts.append(
                     LemmaTargetObligationReference(
-                        obligation_id=obligation.obligation_id,
-                        exact_statement=obligation.exact_statement,
-                        quantifiers=obligation.quantifiers,
-                        hypotheses=obligation.hypotheses,
-                        conclusion=obligation.conclusion,
-                        dependency_claim_ids=obligation.dependency_claim_ids,
-                        target_claim_ids=obligation.target_claim_ids,
-                        scope=obligation.scope,
-                        notation_definition_version=obligation.notation_definition_version,
-                        falsification_evidence=obligation.falsification_evidence,
-                        logical_version=obligation.logical_version,
+                        obligation_id=obligation_node.matek_id,
+                        exact_statement=exact_obligation,
+                        quantifiers=quantifiers,
+                        hypotheses=hypotheses,
+                        conclusion=conclusion,
+                        dependency_claim_ids=dependency_claim_ids,
+                        target_claim_ids=target_claim_ids,
+                        scope=obligation_scope,
+                        notation_definition_version=notation,
+                        falsification_evidence=obligation_node.evidence,
+                        logical_version=obligation_logical_version(
+                            exact_obligation,
+                            conclusion=conclusion,
+                            quantifiers=quantifiers,
+                            hypotheses=hypotheses,
+                            dependency_claim_ids=dependency_claim_ids,
+                            target_claim_ids=target_claim_ids,
+                            scope=obligation_scope,
+                            notation_definition_version=notation,
+                            falsification_evidence=obligation_node.evidence,
+                        ),
                         statement_version=obligation_node.statement_version,
                         content_sha256=obligation_node.content_hash,
                     )
                 )
                 continue
-            claim_contract = (
-                canonical_ledger.claims.get(target_id) if canonical_ledger is not None else None
-            )
             if (
-                claim_contract is None
-                or obligation_node is None
+                obligation_node is None
                 or obligation_node.node_type is not NodeType.CLAIM
                 or obligation_node.content_hash is None
             ):
                 invalid_target_ids.append(target_id)
                 continue
-            # An obligation-free graph uses the canonical main CLAIM as its exact
+            # An obligation-free graph uses the main claim as its exact
             # smallest-cut fallback. Freeze a self-describing contract for that one
             # case; explicit OBL nodes retain their full richer contracts above.
+            exact_claim = normalize_exact_statement(exact_statement(obligation_node.body))
+            try:
+                claim_scope = (
+                    ScientificScope.MAIN
+                    if target_id == main_target_id or "matek/main-target" in obligation_node.tags
+                    else ScientificScope(
+                        str(
+                            obligation_node.metadata.get("matek_scientific_scope")
+                            or ScientificScope.BRANCH.value
+                        )
+                    )
+                )
+            except ValueError:
+                invalid_target_ids.append(target_id)
+                continue
             target_contracts.append(
                 LemmaTargetObligationReference(
                     target_kind="claim",
-                    obligation_id=claim_contract.claim_id,
-                    exact_statement=claim_contract.exact_statement,
-                    conclusion=claim_contract.exact_statement,
-                    scope=claim_contract.scope,
+                    obligation_id=obligation_node.matek_id,
+                    exact_statement=exact_claim,
+                    conclusion=exact_claim,
+                    scope=claim_scope,
                     notation_definition_version="1",
-                    logical_version=claim_contract.logical_version,
+                    logical_version=logical_version(exact_claim),
                     statement_version=obligation_node.statement_version,
                     content_sha256=obligation_node.content_hash,
                 )
@@ -920,7 +999,7 @@ def nominate_intermediate_lemmas(
                     report,
                     result,
                     LemmaNominationSkipCode.FRONTIER_INVALID,
-                    "A targeted open-cut node lacks a complete canonical obligation contract.",
+                    "A targeted open-cut note lacks a complete Markdown obligation contract.",
                     *invalid_target_ids,
                 )
             )

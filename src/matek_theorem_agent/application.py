@@ -30,6 +30,7 @@ from .knowledge_graph import (
     normalize_graph_name,
     problem_graph_name,
 )
+from .knowledge_graph.semantic import SemanticGraphWriter
 from .logging import RunLogger, load_usage_journal_strict
 from .models import (
     FailureCategory,
@@ -281,7 +282,12 @@ class WorkflowRunner:
         return normalize_graph_name(str(raw["name"]))
 
     def _knowledge_graph_for_state(self, state: RunState) -> KnowledgeGraph:
-        return self._knowledge_graph(state.project_root, self._graph_name(state))
+        # The scheduler's typed graph is disposable run scratch.  The project-level
+        # Markdown vault is the only durable research authority.
+        return self._knowledge_graph(state.run_root, self._graph_name(state))
+
+    def _semantic_graph_for_state(self, state: RunState) -> SemanticGraphWriter:
+        return SemanticGraphWriter(state.project_root, self._graph_name(state))
 
     @staticmethod
     def _graph_problem_id(state: RunState) -> str:
@@ -299,7 +305,7 @@ class WorkflowRunner:
         graph_name: str | None = None,
         selection: str | None = None,
     ) -> KnowledgeGraph:
-        """Initialize/reconcile the persistent graph and reject conflicting edits."""
+        """Initialize the Markdown authority and its run-local scheduler projection."""
 
         graph_metadata = state.metadata.get("knowledge_graph")
         if not isinstance(graph_metadata, dict) or not isinstance(
@@ -333,11 +339,18 @@ class WorkflowRunner:
                     raise StateCorruptionError(
                         "a new run requires a problem path or explicit knowledge-graph name"
                     )
-            graph = self._knowledge_graph(state.project_root, graph_name)
             source_path = source_path or (state.run_root / "input" / "problem.md")
             problem_text = problem_text or (state.run_root / "input" / "problem.md").read_text(
                 encoding="utf-8"
             )
+            semantic_graph = SemanticGraphWriter(state.project_root, graph_name)
+            semantic_graph.initialize()
+            semantic_graph.initialize_problem(
+                title=source_path.stem.replace("_", " ").replace("-", " "),
+                statement=problem_text,
+                provenance=[f"run: {state.run_id}"],
+            )
+            graph = self._knowledge_graph(state.run_root, graph_name)
             problem_id, revision = graph.initialize_problem(
                 source_path=source_path,
                 problem_text=problem_text,
@@ -345,6 +358,8 @@ class WorkflowRunner:
             )
         else:
             graph = self._knowledge_graph_for_state(state)
+            semantic_graph = self._semantic_graph_for_state(state)
+            semantic_graph.initialize()
             if not graph.initialized:
                 raise GraphValidationError(
                     "run metadata references a knowledge graph that is not initialized"
@@ -830,7 +845,7 @@ class WorkflowRunner:
         else:
             graph_name = normalize_graph_name(selected.knowledge_graph)
             graph_selection = "explicit_existing"
-            if not self._knowledge_graph(project_root, graph_name).initialized:
+            if not SemanticGraphWriter(project_root, graph_name).initialized:
                 raise GraphNotInitializedError(
                     f"knowledge graph {graph_name!r} does not exist; available graphs must be "
                     "created by an earlier run or 'matek graph init GRAPH_NAME'"
@@ -2325,6 +2340,7 @@ class WorkflowRunner:
                     source_verifier=self._source_verifier(state.run_root),
                     remaining_run_model_calls=remaining_global_calls,
                     knowledge_graph=self._knowledge_graph_for_state(state),
+                    semantic_graph=self._semantic_graph_for_state(state),
                     graph_problem_id=self._graph_problem_id(state),
                     run_id=state.run_id,
                     coordinator_can_read_files=(self.config.backend.provider == "codex"),

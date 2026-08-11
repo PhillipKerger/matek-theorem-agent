@@ -1,5 +1,8 @@
 # Locked Product Decisions
 
+> **P0 graph-state override:** [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md) replaces
+> all older graph identity, ledger, snapshot, and migration decisions in this file.
+
 These decisions define the current v0.x product line and should not be reopened unless
 implementation reveals a concrete blocker.
 

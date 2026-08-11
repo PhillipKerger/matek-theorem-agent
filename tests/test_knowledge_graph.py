@@ -25,6 +25,10 @@ from matek_theorem_agent.knowledge_graph import (
     KnowledgeGraph,
     NodeType,
     RelationType,
+    SemanticFinding,
+    SemanticFindingStatus,
+    SemanticFindingType,
+    SemanticGraphWriter,
     WorkflowStatus,
     list_graph_names,
     problem_graph_name,
@@ -759,10 +763,7 @@ def test_fabricated_passing_lemma_gate_cannot_promote_an_intermediate_derivation
     assert (
         graph.show(graph.main_claim_id(problem_id)).epistemic_status is EpistemicStatus.CONJECTURED
     )
-    ledger = json.loads(
-        (graph.ledgers_root / problem_id / "canonical-ledger.json").read_text(encoding="utf-8")
-    )
-    assert ledger["derivations"][derivation.matek_id]["audit_ids"] == []
+    assert not graph.ledgers_root.exists()
     assert claim.matek_id not in {
         item.matek_id for item in graph.frontier(problem_id).strongest_audited_results
     }
@@ -3264,8 +3265,8 @@ def test_graph_cli_operates_without_obsidian(
     assert '"node_count": 0' in status.output
     doctor = cli.invoke(app, ["graph", "doctor", "--repair"])
     assert doctor.exit_code == 0, doctor.output
-    assert '"repair_requested": true' in doctor.output
-    assert '"actions": []' in doctor.output
+    assert '"valid": true' in doctor.output
+    assert '"dangling_links": []' in doctor.output
     exported = cli.invoke(app, ["graph", "export", "--format", "mermaid"])
     assert exported.exit_code == 0
     assert "flowchart TD" in exported.output
@@ -3412,24 +3413,16 @@ def test_graph_search_cli_finds_nodes_lexically(
     project.mkdir()
     (project / ".git").mkdir()
     monkeypatch.chdir(project)
-    problem = project / "problem.md"
-    problem.write_text("Prove the search fixture theorem.\n", encoding="utf-8")
-    graph = KnowledgeGraph(project, "problem")
-    problem_id, _ = graph.initialize_problem(
-        source_path=problem,
-        problem_text=problem.read_text(encoding="utf-8"),
-        run_id="run-one",
-    )
-    graph.record_compiled_problem(
-        problem_id=problem_id,
-        run_id="run-one",
-        compiled_problem={
-            "title": "Search fixture theorem",
-            "normalized_statement": "Every searchable object has the fixture property.",
-            "claim_contract": {"target": "the fixture property"},
-            "literature_status": "open_problem",
-            "source_ledger": [],
-        },
+    graph = SemanticGraphWriter(project, "problem")
+    graph.initialize()
+    graph.admit_finding(
+        SemanticFinding(
+            finding_type=SemanticFindingType.THEOREM,
+            title="Search fixture theorem",
+            status=SemanticFindingStatus.INCOMPLETE,
+            statement="Every searchable object has the fixture property.",
+            what_was_established="The searchable fixture property remains the exact target.",
+        )
     )
 
     cli = CliRunner()

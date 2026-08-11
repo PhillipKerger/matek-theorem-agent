@@ -3104,7 +3104,7 @@ async def test_self_assumed_exact_main_candidate_never_reaches_packaging_without
             [],
             False,
             False,
-            "not current canonical trusted claims",
+            "not current audited Markdown claims",
         ),
         (
             NodeType.CLAIM,
@@ -3112,7 +3112,7 @@ async def test_self_assumed_exact_main_candidate_never_reaches_packaging_without
             [],
             False,
             False,
-            "not current canonical trusted claims",
+            "not current audited Markdown claims",
         ),
         (NodeType.CLAIM, EpistemicStatus.AUDIT_PASSED, [], False, True, None),
         (

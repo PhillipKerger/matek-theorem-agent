@@ -1,5 +1,9 @@
 # MATEK: An Orchestrator for Agentic Mathematical Research using Human-Explorable Knowledge Graph Memory with Lean Verification
 
+> Research memory is now graph-only. Descriptive Markdown notes are the sole durable authority;
+> model agents exchange semantic mathematical findings and never administer graph IDs, patches,
+> ledgers, or persistence formats. See [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md).
+
 MATEK (Multi-Agent Theorem Exploration through Knowledge-Graph Memory) is a local,
 multi-agent orchestration system for mathematical research and Lean formalization. Starting from a concise
 problem description, it coordinates independent research and adversarial review, and stores results in a human-explorable persistent knowledge graph. Agents can thereby build persistent knowledge about a problem over many sessions until a result is finally achieved, and even no result is achieved the user can explore the lemmas, partial results, approaches and so on that MATEK worked through. 
@@ -15,14 +19,14 @@ MATEK should be cited in any scholarly, technical, or public work in which it is
 produced work should contain a clear statement of AI usage. Users are also encouraged to share
 knowledge graphs that can serve as starting points for future work.
 
-The current package version is **0.8.1**.
+The current package version is **0.9.0**.
 
 | At a glance | Default behavior |
 | --- | --- |
 | Model access | Official Codex CLI with ChatGPT sign-in; no OpenAI API key required |
 | Run outputs | `.matek/runs/<run-id>/` inside your project |
 | Persistent memory | One typed Markdown graph per problem in `.matek/knowledge/<graph-name>/`, shared across runs |
-| Proof memory | Exact canonical claim/derivation/obligation ledger with a computed smallest known open cut |
+| Proof memory | Descriptive Markdown notes and wiki links; no separate canonical ledger |
 | Research breadth | A continuous logical coordinator starts eight diverse first-level workers and refills adaptively; there is no cumulative worker-count cap |
 | Parallelism | Eight bootstrap assignments; four nested agents per worker; 24 reserved research-agent slots, yielding four concurrent hierarchical workers by default |
 | Research roles | GPT 5.6 Sol with max coordinator effort and independent xhigh workers; the API adapter also requests pro mode |
@@ -462,14 +466,10 @@ write boundary:
 .matek/
 └── knowledge/
     └── <graph-name>/       # one Obsidian vault, normally named from the problem file stem
-        ├── Home.md and typed note directories
-        ├── graph-schema.json
+        ├── Problems/, Claims/, Obligations/, Tasks/, Sources/, ...
+        ├── Home.md and Dashboards/        # disposable generated navigation
         ├── graph-index.sqlite
-        ├── graph-state.json
-        ├── target-registry.json # source-hash-frozen exact target and contract
-        ├── ledgers/              # canonical claims, derivations, and obligations
-        ├── snapshots/          # v2 manifests/checkpoints/content-addressed blobs; v1 readable
-        └── locks/graph.lock
+        └── .transactions/                  # writer lock and interrupted commit staging
 ```
 
 The main scientific evidence paths are:
@@ -491,10 +491,8 @@ The main scientific evidence paths are:
   `research/computations/{manifests/,blobs/sha256/}`, mutable `replay-workspaces/`, immutable
   `replays/<assignment>/<manifest-sha>/{attempts/<eight-digit-attempt>.json,verdict.json}`, and
   `research/worker-computation/<assignment>.json`; and
-- graph `target-registry.json`, `ledgers/<problem>/canonical-ledger.json`, conditional
-  `ledgers/<problem>/migration-report.json` for ambiguous projection,
-  `ledgers/migrations/<plan-sha>.application.json` for an applied reviewed backfill, and
-  snapshot-v2 `snapshots/{manifests/,checkpoints/,blobs/{nodes,edges}/}`.
+- descriptive Markdown notes under `.matek/knowledge/<graph>/`, with hidden note UUIDs used only
+  for rename detection and atomic inbound-link updates.
 
 See [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) for the complete tree and integrity rules.
 
@@ -512,16 +510,15 @@ filename gets a separate graph. To intentionally place related or follow-up work
 graph, pass `--knowledge-graph NAME`; an unknown name is rejected rather than silently creating
 one. The selected graph is frozen in run metadata, so resume cannot drift to another graph.
 
-Claims, proof attempts, derivations, obligations, proofs, audits, counterexamples, formalizations,
-sources, tasks, and artifacts remain separate typed notes with immutable IDs. The Markdown notes
-and flat YAML frontmatter are authoritative; SQLite is only a rebuildable index, and MATEK works
-normally when Obsidian is not installed.
+Claims, partial progress, failed approaches, obligations, counterexamples, computations, sources,
+and tasks are separate Markdown notes named by descriptive mathematical titles. Ordinary wiki
+links express their relationships. A hidden UUID supports rename detection, but models and normal
+navigation never see it. SQLite is a disposable index, and MATEK works normally without Obsidian.
 
-Every coordinator activation reviews the current frontier revision, including after
-`matek resume`, and records that revision in its decision rationale. Tasks point to explicit graph nodes
-that define their branch scope. Blocked and ruled-out approaches retain their exact failure,
-counterexamples, and reopen condition, while partial results from different branches remain
-available for later synthesis.
+Every coordinator activation receives a concise semantic graph slice: descriptive titles,
+statements, statuses, immediate dependencies, and selected evidence. MATEK—not the model—binds
+scheduler identity and writes graph structure. Blocked and ruled-out approaches retain their exact
+failure and reopen condition, while partial results remain available for later synthesis.
 
 The normalized source file hash freezes the theorem before research. The prompt compiler first
 writes `prompts/target_alignment.json`, which hash-binds the statement and contract and checks each
@@ -547,21 +544,11 @@ generated prose do not block. In particular, contract examples
 inside prohibitions—such as “no `+β` is permitted”—are not required to appear positively in the
 statement. Research, manuscript, bibliography, and Lean verification retain their own gates.
 
-The Markdown vault is the complete research archive, not a bag of trusted theorems. Its rebuildable
-`ledgers/<problem-id>/canonical-ledger.json` projection contains exact canonical claims, joint
-AND-premise derivations, OR alternative derivations, and explicit obligations with logical
-versions. An obligation version covers its exact statement, conclusion, quantifiers, hypotheses,
-dependency and target claim IDs, scope, notation-definition version, and falsification evidence.
-Gapped and partial reports stay proof attempts plus completion obligations. Claims and derivations
-with nonempty, missing, or malformed application-owned assumption contracts are quarantined from
-trusted support while their archive evidence remains intact. Assumption-bearing and partial results
-cannot become same-report premises or support a candidate, blind lemma audit, or exact-
-counterexample audit. Only audited or Lean-verified claims seed the trusted closure; an audit-passed
-derivation propagates trust only when every joint premise is trusted and every attached obligation
-is resolved. `matek graph frontier` computes the smallest known open cut from that ledger and says
-when bounded antichain search was capped. Archive
-membership, canonical identity, ledger inclusion, and snapshot integrity establish provenance—not
-mathematical truth; only an independent audit or Lean verification changes trust status.
+The Markdown vault is the complete research archive, not a bag of trusted theorems. Trust is
+computed directly from the current notes, their statuses, provenance, and links. Partial and
+assumption-bearing results remain visible but cannot satisfy the manuscript or Lean gates.
+Presence in the archive establishes provenance—not mathematical truth; only independent audit or
+Lean verification changes trust status.
 
 Manuscript and Lean formalization receive contexts from one shared, bounded trusted-context
 selector. It prioritizes the accepted main proof and its support, includes only canonical trusted
@@ -619,7 +606,7 @@ into `research/computations/blobs/sha256/`, rejects traversal, links, special/un
 quota excess. Trusted replay currently requires `--sandbox docker`, which uses a fresh filesystem-
 confined, network-disabled workspace; native mode records an unsafe-backend verdict and does not
 replay. The API adapter has no worker filesystem authority. An unreplayed or mismatching
-computation remains an experiment outside the canonical ledger. A passing replay creates only a
+computation remains an experiment rather than an audited proof. A passing replay creates only a
 proposed derivation: it does not establish domain completeness or mathematical truth and still
 requires independent audit. Candidate use additionally requires the computation to lie in the
 declared transitive dependency closure of a separate exact-main lemma or reduction. The candidate
@@ -650,18 +637,11 @@ matek graph doctor -g problem
 matek graph doctor --repair -g problem
 matek graph frontier -g problem
 matek graph validate -g problem
-matek graph show CLM-... -g problem
-matek graph dependencies CLM-... -g problem
-matek graph downstream CLM-... -g problem
-matek graph tombstone CLM-... --reason "Superseded by the corrected statement" -g problem
-matek graph diff REVISION_A REVISION_B -g problem
-matek graph verify-snapshots -g problem
-matek graph reconstruct REVISION --output snapshot.json -g problem
-matek graph migrate-legacy -g problem --dry-run \
-  --output .matek/migration-reports/problem.json
-# Inspect and externally review the plan, then explicitly apply those exact bytes:
-matek graph migrate-legacy -g problem \
-  --apply-plan .matek/migration-reports/problem.json
+matek graph show "Within-layer Yoneda vanishing" -g problem
+matek graph dependencies "Rank-three extension obstruction" -g problem
+matek graph downstream "Within-layer Yoneda vanishing" -g problem
+matek graph rename "Old title" "Clearer mathematical title" -g problem
+matek graph search "singular block" -g problem
 matek graph export --format mermaid -g problem
 matek graph rebuild-index -g problem
 matek graph open -g problem
@@ -671,24 +651,9 @@ The graph commands omit `-g` safely when exactly one graph exists. If several ex
 required. `matek graph init NAME` can create an empty named graph for later explicit reuse;
 ordinary `matek init` leaves graph creation to the first problem run.
 
-Every completed report records the canonical-target disposition (`created`, `reused`, or
-`migrated`), stable target ID, and contract SHA-256. This makes repeat-run reuse visible without
-requiring inspection of the graph transaction files.
-
-Graph revision storage is content-addressed: unchanged node and edge records are shared across
-small delta manifests, with full checkpoints every 64 revisions by default for bounded replay.
-`verify-snapshots` checks the integrity chain and every live blob offline. Older schema-v1 full
-snapshots remain read-only, and `reconstruct` returns their original bytes exactly.
-
-Without `--apply-plan`, `migrate-legacy` is a read-only planner and refuses report output inside
-`.matek/knowledge/`. Review its integrity-protected external report before applying it. The apply
-form verifies the digest, graph name, frozen source revision, archive digest, exact claim versions,
-and relations, then asks for confirmation (`--yes` skips the prompt). A valid plan commits once and
-idempotently: legacy nodes and prior snapshots remain archive evidence while MATEK creates typed
-proof attempts, proposed derivations, reviewed aliases, branch-local refutation quarantines, and
-queued verifier/falsifier audit tasks. It neither guesses ambiguous mappings nor makes model calls.
-The application record is
-`.matek/knowledge/<graph>/ledgers/migrations/<plan-sha>.application.json`.
+Retired graph formats are restarted under a clean graph name; they are not migrated or imported.
+Atomic writer transactions and the hidden per-note UUID are implementation details, not a model or
+user-facing identity system.
 
 ## How the workflow works
 

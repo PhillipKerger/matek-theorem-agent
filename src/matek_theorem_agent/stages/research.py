@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -18,6 +19,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode
 
 from ..budget import BudgetExceeded
 from ..config import ModelSettings
@@ -49,13 +51,15 @@ from ..knowledge_graph.admission import (
     admission_payload_sha256,
     node_has_scientific_admission_binding,
 )
-from ..knowledge_graph.ledger import (
-    ObligationStatus,
-    logical_version,
-    project_markdown_ledger,
-    trusted_claim_ids,
-)
 from ..knowledge_graph.markdown import exact_statement as graph_exact_statement
+from ..knowledge_graph.semantic import (
+    SemanticCoordinatorDecision,
+    SemanticFinding,
+    SemanticFindingStatus,
+    SemanticFindingType,
+    SemanticGraphWriter,
+    SemanticWorkerReport,
+)
 from ..models import FailureCategory
 from ..openai_client import (
     ModelClient,
@@ -151,6 +155,16 @@ from .scientific_phase import (
     semantic_similarity,
     write_scientific_phase_state,
 )
+
+
+def logical_version(exact_claim: str, *, notation_definition_version: str = "1") -> str:
+    """Hash mathematical content directly, without consulting a secondary authority."""
+
+    normalized = normalize_exact_statement(exact_claim)
+    notation = notation_definition_version.strip()
+    if not normalized or not notation:
+        raise ValueError("logical versions require an exact statement and notation version")
+    return hashlib.sha256(f"{notation}\0{normalized}".encode()).hexdigest()
 
 
 class WorkerStatus(StrEnum):
@@ -309,7 +323,12 @@ class ResearchRoundPlan(BaseModel):
 
 
 class ResearchCoordinatorDecision(BaseModel):
-    """One event-indexed decision from the continuous logical coordinator."""
+    """Scheduler-owned form of one semantic coordinator decision.
+
+    The model backend sees :class:`SemanticCoordinatorDecision`.  This form is
+    produced by a deterministic boundary adapter and contains the run-local
+    identities needed for crash recovery and concurrency control.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -330,6 +349,65 @@ class ResearchCoordinatorDecision(BaseModel):
     requested_graph_node_ids: list[str] = Field(default_factory=list, max_length=32)
     supporting_evidence_ids: list[str] = Field(default_factory=list, max_length=64)
     resolved_contradiction_node_ids: list[str] = Field(default_factory=list, max_length=32)
+    semantic_decision: SemanticCoordinatorDecision | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_semantic_transport(cls, value: object) -> object:
+        if not isinstance(value, dict) or "assignments" not in value:
+            return value
+        if "decision_id" in value:
+            return value
+        semantic = SemanticCoordinatorDecision.model_validate(value)
+        assignments = []
+        for index, assignment in enumerate(semantic.assignments, start=1):
+            digest = hashlib.sha256(
+                json.dumps(assignment.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            assignments.append(
+                {
+                    "id": f"semantic-{index}-{digest}",
+                    "approach_family": assignment.approach_family,
+                    "task": assignment.task,
+                    "expected_output": assignment.expected_output,
+                    "inputs": [assignment.title, *assignment.relates_to],
+                    "stopping_condition": assignment.stopping_condition,
+                }
+            )
+        stop_reason = semantic.declared_scientific_stop
+        return {
+            "decision_id": 1,
+            "after_event_sequence": 0,
+            "assignments": assignments,
+            "rationale": semantic.rationale,
+            "retire_assignment_ids": semantic.retire_assignments,
+            "candidate_report_ids": semantic.candidate_reports,
+            "candidate_packaging_recommended": semantic.candidate_packaging_recommended,
+            "requested_graph_node_ids": semantic.requested_graph_titles,
+            "stop_recommended": stop_reason is not None,
+            "stop_reason": stop_reason,
+            "semantic_decision": semantic,
+        }
+
+    @classmethod
+    def model_json_schema(
+        cls,
+        by_alias: bool = True,
+        ref_template: str = "#/$defs/{model}",
+        schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+        mode: JsonSchemaMode = "validation",
+        *,
+        union_format: Literal["any_of", "primitive_type_array"] = "any_of",
+    ) -> dict[str, Any]:
+        """Expose only the semantic contract to provider adapters."""
+
+        return SemanticCoordinatorDecision.model_json_schema(
+            by_alias=by_alias,
+            ref_template=ref_template,
+            schema_generator=schema_generator,
+            mode=mode,
+            union_format=union_format,
+        )
 
     @field_validator(
         "requested_artifact_ids",
@@ -734,7 +812,11 @@ class ArchivedResearchWorkerReportV1(BaseModel):
 
 
 class ResearchWorkerReport(BaseModel):
-    """Provider-visible v2 report containing mathematics rather than persistence mutations."""
+    """Scheduler-owned normalization of a semantic worker report.
+
+    ``semantic_report`` retains the exact title-based response for Markdown admission
+    and crash recovery. It is run-local evidence and is hidden from the provider schema.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -746,6 +828,144 @@ class ResearchWorkerReport(BaseModel):
     artifact_manifest: list[ScientificArtifactDeclaration] = Field(default_factory=list)
     branch_outcome: BranchOutcome
     mechanism: str | None = None
+    semantic_report: SemanticWorkerReport | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_semantic_transport(cls, value: object) -> object:
+        if not isinstance(value, dict) or value.get("schema_version") != 3:
+            return value
+        semantic = SemanticWorkerReport.model_validate(value)
+        results: list[dict[str, object]] = []
+        obligations: list[dict[str, object]] = []
+        for index, finding in enumerate(semantic.findings, start=1):
+            local_key = f"finding-{index}-{hashlib.sha256(finding.title.encode()).hexdigest()[:10]}"
+            exact_gap = (
+                finding.next_mathematical_bottleneck
+                or finding.what_was_tried_and_did_not_work
+                or "This finding remains incomplete."
+                if finding.status
+                in {SemanticFindingStatus.INCOMPLETE, SemanticFindingStatus.BLOCKED}
+                else None
+            )
+            if finding.statement:
+                kind = {
+                    SemanticFindingType.DEFINITION: ScientificResultKind.SOURCE_FACT,
+                    SemanticFindingType.THEOREM: ScientificResultKind.LEMMA,
+                    SemanticFindingType.LEMMA: ScientificResultKind.LEMMA,
+                    SemanticFindingType.PARTIAL_PROGRESS: ScientificResultKind.REDUCTION,
+                    SemanticFindingType.FAILED_APPROACH: ScientificResultKind.REDUCTION,
+                    SemanticFindingType.COUNTEREXAMPLE: ScientificResultKind.COUNTEREXAMPLE,
+                    SemanticFindingType.COMPUTATION: ScientificResultKind.COMPUTATION,
+                    SemanticFindingType.SOURCE: ScientificResultKind.SOURCE_FACT,
+                    SemanticFindingType.TASK: ScientificResultKind.REDUCTION,
+                }[finding.finding_type]
+                evidence = (
+                    "\n\n".join(
+                        item
+                        for item in (
+                            finding.what_was_established,
+                            finding.what_was_tried_and_did_not_work,
+                            "\n".join(finding.supporting_evidence),
+                        )
+                        if item.strip()
+                    )
+                    or "The worker supplied this exact mathematical statement without a proof."
+                )
+                disposition = (
+                    ScientificResultDisposition.PROPOSED_COMPLETE
+                    if finding.status is SemanticFindingStatus.PROPOSED and exact_gap is None
+                    else ScientificResultDisposition.REFUTED_MECHANISM
+                    if finding.status is SemanticFindingStatus.REFUTED
+                    else ScientificResultDisposition.PARTIAL
+                )
+                results.append(
+                    {
+                        "local_key": local_key,
+                        "kind": kind.value,
+                        "exact_statement": finding.statement,
+                        "scope": ScientificScope.BRANCH.value,
+                        "one_liner": finding.title,
+                        "proof_or_certificate": evidence,
+                        "exact_gap": exact_gap,
+                        "disposition": disposition.value,
+                    }
+                )
+                continue
+            bottleneck = (
+                finding.next_mathematical_bottleneck
+                or finding.what_was_tried_and_did_not_work
+                or f"Determine the unresolved content of {finding.title}."
+            )
+            obligations.append(
+                {
+                    "local_key": local_key,
+                    "exact_statement": bottleneck,
+                    "one_liner": finding.title,
+                    "conclusion": bottleneck,
+                    "falsification_evidence": finding.supporting_evidence,
+                }
+            )
+        has_refuting_counterexample = any(
+            finding.finding_type is SemanticFindingType.COUNTEREXAMPLE
+            and finding.status is SemanticFindingStatus.REFUTED
+            for finding in semantic.findings
+        )
+        has_incomplete = bool(obligations) or any(
+            result.get("exact_gap") is not None for result in results
+        )
+        branch_outcome = (
+            BranchOutcome.REFUTED
+            if has_refuting_counterexample
+            else BranchOutcome.BLOCKED
+            if has_incomplete or not results
+            else BranchOutcome.PROGRESS
+        )
+        if (
+            branch_outcome is BranchOutcome.BLOCKED
+            and not obligations
+            and not any(result.get("exact_gap") is not None for result in results)
+        ):
+            bottleneck = semantic.next_assignment or "The branch remains mathematically open."
+            obligations.append(
+                {
+                    "local_key": "unresolved-branch",
+                    "exact_statement": bottleneck,
+                    "conclusion": bottleneck,
+                }
+            )
+        assignment_digest = hashlib.sha256(semantic.assignment_title.encode()).hexdigest()[:12]
+        return {
+            "schema_version": 2,
+            "assignment_id": f"semantic-{assignment_digest}",
+            "results": results,
+            "unresolved_obligations": obligations,
+            "source_ledger": [],
+            "artifact_manifest": [],
+            "branch_outcome": branch_outcome.value,
+            "mechanism": semantic.overall_progress or semantic.next_assignment or None,
+            "semantic_report": semantic,
+        }
+
+    @classmethod
+    def model_json_schema(
+        cls,
+        by_alias: bool = True,
+        ref_template: str = "#/$defs/{model}",
+        schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+        mode: JsonSchemaMode = "validation",
+        *,
+        union_format: Literal["any_of", "primitive_type_array"] = "any_of",
+    ) -> dict[str, Any]:
+        """Expose only the semantic contract to provider adapters."""
+
+        return SemanticWorkerReport.model_json_schema(
+            by_alias=by_alias,
+            ref_template=ref_template,
+            schema_generator=schema_generator,
+            mode=mode,
+            union_format=union_format,
+        )
 
     @field_validator("assignment_id")
     @classmethod
@@ -924,19 +1144,16 @@ def _scientific_target_versions(
     problem_id: str,
     target_claim_id: str,
 ) -> dict[str, str]:
-    """Project semantic versions for every possible scientific cut target."""
+    """Compute target versions directly from the parsed Markdown graph."""
 
-    ledger = project_markdown_ledger(
-        nodes,
-        graph_revision=graph_revision,
-        problem_id=problem_id,
-        target_claim_id=target_claim_id,
-    )
+    del graph_revision, target_claim_id
     versions = {
-        obligation_id: obligation.logical_version
-        for obligation_id, obligation in ledger.obligations.items()
+        node.matek_id: logical_version(graph_exact_statement(node.body))
+        for node in nodes
+        if node.problem_id == problem_id
+        and node.node_type in {NodeType.CLAIM, NodeType.OBLIGATION}
+        and graph_exact_statement(node.body)
     }
-    versions.update({claim_id: claim.logical_version for claim_id, claim in ledger.claims.items()})
     for node in nodes:
         if node.problem_id != problem_id or node.tombstone:
             continue
@@ -1518,7 +1735,7 @@ class CandidateComputationBinding(BaseModel):
 
 
 class CandidateGraphSupportBinding(BaseModel):
-    """Hash-bound canonical-ledger slice supporting one candidate-trigger report."""
+    """Hash-bound Markdown graph slice supporting one candidate-trigger report."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -2383,6 +2600,7 @@ async def run_adaptive_research(
     source_verifier: IdentifierVerifier | None = None,
     remaining_run_model_calls: int | None = None,
     knowledge_graph: KnowledgeGraph | None = None,
+    semantic_graph: SemanticGraphWriter | None = None,
     graph_problem_id: str | None = None,
     run_id: str | None = None,
     coordinator_can_read_files: bool = False,
@@ -2409,6 +2627,8 @@ async def run_adaptive_research(
         raise ValueError("knowledge_graph and graph_problem_id must be provided together")
     if knowledge_graph is not None and not (run_id or "").strip():
         raise ValueError("graph-integrated research requires run_id")
+    if semantic_graph is not None and not (run_id or "").strip():
+        raise ValueError("semantic graph admission requires run_id")
     settings = workflow_settings or ResearchWorkflowSettings()
     if remaining_run_model_calls is not None and remaining_run_model_calls < 0:
         raise ValueError("remaining_run_model_calls must be nonnegative")
@@ -2527,7 +2747,7 @@ async def run_adaptive_research(
     ) or len(attempted_candidate_keys) != len(set(attempted_candidate_keys)):
         raise StageValidationError("Research candidate-attempt keys are invalid or duplicated.")
 
-    # Finish the state-first event transaction before validating the ledger. A crash
+    # Finish the state-first event transaction before validating durable reports. A crash
     # may leave the canonical scheduler snapshot one event ahead, but never vice versa.
     if scheduler.pending_event is not None:
         pending_sequence = scheduler.pending_event.get("sequence")
@@ -2706,8 +2926,11 @@ async def run_adaptive_research(
     )
     pending_coordinator = scheduler.pending_coordinator_request
     if pending_coordinator is not None:
+        semantic_pending = pending_coordinator.request_payload.get("semantic_agent_context")
         pending_input = (
-            serialize_coordinator_payload(pending_coordinator.request_payload)
+            json.dumps(semantic_pending, ensure_ascii=False, sort_keys=True)
+            if isinstance(semantic_pending, dict)
+            else serialize_coordinator_payload(pending_coordinator.request_payload)
             if pending_coordinator.context_manifest_path is not None
             else json.dumps(
                 pending_coordinator.request_payload,
@@ -3046,7 +3269,7 @@ async def run_adaptive_research(
         ]
         current_assignment_ids = {record.assignment.id for record in current_completed}
         frontier = knowledge_graph.frontier(graph_problem_id)
-        ledger_revision = frontier.graph_revision
+        graph_revision = frontier.graph_revision
         graph_nodes = knowledge_graph.load_nodes()
         current_claim_ids = {
             node.matek_id
@@ -3141,7 +3364,7 @@ async def run_adaptive_research(
                 if scientific_phase_state.snapshots
                 else 1
             ),
-            ledger_revision=ledger_revision,
+            ledger_revision=graph_revision,
             completed_assignment_count=(
                 scientific_phase_state.completed_assignment_count + len(new_current_completed)
             ),
@@ -3385,42 +3608,72 @@ async def run_adaptive_research(
             if record.request_settings is not None
             else settings.hierarchical_subagent_limit
         )
+        assignment_title = (
+            record.assignment.inputs[0] if record.assignment.inputs else record.assignment.task
+        )
+        graph_slice: list[dict[str, object]] = []
+        if semantic_graph is not None:
+            semantic_memory = semantic_graph.semantic_context(
+                focus_titles=list(record.assignment.inputs[1:]),
+                maximum_nodes=48,
+            )
+            raw_nodes = semantic_memory.get("nodes", [])
+            if isinstance(raw_nodes, list):
+                graph_slice = [item for item in raw_nodes if isinstance(item, dict)]
+        elif knowledge_graph is not None:
+            nodes = [node for node in knowledge_graph.load_nodes() if not node.tombstone]
+            by_id = {node.matek_id: node for node in nodes}
+            selected_ids = set(record.assignment.target_node_ids)
+            if graph_problem_id is not None:
+                selected_ids.add(knowledge_graph.main_claim_id(graph_problem_id))
+            for node_id in tuple(selected_ids):
+                node = by_id.get(node_id)
+                if node is not None:
+                    selected_ids.update(edge.target_id for edge in node.relations)
+            selected_nodes = sorted(
+                (by_id[node_id] for node_id in selected_ids if node_id in by_id),
+                key=lambda node: node.title.casefold(),
+            )
+            for node in selected_nodes:
+                graph_slice.append(
+                    {
+                        "title": node.title,
+                        "kind": node.node_type.value,
+                        "status": f"{node.epistemic_status.value}/{node.workflow_status.value}",
+                        "statement": graph_exact_statement(node.body),
+                        "immediate_dependencies": list(
+                            dict.fromkeys(
+                                by_id[edge.target_id].title
+                                for edge in node.relations
+                                if edge.target_id in by_id
+                            )
+                        ),
+                        "selected_supporting_evidence": node.evidence[:8],
+                    }
+                )
         payload: dict[str, object] = {
             "compiled_prompt": compiled.compiled_prompt,
             "claim_contract": compiled.claim_contract.as_dict(),
             "literature_refresh": literature_refresh_payload(),
-            "assignment": record.assignment.model_dump(mode="json"),
-            "admitted_by_coordinator_decision": record.admitted_by_decision,
-            "repair_generation": record.repair_generation,
-            "scientific_phase_contract": {
+            "assignment": {
+                "title": assignment_title,
+                "approach_family": record.assignment.approach_family,
+                "task": record.assignment.task,
+                "expected_output": record.assignment.expected_output,
+                "relates_to": list(record.assignment.inputs[1:]),
+                "stopping_condition": record.assignment.stopping_condition,
+            },
+            "scientific_role": {
                 "phase": record.assignment.scientific_phase.value,
-                "phase_epoch": record.scientific_phase_epoch,
                 "role": record.assignment.scientific_role.value,
-                "target_obligation_ids": record.assignment.target_obligation_ids,
-                "target_obligation_versions": [
-                    item.model_dump(mode="json")
-                    for item in record.assignment.target_obligation_versions
-                ],
                 "mechanism_delta": record.assignment.mechanism_delta,
-                "audited_premise_ids": record.assignment.audited_premise_ids,
                 "instruction": (
-                    "Work only in the assigned phase and role. A nested contribution has no "
-                    "extra epistemic weight. Report whether the exact open-cut obligation was "
-                    "reduced and distinguish a new mechanism from archived attempts."
+                    "Work only in the assigned mathematical phase and role. Report whether "
+                    "the named bottleneck was reduced and distinguish a new mechanism from "
+                    "the archived attempts in the graph slice."
                 ),
             },
-            "private_artifact_workspace": {
-                "enabled": callable(getattr(worker_client, "for_workspace", None)),
-                "writable_relative_path": ".",
-                "declaration_path_base": ".",
-                "instruction": (
-                    "When enabled, write computation code, inputs, expected stdout/stderr, and "
-                    "certificate outputs only beneath the current private workspace. In "
-                    "artifact_manifest, paths are relative to that workspace. Declare every file; "
-                    "MATEK rejects symlinks, undeclared files, quota excess, worker-supplied "
-                    "digests, and unreplayed computation claims."
-                ),
-            },
+            "knowledge_graph": graph_slice,
             "agent_hierarchy": (
                 {
                     "role": "hierarchical_research_subagent",
@@ -3445,48 +3698,10 @@ async def run_adaptive_research(
                 }
             ),
         }
-        if record.exact_target_policy_version == 1:
-            payload["exact_target_policy"] = exact_target_policy()
         if record.repair_generation:
             payload["recovery_instruction"] = (
-                "This is the one bounded schema/execution repair generation. Return a valid "
-                "typed scientific report for the same assignment. Do not return persistence "
-                "identities or graph mutations."
-            )
-        if record.graph_context is not None:
-            payload.update(
-                {
-                    "knowledge_graph_context": record.graph_context,
-                    "graph_task_id": record.graph_task_id,
-                    "base_graph_revision": record.graph_revision,
-                    "branch_work_contract": {
-                        "contract_version": record.graph_contract_version,
-                        "target_node_ids": record.assignment.target_node_ids,
-                        "scope_rule": (
-                            "Treat these target nodes and the exact task as this assignment's "
-                            "branch boundary. Work deeply on that branch. Record adjacent useful "
-                            "facts without silently changing the assigned objective."
-                        ),
-                        "negative_result_rule": (
-                            "If this branch cannot work, use blocked for a precise missing "
-                            "statement or refuted only for a concrete obstruction to this "
-                            "assigned branch. State the exact failure and evidence. Do not claim "
-                            "that the main theorem is false merely because a strengthening, "
-                            "lemma, or mechanism fails."
-                        ),
-                        "reopen_rule": (
-                            "For blocked or refuted work, make the typed result evidence and "
-                            "unresolved obligations identify what would justify reopening the "
-                            "branch."
-                        ),
-                    },
-                    "scientific_result_contract": (
-                        "Return schema-version-2 typed scientific results, obligations, sources, "
-                        "and artifact declarations only. MATEK owns run/task identities, stable "
-                        "graph IDs, revisions, provenance, status promotion, and relation "
-                        "directions. Do not return any persistence mutation payload."
-                    ),
-                }
+                "Return a valid semantic report for the same mathematical assignment. Preserve "
+                "recoverable partial work and do not return persistence identities."
             )
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -3514,7 +3729,7 @@ async def run_adaptive_research(
                 "policy": (
                     "When a knowledge graph is active, package only the exact-main proposed "
                     "derivations and their application-resolved local-result closure admitted by "
-                    "MATEK's canonical ledger. Bind replay-backed computation derivations and "
+                    "the parsed Markdown graph. Bind replay-backed computation derivations and "
                     "artifacts; treat every live linked obligation as blocking."
                 ),
                 "bindings": [
@@ -4085,7 +4300,7 @@ async def run_adaptive_research(
         )
         if len(legacy_counted_records) < scientific_phase_state.completed_assignment_count:
             raise StageValidationError(
-                "Scientific phase completion count exceeds the durable worker-report ledger."
+                "Scientific phase completion count exceeds the durable worker-report record."
             )
         scientific_phase_state = scientific_phase_state.model_copy(
             update={
@@ -4100,7 +4315,7 @@ async def run_adaptive_research(
         write_scientific_phase_state(scientific_phase_path, scientific_phase_state)
     if scientific_phase_state.completed_assignment_count > completed_on_resume:
         raise StageValidationError(
-            "Scientific phase state is ahead of the durable worker-report ledger."
+            "Scientific phase state is ahead of the durable worker-report record."
         )
     if scientific_phase_state.completed_assignment_count < completed_on_resume:
         record_phase_progress()
@@ -4486,7 +4701,7 @@ async def run_adaptive_research(
     def verify_candidate_graph_support_bindings(
         report_ids: list[str],
     ) -> tuple[list[CandidateGraphSupportBinding], list[str]]:
-        """Bind graph-integrated candidates to their live canonical ledger derivations."""
+        """Bind graph-integrated candidates to their live Markdown derivations."""
 
         if knowledge_graph is None or graph_problem_id is None or run_id is None:
             missing_graph_obligations: list[str] = []
@@ -4537,14 +4752,15 @@ async def run_adaptive_research(
         graph_nodes = knowledge_graph.load_nodes()
         graph_by_id = {node.matek_id: node for node in graph_nodes}
         main_claim_id = knowledge_graph.main_claim_id(graph_problem_id)
-        graph_revision = knowledge_graph.load_state().revision
-        markdown_ledger = project_markdown_ledger(
-            graph_nodes,
-            graph_revision=graph_revision,
-            problem_id=graph_problem_id,
-            target_claim_id=main_claim_id,
-        )
-        trusted_external_claim_ids = trusted_claim_ids(markdown_ledger)
+        trusted_external_claim_ids = {
+            node.matek_id
+            for node in graph_nodes
+            if node.problem_id == graph_problem_id
+            and node.node_type is NodeType.CLAIM
+            and node.epistemic_status
+            in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            and not node.tombstone
+        }
         verified_computations, _ = verify_candidate_computation_bindings(report_ids)
         computation_by_result = {
             (binding.assignment_id, binding.result_local_key): binding
@@ -4878,7 +5094,7 @@ async def run_adaptive_research(
                 if untrusted_external_ids:
                     obligations.append(
                         f"Candidate support result {assignment_id!r}/{result.local_key!r} uses "
-                        "external premise(s) that are not current canonical trusted claims or "
+                        "external premise(s) that are not current audited Markdown claims or "
                         "application-admitted definitions: "
                         + ", ".join(sorted(untrusted_external_ids))
                     )
@@ -5040,7 +5256,6 @@ async def run_adaptive_research(
             for node in graph_nodes:
                 if node.node_type is not NodeType.OBLIGATION:
                     continue
-                ledger_obligation = markdown_ledger.obligations.get(node.matek_id)
                 metadata_links: set[str] = set()
                 for key in (
                     "matek_parent_node_ids",
@@ -5071,15 +5286,6 @@ async def run_adaptive_research(
                         for edge in graph_by_id[support_id].relations
                     )
                 }
-                ledger_links = (
-                    {
-                        *ledger_obligation.parent_derivation_ids,
-                        *ledger_obligation.dependency_claim_ids,
-                        *ledger_obligation.target_claim_ids,
-                    }
-                    if ledger_obligation is not None
-                    else set()
-                )
                 support_metadata_links = False
                 for support_id in obligation_support_ids:
                     support_node = graph_by_id.get(support_id)
@@ -5091,19 +5297,14 @@ async def run_adaptive_research(
                     ):
                         support_metadata_links = True
                         break
-                all_obligation_links = (
-                    metadata_links | relation_links | reciprocal_links | ledger_links
-                )
+                all_obligation_links = metadata_links | relation_links | reciprocal_links
                 if not (
                     all_obligation_links.intersection(obligation_support_ids)
                     or support_metadata_links
                 ):
                     continue
                 linked_obligations.append(node)
-                if (
-                    ledger_obligation is None
-                    or ledger_obligation.status is not ObligationStatus.RESOLVED
-                ):
+                if node.workflow_status is not WorkflowStatus.COMPLETE:
                     unresolved_linked_obligations.append(node)
             if unresolved_linked_obligations:
                 obligations.append(
@@ -6555,6 +6756,311 @@ async def run_adaptive_research(
         )
         return deferred
 
+    def graph_ids_by_semantic_title() -> dict[str, str]:
+        """Resolve old scheduler graph handles outside model context.
+
+        These handles are confined to the current run's deterministic control
+        plane.  The model receives and returns only the corresponding titles.
+        """
+
+        if knowledge_graph is None:
+            return {}
+        return {
+            node.title.casefold(): node.matek_id
+            for node in knowledge_graph.load_nodes()
+            if not node.tombstone
+        }
+
+    def assignment_titles_by_id() -> dict[str, str]:
+        return {
+            record.assignment.id: (
+                record.assignment.inputs[0] if record.assignment.inputs else record.assignment.task
+            )
+            for record in scheduler.assignments
+        }
+
+    def scheduler_decision_from_semantic(
+        decision: ResearchCoordinatorDecision,
+        *,
+        decision_id: int,
+        event_sequence: int,
+    ) -> ResearchCoordinatorDecision:
+        """Bind a semantic decision to run-local scheduler identities."""
+
+        title_by_id = assignment_titles_by_id()
+        id_by_title = {
+            title.casefold(): assignment_id for assignment_id, title in title_by_id.items()
+        }
+        graph_by_title = graph_ids_by_semantic_title()
+
+        def assignment_reference(value: str) -> str:
+            return id_by_title.get(value.casefold(), value)
+
+        normalized_assignments: list[ResearchAssignment] = []
+        known_ids = set(title_by_id)
+        for index, assignment in enumerate(decision.assignments, start=1):
+            title = assignment.inputs[0] if assignment.inputs else assignment.task
+            digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "title": title,
+                        "approach_family": assignment.approach_family,
+                        "task": assignment.task,
+                        "expected_output": assignment.expected_output,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()[:12]
+            assignment_id = f"asg-{decision_id}-{index}-{digest}"
+            suffix = 1
+            while assignment_id in known_ids:
+                suffix += 1
+                assignment_id = f"asg-{decision_id}-{index}-{digest}-{suffix}"
+            known_ids.add(assignment_id)
+            relation_titles = assignment.inputs[1:] if assignment.inputs else []
+            target_ids = [
+                graph_by_title[title.casefold()]
+                for title in relation_titles
+                if title.casefold() in graph_by_title
+            ]
+            if knowledge_graph is not None and not target_ids and graph_problem_id is not None:
+                target_ids = [knowledge_graph.main_claim_id(graph_problem_id)]
+            normalized_assignments.append(
+                assignment.model_copy(
+                    update={
+                        "id": assignment_id,
+                        "target_node_ids": list(dict.fromkeys(target_ids)),
+                    }
+                )
+            )
+
+        requested_graph_ids = [
+            graph_by_title[value.casefold()]
+            for value in decision.requested_graph_node_ids
+            if value.casefold() in graph_by_title
+        ]
+        return decision.model_copy(
+            update={
+                "decision_id": decision_id,
+                "after_event_sequence": event_sequence,
+                "assignments": normalized_assignments,
+                "retire_assignment_ids": [
+                    assignment_reference(value) for value in decision.retire_assignment_ids
+                ],
+                "redirect_assignment_ids": [
+                    assignment_reference(value) for value in decision.redirect_assignment_ids
+                ],
+                "candidate_report_ids": [
+                    assignment_reference(value) for value in decision.candidate_report_ids
+                ],
+                "requested_graph_node_ids": list(dict.fromkeys(requested_graph_ids)),
+            }
+        )
+
+    def scheduler_report_from_semantic(
+        report: ResearchWorkerReport,
+        assignment: ResearchAssignment,
+    ) -> ResearchWorkerReport:
+        """Resolve descriptive finding relations after model validation."""
+
+        semantic = report.semantic_report
+        if semantic is None:
+            return report
+        expected_title = assignment.inputs[0] if assignment.inputs else assignment.task
+        if semantic.assignment_title.casefold() != expected_title.casefold():
+            raise StageValidationError(
+                f"Worker report title {semantic.assignment_title!r} does not match "
+                f"assignment {expected_title!r}."
+            )
+        graph_by_title = graph_ids_by_semantic_title()
+        result_key_by_title = {
+            finding.title.casefold(): result.local_key
+            for finding, result in zip(
+                (item for item in semantic.findings if item.statement),
+                report.results,
+                strict=False,
+            )
+        }
+        findings_by_title = {item.title.casefold(): item for item in semantic.findings}
+        normalized_results: list[ScientificResult] = []
+        for result in report.results:
+            title = (result.one_liner or "").casefold()
+            finding = findings_by_title.get(title)
+            dependencies = finding.depends_on if finding is not None else []
+            relations = finding.relates_to if finding is not None else []
+            dependency_result_keys = [
+                result_key_by_title[value.casefold()]
+                for value in dependencies
+                if value.casefold() in result_key_by_title
+            ]
+            dependency_node_ids = [
+                graph_by_title[value.casefold()]
+                for value in dependencies
+                if value.casefold() in graph_by_title
+            ]
+            target_node_ids = [
+                graph_by_title[value.casefold()]
+                for value in relations
+                if value.casefold() in graph_by_title
+            ]
+            scope = (
+                ScientificScope.MAIN
+                if normalize_exact_statement(result.exact_statement)
+                == normalize_exact_statement(compiled.normalized_statement)
+                else result.scope
+            )
+            normalized_results.append(
+                result.model_copy(
+                    update={
+                        "scope": scope,
+                        "dependency_result_keys": list(dict.fromkeys(dependency_result_keys)),
+                        "dependency_node_ids": list(dict.fromkeys(dependency_node_ids)),
+                        "target_node_ids": list(dict.fromkeys(target_node_ids)),
+                    }
+                )
+            )
+        branch_outcome = report.branch_outcome
+        if (
+            not report.unresolved_obligations
+            and all(result.exact_gap is None for result in normalized_results)
+            and any(
+                result.scope is ScientificScope.MAIN
+                and result.disposition is ScientificResultDisposition.PROPOSED_COMPLETE
+                for result in normalized_results
+            )
+        ):
+            branch_outcome = BranchOutcome.CANDIDATE_COMPLETE
+        return report.model_copy(
+            update={
+                "assignment_id": assignment.id,
+                "results": normalized_results,
+                "branch_outcome": branch_outcome,
+            }
+        )
+
+    def semantic_coordinator_context(
+        control_payload: dict[str, object],
+        *,
+        initial: bool,
+    ) -> dict[str, object]:
+        """Project scheduler state into a concise mathematical model context."""
+
+        title_by_id = assignment_titles_by_id()
+        graph_nodes: list[dict[str, object]] = []
+        if semantic_graph is not None:
+            semantic_memory = semantic_graph.semantic_context(
+                maximum_nodes=(
+                    knowledge_graph.maximum_context_nodes if knowledge_graph is not None else 48
+                )
+            )
+            raw_nodes = semantic_memory.get("nodes", [])
+            if isinstance(raw_nodes, list):
+                graph_nodes = [item for item in raw_nodes if isinstance(item, dict)]
+        elif knowledge_graph is not None:
+            nodes = [node for node in knowledge_graph.load_nodes() if not node.tombstone]
+            by_id = {node.matek_id: node for node in nodes}
+            for node in sorted(nodes, key=lambda item: item.title.casefold())[
+                : knowledge_graph.maximum_context_nodes
+            ]:
+                graph_nodes.append(
+                    {
+                        "title": node.title,
+                        "kind": node.node_type.value,
+                        "status": f"{node.epistemic_status.value}/{node.workflow_status.value}",
+                        "statement": graph_exact_statement(node.body),
+                        "immediate_dependencies": list(
+                            dict.fromkeys(
+                                by_id[edge.target_id].title
+                                for edge in node.relations
+                                if edge.target_id in by_id
+                            )
+                        ),
+                        "selected_supporting_evidence": node.evidence[:8],
+                    }
+                )
+        assignment_state = []
+        for record in scheduler.assignments:
+            title = title_by_id[record.assignment.id]
+            report = reports_by_id.get(record.assignment.id)
+            if report is not None and report.semantic_report is not None:
+                summary = report.semantic_report.overall_progress
+                next_step = report.semantic_report.next_assignment
+            elif report is not None:
+                summary = report.proof_content or "\n".join(report.formal_results)
+                next_step = report.exact_gap or ""
+            else:
+                summary = ""
+                next_step = ""
+            assignment_state.append(
+                {
+                    "title": title,
+                    "approach_family": record.assignment.approach_family,
+                    "task": record.assignment.task,
+                    "status": record.status.value,
+                    "summary": summary,
+                    "next_mathematical_bottleneck": next_step,
+                }
+            )
+        approaches = [
+            {
+                "family": item.family,
+                "mechanism": item.mechanism,
+                "status": item.status,
+                "strongest_result": item.strongest_result,
+                "exact_gap": item.exact_gap,
+                "reopen_condition": item.reopen_condition,
+            }
+            for item in registry.approaches
+        ]
+        completed_titles = [
+            title_by_id[record.assignment.id]
+            for record in scheduler.assignments
+            if record.assignment.id in reports_by_id
+        ]
+        return {
+            "compiled_prompt": compiled.compiled_prompt,
+            "claim_contract": compiled.claim_contract.as_dict(),
+            "literature_refresh": literature_refresh_payload(),
+            "activation": "bootstrap" if initial else "continuation",
+            "portfolio_policy": {
+                "minimum_materially_diverse_assignments": control_payload.get(
+                    "minimum_materially_diverse_initial_assignments", 0
+                ),
+                "maximum_new_assignments": control_payload.get(
+                    "maximum_new_assignments_this_decision", 0
+                ),
+                "available_assignment_slots": control_payload.get(
+                    "available_new_assignment_slots", 0
+                ),
+            },
+            "assignment_state": assignment_state,
+            "completed_report_titles": completed_titles,
+            "approach_registry": approaches,
+            "knowledge_graph": graph_nodes,
+            "latest_audits": {
+                name: {
+                    "verdict": audit.verdict.value,
+                    "rationale": audit.rationale,
+                    "unresolved_mathematical_obligations": audit.unresolved_obligations,
+                }
+                for name, audit in current_audits.items()
+            },
+            "latest_final_judge": (
+                {
+                    "verdict": current_verdict.verdict.value,
+                    "reasons": current_verdict.reasons,
+                    "unresolved_mathematical_obligations": (current_verdict.unresolved_obligations),
+                }
+                if current_verdict is not None
+                else None
+            ),
+            "instruction": (
+                "Return mathematical decisions using descriptive titles only. MATEK binds "
+                "scheduler identity, provenance, and graph writes after your response."
+            ),
+        }
+
     async def request_coordinator_decision(*, initial: bool) -> ResearchCoordinatorDecision:
         nonlocal scientific_phase_state
         if len(scheduler.decisions) >= settings.maximum_coordinator_decisions:
@@ -6906,7 +7412,7 @@ async def run_adaptive_research(
                 "canonical_path": "research/coordinator/state.json",
                 "assignment_count": len(scheduler.assignments),
                 "assignment_counts": assignment_counts,
-                "event_ledger_pattern": "research/events/<zero-padded-sequence>.json",
+                "event_file_pattern": "research/events/<zero-padded-sequence>.json",
                 "event_sequence": event_sequence,
                 "instruction": (
                     "This indexed context replaces cumulative scheduler history. Running and "
@@ -7077,7 +7583,32 @@ async def run_adaptive_research(
                     or bool(scheduler.requested_graph_node_ids)
                 ),
             )
-            return built.payload, built.manifest
+            model_payload = dict(built.payload)
+            semantic_payload = semantic_coordinator_context(model_payload, initial=initial)
+            model_payload["semantic_agent_context"] = semantic_payload
+            serialized_payload = serialize_coordinator_payload(model_payload)
+            serialized_provider = json.dumps(
+                semantic_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            manifest = built.manifest.model_copy(
+                update={
+                    "payload_sha256": sha256_text(serialized_payload),
+                    "serialized_payload_characters": len(serialized_payload),
+                    "serialized_provider_input_characters": provider_input_character_measure(
+                        serialized_provider, decision_model_settings
+                    ),
+                    "estimated_input_tokens": max(
+                        provider_input_character_measure(
+                            serialized_provider, decision_model_settings
+                        )
+                        // 4,
+                        1,
+                    ),
+                }
+            )
+            return model_payload, manifest
 
         legacy_unbounded_request: PendingCoordinatorRequest | None = None
         if pending_request is not None and pending_request.context_manifest_path is None:
@@ -7215,7 +7746,14 @@ async def run_adaptive_research(
             raise StageValidationError(
                 "Frozen coordinator request has an invalid initial-portfolio target."
             )
-        coordinator_input = serialize_coordinator_payload(payload)
+        semantic_agent_context = payload.get("semantic_agent_context")
+        if not isinstance(semantic_agent_context, dict):
+            raise StageValidationError("Coordinator request has no semantic agent context.")
+        coordinator_input = json.dumps(
+            semantic_agent_context,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         provider_characters = provider_input_character_measure(
             coordinator_input, decision_model_settings
         )
@@ -7342,7 +7880,16 @@ async def run_adaptive_research(
                 artifact_paths[f"coordinator_context_manifest_{decision_id}_{generation}"] = (
                     context_manifest_path
                 )
-                coordinator_input = serialize_coordinator_payload(payload)
+                semantic_agent_context = payload.get("semantic_agent_context")
+                if not isinstance(semantic_agent_context, dict):
+                    raise StageValidationError(
+                        "Rebuilt coordinator request has no semantic agent context."
+                    ) from exc
+                coordinator_input = json.dumps(
+                    semantic_agent_context,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
                 provider_characters = provider_input_character_measure(
                     coordinator_input, decision_model_settings
                 )
@@ -7367,6 +7914,17 @@ async def run_adaptive_research(
             output_type=ResearchCoordinatorDecision,
         )
         reference_warnings: list[str] = []
+        if result.parsed.semantic_decision is not None or any(
+            assignment.id.startswith("semantic-") for assignment in result.parsed.assignments
+        ):
+            result = replace(
+                result,
+                parsed=scheduler_decision_from_semantic(
+                    result.parsed,
+                    decision_id=decision_id,
+                    event_sequence=event_sequence,
+                ),
+            )
         decision = _validate_coordinator_decision(
             result.parsed,
             expected_decision=decision_id,
@@ -7379,6 +7937,33 @@ async def run_adaptive_research(
             reference_warnings=reference_warnings,
         )
         decision, proposed_scientific_phase_state = normalize_scientific_assignments(decision)
+        if semantic_graph is not None and decision.semantic_decision is not None:
+            admitted_assignments: list[ResearchAssignment] = []
+            for assignment in decision.assignments:
+                assignment_title = assignment.inputs[0] if assignment.inputs else assignment.task
+                admission = semantic_graph.admit_finding(
+                    SemanticFinding(
+                        finding_type=SemanticFindingType.TASK,
+                        title=assignment_title,
+                        relates_to=list(assignment.inputs[1:]),
+                        status=SemanticFindingStatus.INCOMPLETE,
+                        what_was_established=(
+                            f"Approach family: {assignment.approach_family}. "
+                            f"Task: {assignment.task}"
+                        ),
+                        next_mathematical_bottleneck=assignment.expected_output,
+                        supporting_evidence=[
+                            f"Stopping condition: {assignment.stopping_condition}"
+                        ],
+                    ),
+                    provenance=[f"run: {run_id}", "coordinator assignment"],
+                )
+                admitted_assignments.append(
+                    assignment.model_copy(
+                        update={"inputs": [admission.title, *assignment.inputs[1:]]}
+                    )
+                )
+            decision = decision.model_copy(update={"assignments": admitted_assignments})
         decision = defer_consequential_action_for_omitted_evidence(
             decision,
             payload=payload,
@@ -7396,7 +7981,7 @@ async def run_adaptive_research(
                     "Graph-integrated coordinator request lost its graph memory descriptor."
                 )
             reviewed_revision = request_graph_memory.get("graph_revision")
-            if (
+            if decision.semantic_decision is None and (
                 not isinstance(reviewed_revision, str)
                 or reviewed_revision not in decision.rationale
             ):
@@ -7417,7 +8002,9 @@ async def run_adaptive_research(
                     f"Coordinator decision has invalid graph branch targets: {exc}"
                 ) from exc
         scientific_stop_declined = bool(
-            decision.stop_recommended and decision.stop_category == "scientific"
+            decision.stop_recommended
+            and decision.stop_category == "scientific"
+            and decision.semantic_decision is None
         )
         unverified_refutation_stop_declined = bool(
             decision.stop_recommended and decision.stop_category == "refuted"
@@ -7742,6 +8329,16 @@ async def run_adaptive_research(
             output_type=ResearchWorkerReport,
             selected_client=selected_worker_client,
         )
+        if result.parsed.semantic_report is not None:
+            result = replace(
+                result,
+                parsed=scheduler_report_from_semantic(result.parsed, assignment),
+            )
+        elif result.parsed.assignment_id.startswith("semantic-"):
+            result = replace(
+                result,
+                parsed=result.parsed.model_copy(update={"assignment_id": assignment.id}),
+            )
         if result.parsed.assignment_id != assignment.id:
             raise StageValidationError(
                 f"Worker report {result.parsed.assignment_id!r} does not match "
@@ -7784,7 +8381,11 @@ async def run_adaptive_research(
             parsed = evidence.normalized_report
             source_verification = evidence.source_verification
         else:
-            raw_report = result.parsed.model_dump(mode="json")
+            raw_report = (
+                result.parsed.semantic_report.model_dump(mode="json")
+                if result.parsed.semantic_report is not None
+                else result.parsed.model_dump(mode="json")
+            )
             parsed = result.parsed.model_copy(deep=True)
             source_verification = await verify_source_ledger(
                 parsed.sources,
@@ -7876,6 +8477,33 @@ async def run_adaptive_research(
         graph_patch_record: Path | None = None
         graph_issue: BaseException | None = None
         graph_issue_obligations: list[str] = []
+        if semantic_graph is not None and report.semantic_report is not None:
+            report_title = (
+                record.assignment.inputs[0] if record.assignment.inputs else record.assignment.task
+            )
+            semantic_admissions = semantic_graph.admit_worker_report(
+                report.semantic_report,
+                provenance=[
+                    f"run: {run_id}",
+                    f"worker report: {report_title}",
+                ],
+            )
+            semantic_corrections = [
+                admission.semantic_correction
+                for admission in semantic_admissions
+                if admission.semantic_correction
+            ]
+            if semantic_corrections:
+                append_event(
+                    "semantic_graph_admission",
+                    assignment_id=record.assignment.id,
+                    detail=semantic_corrections,
+                )
+            semantic_graph.update_status(
+                report_title,
+                "complete",
+                provenance=[f"run: {run_id}", "worker completed assignment"],
+            )
         if knowledge_graph is not None:
             assert graph_problem_id is not None and run_id is not None
             if record.graph_task_id is None:
@@ -7922,13 +8550,11 @@ async def run_adaptive_research(
                             else None
                         ),
                     )
-                except BaseException as exc:
-                    if classify_failure(exc) is FailureCategory.INTEGRITY:
-                        raise
+                except Exception as exc:
                     graph_issue = exc
                     graph_issue_obligations = [
-                        "Retry graph integration from the frozen report without rerunning "
-                        "the scientific worker."
+                        "Disposable run-scratch graph projection failed. Continue from the "
+                        "canonical Markdown finding and rebuild scratch state if needed."
                     ]
                     graph_merge = None
                 blocking_graph_issues = (

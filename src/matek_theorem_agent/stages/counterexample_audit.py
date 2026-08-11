@@ -211,8 +211,8 @@ class CounterexampleGraphSupport(_AuditModel):
     @classmethod
     def graph_revision_is_valid(cls, value: str) -> str:
         normalized = value.strip().casefold()
-        if not re.fullmatch(r"\d{8}-[0-9a-f]{16}", normalized):
-            raise ValueError("counterexample graph support revision is invalid")
+        if not re.fullmatch(r"(?:\d{8}-[0-9a-f]{16}|[0-9a-f]{64})", normalized):
+            raise ValueError("counterexample graph support content revision is invalid")
         return normalized
 
     @field_validator("result_node_ids")
@@ -766,12 +766,7 @@ def _build_graph_support(
         canonical_admitted_definition_scope,
         node_has_scientific_admission_binding,
     )
-    from ..knowledge_graph.ledger import (
-        ObligationStatus,
-        logical_version,
-        project_markdown_ledger,
-        trusted_claim_ids,
-    )
+    from ..knowledge_graph.ledger import logical_version
     from ..knowledge_graph.models import (
         EpistemicStatus,
         NodeType,
@@ -780,13 +775,11 @@ def _build_graph_support(
     )
 
     load_nodes = getattr(knowledge_graph, "load_nodes", None)
-    load_state = getattr(knowledge_graph, "load_state", None)
     main_claim_id = getattr(knowledge_graph, "main_claim_id", None)
     graph_name = getattr(knowledge_graph, "graph_name", None)
-    if not callable(load_nodes) or not callable(load_state) or not callable(main_claim_id):
-        raise StageValidationError("Named counterexample support requires a canonical graph")
+    if not callable(load_nodes) or not callable(main_claim_id):
+        raise StageValidationError("Named counterexample support requires a Markdown graph")
     nodes: list[Any] = list(load_nodes(include_human_notes=False))
-    state: Any = load_state()
     if not isinstance(graph_name, str) or not graph_name.strip():
         raise StageValidationError("Counterexample graph support has no stable graph identity")
     target_id = main_claim_id(graph_problem_id)
@@ -794,13 +787,19 @@ def _build_graph_support(
     by_id = {node.matek_id: node for node in problem_nodes}
     if target_id not in by_id:
         raise StageValidationError("Counterexample support graph has no frozen main target")
-    ledger = project_markdown_ledger(
-        problem_nodes,
-        graph_revision=state.revision,
-        problem_id=graph_problem_id,
-        target_claim_id=target_id,
-    )
-    trusted_claims = trusted_claim_ids(ledger)
+    trusted_claims = {
+        node.matek_id
+        for node in problem_nodes
+        if node.node_type in {NodeType.CLAIM, NodeType.DEFINITION}
+        and _graph_node_is_live(node)
+        and (
+            node.epistemic_status in {EpistemicStatus.AUDIT_PASSED, EpistemicStatus.LEAN_VERIFIED}
+            or (
+                node.node_type is NodeType.DEFINITION
+                and canonical_admitted_definition_scope(node) is not None
+            )
+        )
+    }
     result_nodes: dict[str, list[str]] = {}
     conclusion_by_key: dict[str, str] = {}
     derivation_by_key: dict[str, Any] = {}
@@ -1115,7 +1114,6 @@ def _build_graph_support(
     for obligation in problem_nodes:
         if obligation.node_type is not NodeType.OBLIGATION:
             continue
-        ledger_obligation = ledger.obligations.get(obligation.matek_id)
         metadata_links: set[str] = set()
         for key in (
             "matek_parent_node_ids",
@@ -1141,19 +1139,8 @@ def _build_graph_support(
                 for edge in node.relations
             )
         }
-        ledger_links = (
-            {
-                *ledger_obligation.parent_derivation_ids,
-                *ledger_obligation.dependency_claim_ids,
-                *ledger_obligation.target_claim_ids,
-            }
-            if ledger_obligation is not None
-            else set()
-        )
         linked_to_support = bool(
-            (metadata_links | relation_links | reciprocal_links | ledger_links).intersection(
-                support_ids
-            )
+            (metadata_links | relation_links | reciprocal_links).intersection(support_ids)
         ) or any(
             obligation.matek_id
             in (
@@ -1164,9 +1151,7 @@ def _build_graph_support(
             for node in problem_nodes
             if node.matek_id in support_ids
         )
-        unresolved = (
-            ledger_obligation is None or ledger_obligation.status is not ObligationStatus.RESOLVED
-        )
+        unresolved = obligation.workflow_status is not WorkflowStatus.COMPLETE
         if linked_to_support and unresolved:
             raise StageValidationError(
                 f"Counterexample support has unresolved graph obligation {obligation.matek_id}"
@@ -1184,7 +1169,9 @@ def _build_graph_support(
         graph_name=graph_name,
         problem_id=graph_problem_id,
         run_id=run_id,
-        source_revision=state.revision,
+        source_revision=sha256_text(
+            json.dumps(sorted(node_hashes.items()), ensure_ascii=False, separators=(",", ":"))
+        ),
         root_counterexample_node_id=root_counterexample_id,
         result_node_ids=result_nodes,
         dependency_node_ids=sorted(

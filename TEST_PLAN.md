@@ -1,5 +1,9 @@
 # Test Plan
 
+> **P0 graph-state override:** Graph acceptance is defined by
+> [GRAPH_ONLY_RESEARCH_STATE.md](GRAPH_ONLY_RESEARCH_STATE.md) and `tests/test_semantic_graph.py`.
+> Historical ledger and migration tests do not specify new-run behavior.
+
 ## Test strategy
 
 All default tests are offline. Model and Codex integrations use protocol-based fakes and
@@ -7,8 +11,8 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
 
 ## Unit tests
 
-- Knowledge-graph schema/type validation, stable IDs, Markdown/frontmatter round trips, and
-  relation constraints.
+- Semantic graph title validation, limited frontmatter round trips, descriptive-link resolution,
+  deterministic collision handling, and hidden-UUID rename preservation.
 - Deterministic schema-v2 scientific admission, idempotent application-owned graph commits,
   `(run, assignment, local key, result schema)` collision rejection, unknown dependency/target
   rejection, exact-statement-plus-scope claim identity, gap/obligation versus gap-free/proposed-
@@ -16,14 +20,12 @@ recorded sanitized fixtures. Live tests require explicit environment flags.
   stable-node and same-report local dependency resolution, unknown/self/cyclic local dependency
   rejection, dependency DAG cycles, and staleness propagation. New worker schemas reject
   model-authored `graph_patch` payloads.
-- Human prose/statement edits, statement version increments, proof re-audit, managed-field
-  conflicts, unknown Markdown notes, crash recovery, snapshots, diffs, and SQLite rebuilds.
+- Human-readable note edits, inbound-link rename updates, dangling-link incidents, interrupted
+  transaction recovery, and nonfatal SQLite deletion/corruption/rebuild.
 - Problem-scoped graph-hygiene inspection and transactional source-identifier repair, including
   before/after audit artifacts, no-identifier warning/downgrade behavior, failed-repair atomicity,
   historical mixed-DOI identification, bounded stage retry, and immutable-target non-regression.
-- Content-addressed snapshot deltas, blob deduplication, periodic checkpoints, integrity/content
-  roots, deterministic reconstruction, corruption rejection, schema-v1 read compatibility, and
-  byte-preserving legacy-to-v2 continuation.
+- Repeated long-run admissions with stale derived state and simultaneous isolated graph writers.
 - Frontier selection, graph-scoped task creation, bounded context slices, manuscript mappings,
   and exact-version Lean records.
 - Source-hash target registry create/reuse, byte-stable same-source target/contract/prompt reuse,

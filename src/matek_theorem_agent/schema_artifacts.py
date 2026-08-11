@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from pydantic import BaseModel
 
+from .knowledge_graph.semantic import SemanticCoordinatorDecision, SemanticWorkerReport
 from .reporting import FinalReport
 from .stages.compile_prompt import CompiledProblem
 from .stages.counterexample_audit import CounterexampleAuditResponse
@@ -13,9 +14,7 @@ from .stages.lean import ClaimAlignment
 from .stages.manuscript import BibliographyAudit
 from .stages.research import (
     AuditVerdict,
-    ResearchCoordinatorDecision,
     ResearchRoundPlan,
-    ResearchWorkerReport,
 )
 from .structured_schema import strict_json_schema
 
@@ -25,9 +24,9 @@ MODEL_SCHEMA_ARTIFACTS: dict[str, type[BaseModel]] = {
     "claim_alignment.schema.json": ClaimAlignment,
     "compiled_problem.schema.json": CompiledProblem,
     "counterexample_audit_response.schema.json": CounterexampleAuditResponse,
-    "research_coordinator_decision.schema.json": ResearchCoordinatorDecision,
+    "research_coordinator_decision.schema.json": SemanticCoordinatorDecision,
     "research_round_plan.schema.json": ResearchRoundPlan,
-    "research_worker_report.schema.json": ResearchWorkerReport,
+    "research_worker_report.schema.json": SemanticWorkerReport,
 }
 
 

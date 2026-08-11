@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "matek-theorem-agent"
-version = "0.8.1"
+version = "0.9.0"
 description = "MATEK: multi-agent theorem exploration through knowledge-graph memory"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -69,6 +69,7 @@ include = [
   "/CHANGELOG.md",
   "/CLI_SPEC.md",
   "/DECISIONS.md",
+  "/GRAPH_ONLY_RESEARCH_STATE.md",
   "/LICENSE",
   "/PRODUCT_REQUIREMENTS.md",
   "/RELEASE_CHECKLIST.md",

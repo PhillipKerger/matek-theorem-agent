@@ -47,26 +47,13 @@ from .graph_ids import suggest_node_ids
 from .initialization import InitializationError, initialize_project
 from .intake import IntakeError, normalize_problem_text
 from .knowledge_graph import (
-    GraphNode,
     GraphNotInitializedError,
     GraphValidationError,
-    KnowledgeGraph,
     KnowledgeGraphError,
-    NodeType,
-    RelationType,
-    list_graph_names,
+    SemanticGraphWriter,
+    SemanticNodeKind,
     normalize_graph_name,
     problem_graph_name,
-)
-from .knowledge_graph.migration import (
-    LegacyMigrationApplicationRecord,
-    LegacyMigrationError,
-    LegacyMigrationReport,
-    load_legacy_migration_report,
-    migration_application_sha256,
-    migration_report_sha256,
-    plan_legacy_graph_backfill,
-    write_legacy_migration_report,
 )
 from .logging import JournalCorruptionError
 from .models import RunState, StageName, StageStatus
@@ -91,7 +78,6 @@ from .state import (
 from .workspace import (
     RunLock,
     WorkspaceError,
-    atomic_write_bytes,
     discover_project_root,
     latest_run_root_for_problem,
     list_run_roots,
@@ -272,7 +258,7 @@ def _error_code(exc: BaseException) -> int:
         return 5
     if isinstance(exc, (ArtifactIntegrityError, StateCorruptionError, JournalCorruptionError)):
         return 6
-    if isinstance(exc, (GraphValidationError, LegacyMigrationError)):
+    if isinstance(exc, GraphValidationError):
         return 6
     if isinstance(exc, CodexBackendError):
         return 3
@@ -696,10 +682,23 @@ def _print_result(result: WorkflowResult) -> None:
         console.print(str(explanation.get("suggested_resolution", "")), markup=False)
 
 
-def _project_graph(graph_name: str | None = None) -> KnowledgeGraph:
+def _semantic_graph_names(root: Path) -> list[str]:
+    collection = root / ".matek" / "knowledge"
+    if not collection.is_dir():
+        return []
+    return sorted(
+        candidate.name
+        for candidate in collection.iterdir()
+        if candidate.is_dir()
+        and not candidate.is_symlink()
+        and not candidate.name.startswith(".")
+        and SemanticGraphWriter(root, candidate.name).initialized
+    )
+
+
+def _project_semantic_graph(graph_name: str | None = None) -> SemanticGraphWriter:
     root = _project_root()
-    config = load_config(project_root=root)
-    available = list_graph_names(root)
+    available = _semantic_graph_names(root)
     if graph_name is not None:
         selected = normalize_graph_name(graph_name)
         if selected not in available:
@@ -716,23 +715,7 @@ def _project_graph(graph_name: str | None = None) -> KnowledgeGraph:
             "multiple knowledge graphs exist; select one with --knowledge-graph NAME "
             f"(available: {', '.join(available)})"
         )
-    return KnowledgeGraph(
-        root,
-        selected,
-        maximum_context_nodes=config.graph.maximum_context_nodes,
-        maximum_context_characters=config.graph.maximum_context_characters,
-    )
-
-
-def _new_project_graph(graph_name: str) -> KnowledgeGraph:
-    root = _project_root()
-    config = load_config(project_root=root)
-    return KnowledgeGraph(
-        root,
-        normalize_graph_name(graph_name),
-        maximum_context_nodes=config.graph.maximum_context_nodes,
-        maximum_context_characters=config.graph.maximum_context_characters,
-    )
+    return SemanticGraphWriter(root, selected)
 
 
 @app.command()
@@ -759,14 +742,15 @@ def init(
 
 @graph_app.command("init")
 def graph_init(graph_name: str = typer.Argument(..., help="Name for the knowledge graph.")) -> None:
-    """Create one named Markdown vault and rebuildable graph index."""
+    """Create one graph-only Markdown vault and disposable search index."""
 
     try:
-        graph = _new_project_graph(graph_name)
-        state = graph.initialize()
+        graph = SemanticGraphWriter(_project_root(), normalize_graph_name(graph_name))
+        warnings = graph.initialize()
         console.print(f"Graph: {graph.graph_name}")
-        console.print(f"Vault: {graph.vault_root}")
-        console.print(f"Revision: {state.revision}")
+        console.print(f"Vault: {graph.graph_root}")
+        for warning in warnings:
+            console.print(f"[yellow]![/yellow] {warning}")
     except BaseException as exc:
         _abort(exc)
 
@@ -782,7 +766,7 @@ def graph_list() -> None:
                 "name": name,
                 "vault": str((root / ".matek" / "knowledge" / name).relative_to(root)),
             }
-            for name in list_graph_names(root)
+            for name in _semantic_graph_names(root)
         ]
         console.print(json.dumps(values, indent=2, sort_keys=True))
     except BaseException as exc:
@@ -793,10 +777,10 @@ def graph_list() -> None:
 def graph_validate(
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Validate Markdown, machine ownership, relations, DAGs, and index revision."""
+    """Validate descriptive links by reparsing authoritative Markdown."""
 
     try:
-        report = _project_graph(knowledge_graph).validate()
+        report = _project_semantic_graph(knowledge_graph).validate()
         console.print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
         if not report.valid:
             raise typer.Exit(code=6)
@@ -810,11 +794,18 @@ def graph_validate(
 def graph_status_command(
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Show the current graph revision and typed node/status counts."""
+    """Show graph-only node counts and disposable-index warnings."""
 
     try:
-        status_value = _project_graph(knowledge_graph).status()
-        console.print(json.dumps(status_value.model_dump(mode="json"), indent=2, sort_keys=True))
+        graph = _project_semantic_graph(knowledge_graph)
+        nodes, warnings = graph.load_nodes()
+        status_value = {
+            "graph_name": graph.graph_name,
+            "vault": str(graph.graph_root),
+            "node_count": len(nodes),
+            "warnings": warnings,
+        }
+        console.print(json.dumps(status_value, indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
@@ -829,13 +820,14 @@ def graph_doctor(
     problem_id: str | None = typer.Option(None, "--problem-id"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Inspect repairable generated graph metadata without model calls."""
+    """Inspect graph-only Markdown and rebuild disposable derived state."""
 
     try:
-        report = _project_graph(knowledge_graph).doctor(
-            repair=repair,
-            problem_id=problem_id,
-        )
+        del problem_id
+        graph = _project_semantic_graph(knowledge_graph)
+        if repair:
+            graph.initialize()
+        report = graph.validate()
         console.print(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
@@ -846,11 +838,12 @@ def graph_frontier(
     problem_id: str | None = typer.Option(None, "--problem-id"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Show unresolved claims, audits, contradictions, blockers, and active tasks."""
+    """Show concise semantic graph context for mathematical coordination."""
 
     try:
-        frontier_value = _project_graph(knowledge_graph).frontier(problem_id)
-        console.print(json.dumps(frontier_value.model_dump(mode="json"), indent=2, sort_keys=True))
+        del problem_id
+        frontier_value = _project_semantic_graph(knowledge_graph).semantic_context()
+        console.print(json.dumps(frontier_value, indent=2, sort_keys=True))
     except BaseException as exc:
         _abort(exc)
 
@@ -861,50 +854,26 @@ def graph_search(
     limit: int = typer.Option(10, "--limit", "-n", min=1, max=100),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Lexically search node IDs and titles; useful after an exact-ID lookup misses."""
+    """Lexically search descriptive graph titles."""
 
     try:
-        graph = _project_graph(knowledge_graph)
-        nodes = graph.load_nodes(include_human_notes=False)
-        by_id = {node.matek_id: node for node in nodes if not node.tombstone}
-        id_matches = suggest_node_ids(query, by_id, limit=limit)
+        graph = _project_semantic_graph(knowledge_graph)
+        nodes, _ = graph.load_nodes()
+        by_title = {node.title: node for node in nodes}
         title_matches = suggest_node_ids(
             query,
-            [node.title for node in by_id.values()],
+            list(by_title),
             limit=limit,
         )
-        title_to_ids: dict[str, list[str]] = {}
-        for node in by_id.values():
-            title_to_ids.setdefault(node.title, []).append(node.matek_id)
-        results: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for node_id in id_matches:
-            if node_id in seen:
-                continue
-            seen.add(node_id)
-            node = by_id[node_id]
-            results.append(
-                {
-                    "matek_id": node_id,
-                    "node_type": node.node_type.value,
-                    "title": node.title,
-                    "match": "id",
-                }
-            )
-        for title in title_matches:
-            for node_id in sorted(title_to_ids.get(title, [])):
-                if node_id in seen:
-                    continue
-                seen.add(node_id)
-                node = by_id[node_id]
-                results.append(
-                    {
-                        "matek_id": node_id,
-                        "node_type": node.node_type.value,
-                        "title": node.title,
-                        "match": "title",
-                    }
-                )
+        results = [
+            {
+                "title": title,
+                "kind": by_title[title].kind.value,
+                "status": by_title[title].status,
+                "link": f"[[{title}]]",
+            }
+            for title in title_matches
+        ]
         console.print(
             json.dumps(
                 {"query": query, "results": results[:limit]},
@@ -916,222 +885,6 @@ def graph_search(
         _abort(exc)
 
 
-def _read_legacy_migration_source(graph: KnowledgeGraph) -> tuple[str, list[GraphNode]]:
-    """Read one consistent archive revision without triggering transaction recovery."""
-
-    with graph._locked():
-        if graph.pending_path.exists():
-            raise GraphValidationError(
-                "legacy migration planning is read-only and cannot recover a pending graph "
-                "transaction; run another graph read command to recover it first"
-            )
-        state = graph._load_state_unlocked()
-        nodes = graph._load_nodes_unlocked(include_human_notes=True)
-    return state.revision, nodes
-
-
-def _migration_problem_id(nodes: Sequence[GraphNode], requested: str | None) -> str:
-    problem_ids = sorted(node.matek_id for node in nodes if node.node_type is NodeType.PROBLEM)
-    if requested is not None:
-        normalized = requested.strip()
-        if normalized not in problem_ids:
-            raise GraphValidationError(f"unknown graph problem ID: {normalized}")
-        return normalized
-    if len(problem_ids) == 1:
-        return problem_ids[0]
-    if not problem_ids:
-        raise GraphValidationError("knowledge graph has no problem node")
-    raise GraphValidationError(
-        "knowledge graph tracks multiple problems; pass --problem-id explicitly"
-    )
-
-
-def _migration_target_claim_id(
-    graph: KnowledgeGraph,
-    nodes: Sequence[GraphNode],
-    *,
-    problem_id: str,
-    requested: str | None,
-) -> str:
-    claims = {
-        node.matek_id: node
-        for node in nodes
-        if node.problem_id == problem_id and node.node_type is NodeType.CLAIM
-    }
-    if requested is not None:
-        normalized = requested.strip()
-        if normalized not in claims:
-            raise GraphValidationError(
-                f"target claim {normalized!r} is not a claim for problem {problem_id}"
-            )
-        return normalized
-
-    tagged = sorted(node.matek_id for node in claims.values() if "matek/main-target" in node.tags)
-    if len(tagged) == 1:
-        return tagged[0]
-    if len(tagged) > 1:
-        raise GraphValidationError(
-            "multiple claims are tagged as the main target; pass --target-claim-id explicitly"
-        )
-    canonical = graph.main_claim_id(problem_id)
-    if canonical in claims:
-        return canonical
-    raise GraphValidationError(
-        "no main target claim is identifiable; pass --target-claim-id explicitly"
-    )
-
-
-def _legacy_migration_payload(report: LegacyMigrationReport) -> dict[str, Any]:
-    payload = report.model_dump(mode="json")
-    payload["integrity_sha256"] = migration_report_sha256(report)
-    return payload
-
-
-def _legacy_migration_application_payload(
-    record: LegacyMigrationApplicationRecord,
-) -> dict[str, Any]:
-    payload = record.model_dump(mode="json")
-    payload["integrity_sha256"] = migration_application_sha256(record)
-    return payload
-
-
-def _migration_output_path(graph: KnowledgeGraph, requested: Path) -> Path:
-    expanded = requested.expanduser()
-    if expanded.is_symlink():
-        raise WorkspaceError(f"refusing symlinked migration report output: {expanded}")
-    try:
-        destination = expanded.resolve(strict=False)
-        knowledge_root = graph.collection_root.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise WorkspaceError(f"cannot resolve migration report output {expanded}: {exc}") from exc
-    if destination == knowledge_root or knowledge_root in destination.parents:
-        raise WorkspaceError(
-            "migration reports must be written outside .matek/knowledge so the archival "
-            "vault and snapshots remain unchanged"
-        )
-    return destination
-
-
-def _migration_input_path(graph: KnowledgeGraph, requested: Path) -> Path:
-    expanded = requested.expanduser()
-    if expanded.is_symlink():
-        raise WorkspaceError(f"refusing symlinked migration plan input: {expanded}")
-    try:
-        source = expanded.resolve(strict=True)
-        knowledge_root = graph.collection_root.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise WorkspaceError(f"cannot resolve migration plan input {expanded}: {exc}") from exc
-    if source == knowledge_root or knowledge_root in source.parents:
-        raise WorkspaceError("reviewed migration plans must remain outside .matek/knowledge")
-    if not source.is_file():
-        raise WorkspaceError(f"migration plan input is not a regular file: {source}")
-    return source
-
-
-@graph_app.command("migrate-legacy")
-def graph_migrate_legacy(
-    problem_id: str | None = typer.Option(
-        None,
-        "--problem-id",
-        help="Problem node to plan; required only when the graph contains several problems.",
-    ),
-    target_claim_id: str | None = typer.Option(
-        None,
-        "--target-claim-id",
-        help="Main claim to plan; otherwise infer the uniquely tagged/canonical main target.",
-    ),
-    output: Path | None = typer.Option(
-        None,
-        "--output",
-        "-o",
-        dir_okay=False,
-        help="Write integrity-protected JSON outside the graph vault; otherwise print it.",
-    ),
-    apply_plan: Path | None = typer.Option(
-        None,
-        "--apply-plan",
-        dir_okay=False,
-        help="Apply one externally reviewed integrity-protected plan.",
-    ),
-    yes: bool = typer.Option(
-        False,
-        "--yes",
-        "-y",
-        help="Confirm application without an interactive prompt.",
-    ),
-    audit_nomination_limit: int = typer.Option(
-        25,
-        "--audit-nomination-limit",
-        min=1,
-        help="Maximum number of strong intermediate results nominated for fresh audit.",
-    ),
-    dry_run: bool = typer.Option(
-        True,
-        "--dry-run",
-        help="Build a read-only plan when --apply-plan is omitted (the default).",
-    ),
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
-) -> None:
-    """Plan a legacy backfill, or explicitly apply one reviewed external plan.
-
-    Dry-run planning is the default. Applying a plan requires --apply-plan plus an
-    interactive confirmation or --yes. Existing snapshots and legacy note identities
-    remain archived.
-    """
-
-    try:
-        graph = _project_graph(knowledge_graph)
-        if apply_plan is not None:
-            if output is not None:
-                raise KnowledgeGraphError("--output cannot be combined with --apply-plan")
-            source = _migration_input_path(graph, apply_plan)
-            report = load_legacy_migration_report(source)
-            if not yes:
-                typer.confirm(
-                    "Apply this reviewed legacy migration plan to the selected graph?",
-                    abort=True,
-                )
-            record = graph.apply_legacy_migration(report)
-            sys.stdout.write(
-                json.dumps(
-                    _legacy_migration_application_payload(record),
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-            return
-        if not dry_run:  # pragma: no cover - Typer exposes only the affirmative flag
-            raise KnowledgeGraphError("pass --apply-plan to apply a reviewed migration")
-        revision, nodes = _read_legacy_migration_source(graph)
-        selected_problem = _migration_problem_id(nodes, problem_id)
-        selected_target = _migration_target_claim_id(
-            graph,
-            nodes,
-            problem_id=selected_problem,
-            requested=target_claim_id,
-        )
-        report = plan_legacy_graph_backfill(
-            nodes,
-            graph_revision=revision,
-            problem_id=selected_problem,
-            target_claim_id=selected_target,
-            audit_nomination_limit=audit_nomination_limit,
-            graph_name=graph.graph_name,
-        )
-        if output is None:
-            sys.stdout.write(
-                json.dumps(_legacy_migration_payload(report), indent=2, sort_keys=True) + "\n"
-            )
-        else:
-            destination = _migration_output_path(graph, output)
-            written = write_legacy_migration_report(destination, report)
-            console.print(f"Wrote read-only migration plan: {written}")
-            console.print(f"Integrity SHA-256: {migration_report_sha256(report)}")
-    except BaseException as exc:
-        _abort(exc)
-
-
 @graph_app.command("rebuild-index")
 def graph_rebuild_index(
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
@@ -1139,8 +892,11 @@ def graph_rebuild_index(
     """Rebuild the disposable SQLite index from authoritative Markdown notes."""
 
     try:
-        path = _project_graph(knowledge_graph).rebuild_index()
-        console.print(f"Rebuilt {path}")
+        graph = _project_semantic_graph(knowledge_graph)
+        warnings = graph.initialize()
+        console.print(f"Rebuilt {graph.index_path}")
+        for warning in warnings:
+            console.print(f"[yellow]![/yellow] {warning}")
     except BaseException as exc:
         _abort(exc)
 
@@ -1150,9 +906,9 @@ def graph_open(knowledge_graph: str | None = typer.Option(None, "--knowledge-gra
     """Open the vault in Obsidian when available, otherwise print its path."""
 
     try:
-        opened, path, detail = _project_graph(knowledge_graph).open_in_obsidian()
-        console.print(f"Vault: {path}")
-        console.print(("Opened in Obsidian. " if opened else "Obsidian unavailable. ") + detail)
+        graph = _project_semantic_graph(knowledge_graph)
+        console.print(f"Vault: {graph.graph_root}")
+        console.print("Obsidian unavailable. Open the vault path manually.")
     except BaseException as exc:
         _abort(exc)
 
@@ -1163,10 +919,32 @@ def graph_export(
     output: Path | None = typer.Option(None, "--output", dir_okay=False),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Export JSON, Graphviz DOT, or Mermaid without requiring Obsidian."""
+    """Export the parsed semantic graph without requiring Obsidian."""
 
     try:
-        rendered = _project_graph(knowledge_graph).export(output_format=output_format.value)
+        graph = _project_semantic_graph(knowledge_graph)
+        nodes, _ = graph.load_nodes()
+        if output_format is GraphExportChoice.JSON:
+            rendered = json.dumps(graph.semantic_context(maximum_nodes=len(nodes) or 1), indent=2)
+            rendered += "\n"
+        elif output_format is GraphExportChoice.MERMAID:
+            lines = ["flowchart TD"]
+            title_keys = {node.title: f"n{index}" for index, node in enumerate(nodes)}
+            lines.extend(f'  {title_keys[node.title]}["{node.title}"]' for node in nodes)
+            lines.extend(
+                f"  {title_keys[node.title]} --> {title_keys[target]}"
+                for node in nodes
+                for target in node.depends_on
+                if target in title_keys
+            )
+            rendered = "\n".join(lines) + "\n"
+        else:
+            lines = ["digraph matek {"]
+            lines.extend(f'  "{node.title}";' for node in nodes)
+            lines.extend(
+                f'  "{node.title}" -> "{target}";' for node in nodes for target in node.depends_on
+            )
+            rendered = "\n".join([*lines, "}"]) + "\n"
         if output is None:
             console.print(rendered, markup=False, end="")
         else:
@@ -1178,58 +956,24 @@ def graph_export(
         _abort(exc)
 
 
-@graph_app.command("diff")
-def graph_diff(
-    revision_a: str,
-    revision_b: str,
+@graph_app.command("show")
+def graph_show(
+    title: str,
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Compare two durable graph snapshots."""
+    """Show one node by descriptive title."""
 
     try:
-        difference = _project_graph(knowledge_graph).diff(revision_a, revision_b)
-        console.print(json.dumps(difference.model_dump(mode="json"), indent=2, sort_keys=True))
-    except BaseException as exc:
-        _abort(exc)
-
-
-@graph_app.command("reconstruct")
-def graph_reconstruct(
-    revision: str,
-    output: Path | None = typer.Option(None, "--output", dir_okay=False),
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
-) -> None:
-    """Reconstruct and integrity-check one immutable graph revision snapshot."""
-
-    try:
-        contents = _project_graph(knowledge_graph).reconstruct_snapshot(revision)
-        if output is None:
-            sys.stdout.write(contents.decode("utf-8"))
-        else:
-            requested = output.expanduser()
-            if requested.is_symlink():
-                raise WorkspaceError(f"refusing symlinked reconstruction output: {requested}")
-            destination = atomic_write_bytes(requested, contents)
-            console.print(f"Wrote {destination}")
-    except BaseException as exc:
-        _abort(exc)
-
-
-@graph_app.command("verify-snapshots")
-def graph_verify_snapshots(
-    revision: str | None = typer.Argument(
-        None,
-        help="Optional revision; omit it to verify the complete snapshot history.",
-    ),
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
-) -> None:
-    """Verify manifests, parent roots, checkpoints, and live content blobs."""
-
-    try:
-        results = _project_graph(knowledge_graph).verify_snapshots(revision)
+        node = _project_semantic_graph(knowledge_graph).resolve_title(title)
         console.print(
             json.dumps(
-                [item.model_dump(mode="json") for item in results],
+                {
+                    "title": node.title,
+                    "kind": node.kind.value,
+                    "status": node.status,
+                    "depends_on": node.depends_on,
+                    "body": node.body,
+                },
                 indent=2,
                 sort_keys=True,
             )
@@ -1238,16 +982,23 @@ def graph_verify_snapshots(
         _abort(exc)
 
 
-@graph_app.command("show")
-def graph_show(
-    node_id: str,
+@graph_app.command("rename")
+def graph_rename(
+    old_title: str,
+    new_title: str,
+    disambiguation: str | None = typer.Option(None, "--disambiguation"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """Show one node by immutable ID."""
+    """Rename a descriptive note and update every inbound wiki link."""
 
     try:
-        node = _project_graph(knowledge_graph).show(node_id)
-        console.print(json.dumps(node.model_dump(mode="json"), indent=2, sort_keys=True))
+        graph = _project_semantic_graph(knowledge_graph)
+        title = graph.rename_node(
+            old_title,
+            new_title,
+            disambiguation=disambiguation,
+        )
+        console.print(f"Renamed to [[{title}]]")
     except BaseException as exc:
         _abort(exc)
 
@@ -1260,15 +1011,18 @@ def _print_graph_nodes(nodes: Sequence[BaseModel]) -> None:
 
 @graph_app.command("dependencies")
 def graph_dependencies(
-    node_id: str,
+    title: str,
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
     """Traverse mathematical dependencies of a node."""
 
     try:
-        _print_graph_nodes(
-            _project_graph(knowledge_graph).traverse(
-                node_id, downstream=False, relation=RelationType.DEPENDS_ON
+        node = _project_semantic_graph(knowledge_graph).resolve_title(title)
+        console.print(
+            json.dumps(
+                {"title": node.title, "depends_on": node.depends_on},
+                indent=2,
+                sort_keys=True,
             )
         )
     except BaseException as exc:
@@ -1277,15 +1031,28 @@ def graph_dependencies(
 
 @graph_app.command("downstream")
 def graph_downstream(
-    node_id: str,
+    title: str,
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
     """Traverse nodes invalidated when this dependency changes."""
 
     try:
-        _print_graph_nodes(
-            _project_graph(knowledge_graph).traverse(
-                node_id, downstream=True, relation=RelationType.DEPENDS_ON
+        graph = _project_semantic_graph(knowledge_graph)
+        target = graph.resolve_title(title)
+        nodes, _ = graph.load_nodes()
+        console.print(
+            json.dumps(
+                {
+                    "title": target.title,
+                    "downstream": sorted(
+                        node.title
+                        for node in nodes
+                        if target.title.casefold()
+                        in {dependency.casefold() for dependency in node.depends_on}
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
             )
         )
     except BaseException as exc:
@@ -1297,10 +1064,12 @@ def graph_stale(
     problem_id: str | None = typer.Option(None, "--problem-id"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """List stale nodes and invalidation reasons."""
+    """List notes whose current semantic status is stale."""
 
     try:
-        _print_graph_nodes(_project_graph(knowledge_graph).list_stale(problem_id))
+        del problem_id
+        nodes, _ = _project_semantic_graph(knowledge_graph).load_nodes()
+        _print_graph_nodes([node for node in nodes if node.status.casefold() == "stale"])
     except BaseException as exc:
         _abort(exc)
 
@@ -1310,25 +1079,12 @@ def graph_tasks(
     problem_id: str | None = typer.Option(None, "--problem-id"),
     knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
 ) -> None:
-    """List persistent graph-scoped research tasks."""
+    """List descriptive task notes from authoritative Markdown."""
 
     try:
-        _print_graph_nodes(_project_graph(knowledge_graph).list_tasks(problem_id))
-    except BaseException as exc:
-        _abort(exc)
-
-
-@graph_app.command("tombstone")
-def graph_tombstone(
-    node_id: str,
-    reason: str = typer.Option(..., "--reason"),
-    knowledge_graph: str | None = typer.Option(None, "--knowledge-graph", "-g"),
-) -> None:
-    """Retain a superseded node identity and invalidate its dependents."""
-
-    try:
-        result = _project_graph(knowledge_graph).tombstone(node_id, reason=reason)
-        console.print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
+        del problem_id
+        nodes, _ = _project_semantic_graph(knowledge_graph).load_nodes()
+        _print_graph_nodes([node for node in nodes if node.kind is SemanticNodeKind.TASK])
     except BaseException as exc:
         _abort(exc)
 
@@ -1521,8 +1277,8 @@ def run(
         else:
             selected_graph_name = normalize_graph_name(knowledge_graph)
             graph_selection = "explicit existing graph"
-            if selected_graph_name not in list_graph_names(root):
-                available = list_graph_names(root)
+            if selected_graph_name not in _semantic_graph_names(root):
+                available = _semantic_graph_names(root)
                 suffix = f" Available graphs: {', '.join(available)}." if available else ""
                 raise GraphNotInitializedError(
                     f"knowledge graph {selected_graph_name!r} does not exist.{suffix}"
