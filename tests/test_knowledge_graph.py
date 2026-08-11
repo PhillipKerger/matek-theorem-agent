@@ -3442,3 +3442,179 @@ def test_graph_search_cli_finds_nodes_lexically(
     empty = cli.invoke(app, ["graph", "search", "zzzzzzzzzzz"])
     assert empty.exit_code == 0, empty.output
     assert json.loads(empty.output)["results"] == []
+
+
+
+def test_obligation_with_projection_demoted_parent_is_ambiguity_not_ledger_error(
+    tmp_path: Path,
+) -> None:
+    """Regression for the 2026-08 Jantzen incident: a dangling obligation parent
+    derivation must demote the obligation to an ambiguity, never raise LedgerError."""
+    graph, _problem, problem_id, _ = initialized_graph(tmp_path)
+    main_target_id = graph.main_claim_id(problem_id)
+    tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id="run-one",
+        decision_id=11,
+        assignments=[
+            {
+                "id": "worker-gap",
+                "approach_family": "induction",
+                "task": "Attempt the intermediate lemma.",
+                "expected_output": "A gapped attempt with an exact obstruction.",
+                "target_node_ids": [main_target_id],
+            }
+        ],
+    )
+    gapped_result = ScientificResult(
+        local_key="gapped-lemma",
+        kind=ScientificResultKind.LEMMA,
+        exact_statement="Every boundary object has property P.",
+        scope=ScientificScope.BRANCH,
+        proof_or_certificate="Partial argument; the boundary step is missing.",
+        exact_gap="Prove the boundary step for the degenerate object.",
+        target_node_ids=[main_target_id],
+        disposition=ScientificResultDisposition.PARTIAL,
+    )
+    report = ResearchWorkerReport(
+        assignment_id="worker-gap",
+        results=[gapped_result],
+        branch_outcome=BranchOutcome.BLOCKED,
+        mechanism="Boundary analysis.",
+    )
+    merged = graph.integrate_worker_report(
+        problem_id=problem_id,
+        run_id="run-one",
+        assignment={
+            "id": "worker-gap",
+            "approach_family": "induction",
+            "task": "Attempt the intermediate lemma.",
+        },
+        task_id=tasks["worker-gap"],
+        report=report.model_dump(mode="json"),
+        proposed_patch=None,
+        source_artifact=".matek/runs/run-one/research/workers/worker-gap.json",
+        operation_id="typed-gap:run-one:worker-gap",
+    )
+    assert merged.committed
+
+    # Simulate the incident: the obligation's recorded parent derivation is not a
+    # projectable ledger derivation (demoted/removed), which used to raise
+    # LedgerError hours into a run.
+    with graph._locked():
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        obligation = next(node for node in nodes if node.node_type is NodeType.OBLIGATION)
+        gapped_attempt = next(
+            node for node in nodes if node.node_type is NodeType.PROOF_ATTEMPT
+        )
+        obligation.metadata["matek_parent_derivation_ids"] = [gapped_attempt.matek_id]
+        graph._commit_nodes_unlocked(
+            state=state,
+            all_nodes=nodes,
+            changed_node_ids=[obligation.matek_id],
+            run_id="run-one",
+            author="legacy-fixture",
+            reason="Simulate the incident's dangling obligation parent derivation.",
+            operation_id="incident-dangling-parent",
+        )
+
+    nodes = graph.load_nodes(include_human_notes=False)
+    state = graph.load_state()
+    ledger = project_markdown_ledger(
+        nodes,
+        graph_revision=state.revision,
+        problem_id=problem_id,
+        target_claim_id=main_target_id,
+    )
+    assert obligation.matek_id not in ledger.obligations
+    assert any(
+        ambiguity.source_node_id == obligation.matek_id
+        and ambiguity.code == "unresolved_obligation_links"
+        for ambiguity in ledger.ambiguities
+    )
+    # The frontier remains computable: research continues with the lane recorded.
+    frontier = graph.frontier(problem_id)
+    assert frontier.main_target is not None
+
+
+def test_derivation_naming_a_screened_obligation_is_demoted_not_fatal(tmp_path: Path) -> None:
+    """The reciprocal side of the incident: a derivation that names a screened
+    obligation must also stay in the archive instead of crashing validation."""
+    graph, _problem, problem_id, _ = initialized_graph(tmp_path)
+    main_target_id = graph.main_claim_id(problem_id)
+    tasks, _, _ = graph.record_assignment_tasks(
+        problem_id=problem_id,
+        run_id="run-one",
+        decision_id=12,
+        assignments=[
+            {
+                "id": "worker-complete",
+                "approach_family": "induction",
+                "task": "Prove the intermediate lemma.",
+                "expected_output": "A gap-free lemma.",
+                "target_node_ids": [main_target_id],
+            }
+        ],
+    )
+    complete_result = ScientificResult(
+        local_key="complete-lemma",
+        kind=ScientificResultKind.LEMMA,
+        exact_statement="Every interior object has property Q.",
+        scope=ScientificScope.BRANCH,
+        proof_or_certificate="A complete, checkable proof.",
+        target_node_ids=[main_target_id],
+        disposition=ScientificResultDisposition.PROPOSED_COMPLETE,
+    )
+    report = ResearchWorkerReport(
+        assignment_id="worker-complete",
+        results=[complete_result],
+        branch_outcome=BranchOutcome.PROGRESS,
+        mechanism="Interior analysis.",
+    )
+    merged = graph.integrate_worker_report(
+        problem_id=problem_id,
+        run_id="run-one",
+        assignment={
+            "id": "worker-complete",
+            "approach_family": "induction",
+            "task": "Prove the intermediate lemma.",
+        },
+        task_id=tasks["worker-complete"],
+        report=report.model_dump(mode="json"),
+        proposed_patch=None,
+        source_artifact=".matek/runs/run-one/research/workers/worker-complete.json",
+        operation_id="typed-complete:run-one:worker-complete",
+    )
+    assert merged.committed
+
+    with graph._locked():
+        state = graph._load_state_unlocked()
+        nodes = graph._load_nodes_unlocked(include_human_notes=True)
+        derivation_node = next(node for node in nodes if node.node_type is NodeType.DERIVATION)
+        derivation_node.metadata["matek_obligation_ids"] = ["OBL-NEVERADMITTED00001"]
+        graph._commit_nodes_unlocked(
+            state=state,
+            all_nodes=nodes,
+            changed_node_ids=[derivation_node.matek_id],
+            run_id="run-one",
+            author="legacy-fixture",
+            reason="Simulate a derivation naming an obligation that was never admitted.",
+            operation_id="incident-asymmetric-derivation",
+        )
+
+    nodes = graph.load_nodes(include_human_notes=False)
+    state = graph.load_state()
+    ledger = project_markdown_ledger(
+        nodes,
+        graph_revision=state.revision,
+        problem_id=problem_id,
+        target_claim_id=main_target_id,
+    )
+    assert derivation_node.matek_id not in ledger.derivations
+    assert any(
+        ambiguity.source_node_id == derivation_node.matek_id
+        and ambiguity.code == "non_reciprocal_obligation_link"
+        for ambiguity in ledger.ambiguities
+    )
+    assert graph.frontier(problem_id).main_target is not None

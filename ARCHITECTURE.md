@@ -331,7 +331,12 @@ OR alternatives, and retains first-class versioned obligations. Gapped reports r
 attempts plus obligations and cannot enter the derivation ledger. Trusted claims require an
 independent audit or Lean verification, and the frontier computes the smallest known open cut from
 the ledger. A bounded antichain search exposes `open_cut_search_capped` rather than overstating
-minimality.
+minimality. Obligation and derivation link integrity is screened during projection with one
+shared derivation-eligibility predicate: an obligation whose recorded parent derivation, dependency,
+or target claim was itself demoted or removed becomes an `unresolved_obligation_links` ambiguity,
+and a derivation naming a screened or non-reciprocal obligation becomes a
+`non_reciprocal_obligation_link` / `screened_obligation_link` ambiguity. Stale, gapped, or
+demoted archive linkage therefore records a blocked lane and never halts a run.
 
 Before research, `prompts/target_alignment.json` hash-binds the compiler's theorem and exact claim
 contract and records possible conflicts; it is not a mathematical proof. Clause keys control

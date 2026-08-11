@@ -373,18 +373,11 @@ def validate_ledger(ledger: CanonicalLedger) -> None:
                 f"derivation {derivation.derivation_id} references unknown claim(s): "
                 + ", ".join(missing_claims)
             )
-        missing_obligations = [
-            item for item in derivation.obligation_ids if item not in ledger.obligations
-        ]
-        if missing_obligations:
-            raise LedgerError(
-                f"derivation {derivation.derivation_id} references unknown obligation(s): "
-                + ", ".join(missing_obligations)
-            )
         asymmetric_obligations = [
             item
             for item in derivation.obligation_ids
-            if derivation.derivation_id not in ledger.obligations[item].parent_derivation_ids
+            if item not in ledger.obligations
+            or derivation.derivation_id not in ledger.obligations[item].parent_derivation_ids
         ]
         if asymmetric_obligations:
             raise LedgerError(
@@ -392,23 +385,11 @@ def validate_ledger(ledger: CanonicalLedger) -> None:
                 + ", ".join(asymmetric_obligations)
             )
     for obligation in ledger.obligations.values():
-        missing_parents = [
-            item for item in obligation.parent_derivation_ids if item not in ledger.derivations
-        ]
-        missing_dependencies = [
-            item for item in obligation.dependency_claim_ids if item not in claims
-        ]
-        missing_targets = [item for item in obligation.target_claim_ids if item not in claims]
-        if missing_parents or missing_dependencies or missing_targets:
-            missing = [*missing_parents, *missing_dependencies, *missing_targets]
-            raise LedgerError(
-                f"obligation {obligation.obligation_id} has unknown reference(s): "
-                + ", ".join(missing)
-            )
         asymmetric_parents = [
             item
             for item in obligation.parent_derivation_ids
-            if obligation.obligation_id not in ledger.derivations[item].obligation_ids
+            if item not in ledger.derivations
+            or obligation.obligation_id not in ledger.derivations[item].obligation_ids
         ]
         if asymmetric_parents:
             raise LedgerError(
@@ -711,6 +692,7 @@ def project_markdown_ledger(
     derivations: dict[str, Derivation] = {}
     obligations: dict[str, Obligation] = {}
     ambiguities: list[LedgerAmbiguity] = []
+    screened_obligation_ids: set[str] = set()
     selected = [node for node in nodes if node.problem_id == problem_id and not node.tombstone]
     selected_by_id = {node.matek_id: node for node in selected}
     audit_ids_by_target: dict[str, list[str]] = {}
@@ -867,6 +849,120 @@ def project_markdown_ledger(
         )
         claim_aliases[node.matek_id] = node.matek_id
 
+    def derivation_id_for(node: GraphNode) -> str:
+        """Return the canonical ledger ID for one derivation candidate node."""
+
+        return (
+            node.matek_id
+            if str(node.node_type.value) == "derivation"
+            else deterministic_ledger_id("DRV", problem_id, node.matek_id)
+        )
+
+    def derivation_projection_issue(node: GraphNode | None) -> tuple[str, str] | None:
+        """Return the ambiguity code/detail for one derivation candidate, if any.
+
+        This predicate decides derivation-ledger membership in exactly one place.
+        Obligation parent screening above uses the same rules so an obligation
+        referencing a demoted derivation is itself demoted instead of tripping a
+        late validation error hours into a run.
+        """
+
+        if node is None:
+            return (
+                "unknown_parent_derivation",
+                "The parent derivation node does not exist in this problem archive.",
+            )
+        node_type_value = str(node.node_type.value)
+        if node_type_value not in {"proof", "derivation"}:
+            return (
+                "unknown_parent_derivation",
+                "The parent derivation reference does not identify a proof or derivation.",
+            )
+        if node_type_value == "proof" and node.metadata.get("matek_archive_only") is True:
+            return (
+                "archive_only_legacy_proof",
+                "A reviewed migration retains the incompatible legacy proof note as "
+                "evidence; its canonical route lives in the proof attempt/derivation pair.",
+            )
+        if node_type_value == "proof" and node.epistemic_status not in {
+            EpistemicStatus.AUDIT_PASSED,
+            EpistemicStatus.LEAN_VERIFIED,
+        }:
+            return (
+                "unadmitted_archive_proof",
+                "A proof note without independent acceptance remains in the research "
+                "archive and was not inferred into the canonical ledger.",
+            )
+        archive_issue = _scientific_derivation_archive_issue(node)
+        if archive_issue is not None:
+            return ("archive_only_scientific_derivation", archive_issue)
+        raw_gap = node.metadata.get("matek_exact_gap")
+        if isinstance(raw_gap, str) and raw_gap.strip():
+            return (
+                "gapped_proof_attempt",
+                "Gapped proof remains in the archive and is not a derivation.",
+            )
+        conclusions = [
+            edge.target_id for edge in node.relations if edge.relation is RelationType.PROVES
+        ]
+        premises = [
+            edge.target_id for edge in node.relations if edge.relation is RelationType.DEPENDS_ON
+        ]
+        if len(conclusions) != 1:
+            return (
+                "ambiguous_derivation_conclusion",
+                "A derivation requires exactly one structured proves edge.",
+            )
+        conclusion_id = claim_aliases.get(conclusions[0], conclusions[0])
+        canonical_premises = list(dict.fromkeys(claim_aliases.get(item, item) for item in premises))
+        if conclusion_id not in claims or any(item not in claims for item in canonical_premises):
+            return (
+                "unknown_derivation_claim",
+                "A structured derivation references an unknown canonical claim.",
+            )
+        raw_proof_attempt_id = node.metadata.get("matek_proof_attempt_id")
+        if node_type_value == "derivation" and (
+            not isinstance(raw_proof_attempt_id, str) or not raw_proof_attempt_id.strip()
+        ):
+            return (
+                "missing_proof_attempt_id",
+                "A structured derivation has no canonical proof-attempt identity.",
+            )
+        if node_type_value == "derivation" and isinstance(raw_proof_attempt_id, str):
+            proof_attempt = selected_by_id.get(raw_proof_attempt_id.strip())
+            if proof_attempt is None or str(proof_attempt.node_type.value) != "proof_attempt":
+                return (
+                    "invalid_proof_attempt_link",
+                    "A structured derivation's matek_proof_attempt_id does not identify a "
+                    "canonical proof-attempt node.",
+                )
+        raw_premise_versions = node.metadata.get("matek_premise_versions")
+        if node_type_value == "derivation" and isinstance(raw_premise_versions, list):
+            parsed_ids: set[str] = set()
+            malformed_versions = False
+            for raw_version in raw_premise_versions:
+                raw_id, separator, raw_digest = raw_version.partition("=")
+                premise_id = claim_aliases.get(raw_id.strip(), raw_id.strip())
+                digest = raw_digest.strip().casefold()
+                if not separator or not premise_id or not _SHA256.fullmatch(digest):
+                    malformed_versions = True
+                    break
+                parsed_ids.add(premise_id)
+            if malformed_versions or parsed_ids != set(canonical_premises):
+                return (
+                    "malformed_premise_versions",
+                    "A structured derivation's exact premise versions do not cover its "
+                    "canonical premises.",
+                )
+        return None
+
+    # Pass 1: decide derivation membership before obligations are admitted, so
+    # obligation parent screening below can use the definitive eligibility set.
+    derivation_eligibility: dict[str, tuple[str, str] | None] = {}
+    for node in selected:
+        if str(node.node_type.value) in {"proof", "derivation"}:
+            derivation_eligibility[node.matek_id] = derivation_projection_issue(node)
+
     for node in selected:
         node_type_value = str(node.node_type.value)
         if node_type_value == "obligation":
@@ -905,20 +1001,59 @@ def project_markdown_ledger(
                     )
                 )
                 continue
-            notation = str(node.metadata.get("matek_notation_definition_version") or "1")
-            raw_leverage = node.metadata.get("matek_estimated_leverage")
-            leverage = raw_leverage if isinstance(raw_leverage, int) else 0
+            # Reference integrity is screened here, not in validate_ledger: an
+            # obligation that references a demoted or unknown node is itself
+            # ambiguous archive evidence, never a reason to halt the projection.
+            parent_ids = [str(item) for item in parents]
             canonical_dependencies = [
                 claim_aliases.get(str(item), str(item)) for item in dependencies
             ]
             canonical_targets = [claim_aliases.get(str(item), str(item)) for item in targets]
+            unresolved_links = sorted(
+                {
+                    *(
+                        parent_id
+                        for parent_id in parent_ids
+                        if derivation_eligibility.get(
+                            parent_id,
+                            (
+                                "unknown_parent_derivation",
+                                "The parent derivation node does not exist in this problem "
+                                "archive.",
+                            ),
+                        )
+                        is not None
+                    ),
+                    *(
+                        claim_id
+                        for claim_id in [*canonical_dependencies, *canonical_targets]
+                        if claim_id not in claims
+                    ),
+                }
+            )
+            if unresolved_links:
+                ambiguities.append(
+                    LedgerAmbiguity(
+                        source_node_id=node.matek_id,
+                        code="unresolved_obligation_links",
+                        detail=(
+                            "Obligation links reference demoted or unknown canonical "
+                            "records: " + ", ".join(unresolved_links)
+                        ),
+                    )
+                )
+                screened_obligation_ids.add(node.matek_id)
+                continue
+            notation = str(node.metadata.get("matek_notation_definition_version") or "1")
+            raw_leverage = node.metadata.get("matek_estimated_leverage")
+            leverage = raw_leverage if isinstance(raw_leverage, int) else 0
             obligations[node.matek_id] = Obligation(
                 obligation_id=node.matek_id,
                 exact_statement=statement,
                 conclusion=conclusion,
                 quantifiers=[str(item) for item in quantifiers],
                 hypotheses=[str(item) for item in hypotheses],
-                parent_derivation_ids=[str(item) for item in parents],
+                parent_derivation_ids=parent_ids,
                 dependency_claim_ids=canonical_dependencies,
                 target_claim_ids=canonical_targets,
                 scope=obligation_scope,
@@ -952,47 +1087,19 @@ def project_markdown_ledger(
         node_type_value = str(node.node_type.value)
         if node_type_value not in {"proof", "derivation"}:
             continue
-        if node_type_value == "proof" and node.metadata.get("matek_archive_only") is True:
-            # A reviewed migration retains the incompatible legacy PRF note as evidence.
-            # Its canonical mathematical route is represented separately by PAT + DRV.
-            continue
-        if node_type_value == "proof" and node.epistemic_status not in {
-            EpistemicStatus.AUDIT_PASSED,
-            EpistemicStatus.LEAN_VERIFIED,
-        }:
-            # A legacy/candidate PRF is archive evidence, not a structured derivation.
-            # Typed admission creates PAT + DRV records, while the terminal acceptance
-            # gate may still contribute an independently audited PRF.
-            ambiguities.append(
-                LedgerAmbiguity(
-                    source_node_id=node.matek_id,
-                    code="unadmitted_archive_proof",
-                    detail=(
-                        "A proof note without independent acceptance remains in the "
-                        "research archive and was not inferred into the canonical ledger."
-                    ),
+        issue = derivation_projection_issue(node)
+        if issue is not None:
+            code, detail = issue
+            # An archive-only legacy proof note is retained verbatim; it is not
+            # itself an ambiguity, only its mathematical route matters.
+            if code != "archive_only_legacy_proof":
+                ambiguities.append(
+                    LedgerAmbiguity(
+                        source_node_id=node.matek_id,
+                        code=code,
+                        detail=detail,
+                    )
                 )
-            )
-            continue
-        derivation_archive_issue = _scientific_derivation_archive_issue(node)
-        if derivation_archive_issue is not None:
-            ambiguities.append(
-                LedgerAmbiguity(
-                    source_node_id=node.matek_id,
-                    code="archive_only_scientific_derivation",
-                    detail=derivation_archive_issue,
-                )
-            )
-            continue
-        raw_gap = node.metadata.get("matek_exact_gap")
-        if isinstance(raw_gap, str) and raw_gap.strip():
-            ambiguities.append(
-                LedgerAmbiguity(
-                    source_node_id=node.matek_id,
-                    code="gapped_proof_attempt",
-                    detail="Gapped proof remains in the archive and is not a derivation.",
-                )
-            )
             continue
         conclusions = [
             edge.target_id for edge in node.relations if edge.relation is RelationType.PROVES
@@ -1000,66 +1107,55 @@ def project_markdown_ledger(
         premises = [
             edge.target_id for edge in node.relations if edge.relation is RelationType.DEPENDS_ON
         ]
-        if len(conclusions) != 1:
-            ambiguities.append(
-                LedgerAmbiguity(
-                    source_node_id=node.matek_id,
-                    code="ambiguous_derivation_conclusion",
-                    detail="A derivation requires exactly one structured proves edge.",
-                )
-            )
-            continue
         conclusion_id = claim_aliases.get(conclusions[0], conclusions[0])
         canonical_premises = list(dict.fromkeys(claim_aliases.get(item, item) for item in premises))
-        if conclusion_id not in claims or any(item not in claims for item in canonical_premises):
-            ambiguities.append(
-                LedgerAmbiguity(
-                    source_node_id=node.matek_id,
-                    code="unknown_derivation_claim",
-                    detail="A structured derivation references an unknown canonical claim.",
-                )
-            )
-            continue
         raw_obligations = node.metadata.get("matek_obligation_ids", [])
         obligation_ids = (
             [str(item) for item in raw_obligations] if isinstance(raw_obligations, list) else []
         )
-        derivation_id = (
-            node.matek_id
-            if node_type_value == "derivation"
-            else deterministic_ledger_id("DRV", problem_id, node.matek_id)
+        asymmetric_links = sorted(
+            obligation_id
+            for obligation_id in obligation_ids
+            if obligation_id not in obligations
+            or derivation_id_for(node) not in obligations[obligation_id].parent_derivation_ids
         )
-        raw_proof_attempt_id = node.metadata.get("matek_proof_attempt_id")
-        if node_type_value == "derivation" and (
-            not isinstance(raw_proof_attempt_id, str) or not raw_proof_attempt_id.strip()
-        ):
+        if asymmetric_links:
             ambiguities.append(
                 LedgerAmbiguity(
                     source_node_id=node.matek_id,
-                    code="missing_proof_attempt_id",
-                    detail="A structured derivation has no canonical proof-attempt identity.",
+                    code="non_reciprocal_obligation_link",
+                    detail=(
+                        "A derivation names obligations that were screened out or that do "
+                        "not name it as their parent: " + ", ".join(asymmetric_links)
+                    ),
                 )
             )
             continue
+        references_screened = sorted(
+            obligation_id
+            for obligation_id in obligation_ids
+            if obligation_id in screened_obligation_ids
+        )
+        if references_screened:
+            ambiguities.append(
+                LedgerAmbiguity(
+                    source_node_id=node.matek_id,
+                    code="screened_obligation_link",
+                    detail=(
+                        "A derivation references obligations whose own links are ambiguous; "
+                        "the derivation stays in the archive with them: "
+                        + ", ".join(references_screened)
+                    ),
+                )
+            )
+            continue
+        derivation_id = derivation_id_for(node)
+        raw_proof_attempt_id = node.metadata.get("matek_proof_attempt_id")
         proof_attempt_id = (
             raw_proof_attempt_id.strip()
             if node_type_value == "derivation" and isinstance(raw_proof_attempt_id, str)
             else node.matek_id
         )
-        if node_type_value == "derivation":
-            proof_attempt = selected_by_id.get(proof_attempt_id)
-            if proof_attempt is None or str(proof_attempt.node_type.value) != "proof_attempt":
-                ambiguities.append(
-                    LedgerAmbiguity(
-                        source_node_id=node.matek_id,
-                        code="invalid_proof_attempt_link",
-                        detail=(
-                            "A structured derivation's matek_proof_attempt_id does not "
-                            "identify a canonical proof-attempt node."
-                        ),
-                    )
-                )
-                continue
         target_version = claims[conclusion_id].logical_version
         raw_target_version = node.metadata.get("matek_exact_target_version")
         if node_type_value == "derivation" and isinstance(raw_target_version, str):
@@ -1068,27 +1164,10 @@ def project_markdown_ledger(
         raw_premise_versions = node.metadata.get("matek_premise_versions")
         if node_type_value == "derivation" and isinstance(raw_premise_versions, list):
             parsed_versions: dict[str, str] = {}
-            malformed_versions = False
             for raw_version in raw_premise_versions:
-                raw_id, separator, raw_digest = raw_version.partition("=")
+                raw_id, _, raw_digest = raw_version.partition("=")
                 premise_id = claim_aliases.get(raw_id.strip(), raw_id.strip())
-                digest = raw_digest.strip().casefold()
-                if not separator or not premise_id or not _SHA256.fullmatch(digest):
-                    malformed_versions = True
-                    break
-                parsed_versions[premise_id] = digest
-            if malformed_versions or set(parsed_versions) != set(canonical_premises):
-                ambiguities.append(
-                    LedgerAmbiguity(
-                        source_node_id=node.matek_id,
-                        code="malformed_premise_versions",
-                        detail=(
-                            "A structured derivation's exact premise versions do not cover "
-                            "its canonical premises."
-                        ),
-                    )
-                )
-                continue
+                parsed_versions[premise_id] = raw_digest.strip().casefold()
             premise_versions = parsed_versions
         derivations[derivation_id] = Derivation(
             derivation_id=derivation_id,

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.1 — 2026-08-10
+
+- Fixed the canonical ledger halting a multi-hour research run when an obligation outlived its
+  parent derivation's ledger membership. Derivation projection already routed unverifiable records
+  to typed ambiguities instead of failing, but an obligation whose recorded parent derivation,
+  dependency claim, or target claim was demoted or removed still raised `LedgerError` during
+  validation — pausing the whole run hours after the coordinator had legitimately referenced the
+  node. Obligation link integrity is now screened at projection time with the same single
+  derivation-eligibility predicate the derivation pass uses: an obligation with unresolved links
+  is recorded as an `unresolved_obligation_links` ambiguity, and a derivation naming a screened
+  or non-reciprocal obligation is demoted to a `non_reciprocal_obligation_link` /
+  `screened_obligation_link` ambiguity. `validate_ledger` remains as a defensive net for
+  hand-constructed ledgers but is no longer reachable from projection-produced states. The
+  frontier keeps the lane visible as blocked/ambiguous and research continues.
+
 ## 0.8.0 — 2026-08-10
 
 - Agent-authored mathematical graph nodes now carry descriptive one-liner IDs instead of opaque
